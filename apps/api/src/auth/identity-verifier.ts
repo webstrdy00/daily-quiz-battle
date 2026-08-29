@@ -1,0 +1,168 @@
+import { readFileSync } from "node:fs";
+import { request as httpsRequest } from "node:https";
+import { resolve } from "node:path";
+import { z } from "zod";
+import type { AppConfig } from "../config.js";
+import { AppError } from "../shared/errors.js";
+
+const VerificationResponseSchema = z.discriminatedUnion("resultType", [
+  z.object({
+    resultType: z.literal("SUCCESS"),
+    success: z.boolean(),
+  }),
+  z.object({
+    resultType: z.literal("FAIL"),
+    error: z
+      .object({
+        code: z.union([z.string(), z.number()]),
+      })
+      .passthrough(),
+  }),
+]);
+
+export interface IdentityVerifier {
+  verify(anonymousKey: string): Promise<boolean>;
+}
+
+const APPS_IN_TOSS_DEVTOOLS_ANONYMOUS_KEY = "mock-anon-hash-xyz789";
+
+class MockIdentityVerifier implements IdentityVerifier {
+  async verify(anonymousKey: string): Promise<boolean> {
+    return (
+      anonymousKey.startsWith("dev-") ||
+      anonymousKey === APPS_IN_TOSS_DEVTOOLS_ANONYMOUS_KEY
+    );
+  }
+}
+
+function readPem(value: string): string {
+  if (value.includes("-----BEGIN")) {
+    return value.replaceAll("\\n", "\n");
+  }
+  return readFileSync(resolve(value), "utf8");
+}
+
+class MtlsIdentityVerifier implements IdentityVerifier {
+  private readonly endpoint: URL;
+  private readonly certificate: string;
+  private readonly privateKey: string;
+  private readonly certificateAuthority?: string;
+
+  constructor(config: AppConfig) {
+    if (!config.identityMtlsCert || !config.identityMtlsKey) {
+      throw new Error("mTLS identity verifier is missing certificate material");
+    }
+
+    this.endpoint = new URL(config.identityVerifyUrl);
+    this.certificate = readPem(config.identityMtlsCert);
+    this.privateKey = readPem(config.identityMtlsKey);
+    this.certificateAuthority = config.identityMtlsCa
+      ? readPem(config.identityMtlsCa)
+      : undefined;
+  }
+
+  async verify(anonymousKey: string): Promise<boolean> {
+    let responseBody: string;
+
+    try {
+      responseBody = await new Promise<string>((resolveResponse, reject) => {
+        const request = httpsRequest(
+          this.endpoint,
+          {
+            method: "POST",
+            cert: this.certificate,
+            key: this.privateKey,
+            ca: this.certificateAuthority,
+            rejectUnauthorized: true,
+            headers: {
+              accept: "application/json",
+              "x-anon-key": anonymousKey,
+            },
+            timeout: 5_000,
+          },
+          (response) => {
+            let body = "";
+            response.setEncoding("utf8");
+            response.on("data", (chunk: string) => {
+              body += chunk;
+              if (body.length > 65_536) {
+                response.destroy(new Error("Identity response is too large"));
+              }
+            });
+            response.on("error", reject);
+            response.on("end", () => {
+              const statusCode = response.statusCode ?? 500;
+              if (statusCode < 200 || statusCode >= 300) {
+                reject(
+                  new Error(`Identity verification returned ${statusCode}`),
+                );
+                return;
+              }
+              resolveResponse(body);
+            });
+          },
+        );
+
+        request.on("timeout", () => {
+          request.destroy(new Error("Identity verification timed out"));
+        });
+        request.on("error", reject);
+        request.end();
+      });
+    } catch (error) {
+      throw new AppError({
+        statusCode: 503,
+        code: "IDENTITY_DEPENDENCY_UNAVAILABLE",
+        message: "사용자 확인 서비스에 일시적으로 연결할 수 없습니다.",
+        retryable: true,
+        details: {
+          reason: error instanceof Error ? error.name : "UnknownError",
+        },
+      });
+    }
+
+    let parsedJson: unknown;
+    try {
+      parsedJson = JSON.parse(responseBody);
+    } catch {
+      throw new AppError({
+        statusCode: 503,
+        code: "IDENTITY_INVALID_RESPONSE",
+        message: "사용자 확인 응답을 처리할 수 없습니다.",
+        retryable: true,
+      });
+    }
+
+    const parsed = VerificationResponseSchema.safeParse(parsedJson);
+    if (!parsed.success) {
+      throw new AppError({
+        statusCode: 503,
+        code: "IDENTITY_INVALID_RESPONSE",
+        message: "사용자 확인 응답을 처리할 수 없습니다.",
+        retryable: true,
+      });
+    }
+
+    if (parsed.data.resultType === "SUCCESS") {
+      return parsed.data.success;
+    }
+
+    const errorCode = String(parsed.data.error.code);
+    if (errorCode === "4010") {
+      return false;
+    }
+
+    throw new AppError({
+      statusCode: 503,
+      code: "IDENTITY_DEPENDENCY_UNAVAILABLE",
+      message: "사용자 확인 서비스가 요청을 처리하지 못했습니다.",
+      retryable: true,
+    });
+  }
+}
+
+export function createIdentityVerifier(config: AppConfig): IdentityVerifier {
+  return config.identityVerificationMode === "mock"
+    ? new MockIdentityVerifier()
+    : new MtlsIdentityVerifier(config);
+}

@@ -1,0 +1,24 @@
+{
+  "name": "daily-quiz-battle",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Apps in Toss daily quiz battle",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "packageManager": "pnpm@11.24.0",
+  "scripts": {
+    "dev:web": "pnpm --filter @daily-quiz-battle/web dev",
+    "dev:api": "pnpm --filter @daily-quiz-battle/api dev",
+    "build": "pnpm --filter @daily-quiz-battle/contracts build && pnpm --filter @daily-quiz-battle/api build && pnpm --filter @daily-quiz-battle/web build",
+    "lint": "pnpm -r --if-present lint",
+    "typecheck": "pnpm --filter @daily-quiz-battle/contracts build && pnpm -r --if-present typecheck",
+    "format": "prettier --write . --ignore-path .prettierignore",
+    "format:check": "prettier --check . --ignore-path .prettierignore",
+    "db:migrate": "pnpm --filter @daily-quiz-battle/api db:migrate",
+    "db:seed": "pnpm --filter @daily-quiz-battle/api db:seed"
+  },
+  "devDependencies": {
+    "prettier": "3.9.6"
+  }
+}

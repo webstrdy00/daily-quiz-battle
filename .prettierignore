@@ -1,0 +1,6 @@
+node_modules
+dist
+coverage
+*.ait
+docs
+pnpm-lock.yaml

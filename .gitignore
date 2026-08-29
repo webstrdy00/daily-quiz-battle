@@ -1,0 +1,76 @@
+# Private planning and development references
+# This repository intentionally keeps the entire docs tree out of Git.
+/docs/
+
+# Dependencies and package-manager state
+node_modules/
+.pnpm-store/
+.yarn/
+!.yarn/patches/
+!.yarn/plugins/
+!.yarn/releases/
+!.yarn/versions/
+
+# Build and Apps in Toss artifacts
+dist/
+build/
+out/
+*.ait
+.vite/
+.turbo/
+.cache/
+*.tsbuildinfo
+
+# Test and quality output
+coverage/
+playwright-report/
+test-results/
+.nyc_output/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+*.local
+secrets/
+.secrets/
+certs/
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
+
+# Local databases and runtime data
+.data/
+data/
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Logs and diagnostics
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# OS metadata
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# IDE state
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+*.swp
+*.swo
+
+# Temporary files
+.tmp/
+tmp/
+temp/
