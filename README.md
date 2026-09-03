@@ -129,28 +129,50 @@ Web/API는 `packages/contracts`의 Zod schema로 응답을 다시 검증합니�
 
 ## 품질 검증
 
+PostgreSQL을 시작한 뒤 전체 검증을 실행합니다.
+
 ```powershell
+docker compose up -d --wait postgres
+corepack pnpm test:integration
 corepack pnpm format:check
 corepack pnpm lint
 corepack pnpm typecheck
 corepack pnpm build
 ```
 
+통합 테스트는 Node.js 내장 test runner와 Fastify `inject()`를 사용하며 실제 PostgreSQL에서 다음 7개 시나리오를 직렬 실행합니다.
+
+1. migration/seed 반복 실행과 readiness
+2. start/resume → 답안 5개 → complete, 멱등 replay/conflict
+3. 인증·소유권·순서·revision·미완료 오류와 transaction rollback
+4. 동시 start와 서로 다른 Idempotency-Key의 answer/complete 요청 수렴
+5. KST 자정 set 전환과 다음 날 01:00 grace 경계
+6. 핵심 CHECK constraint와 published/answer 불변성 trigger
+7. daily set lifecycle 보호와 publication/item mutation 직렬화
+
+테스트 DB 관리자 URL은 `.env`의 `TEST_DATABASE_ADMIN_URL`로 지정할 수 있습니다. 지정하지 않으면 로컬 Compose의 `postgres` maintenance DB를 사용합니다. 이 계정에는 `CREATE DATABASE` 권한이 필요합니다. Harness는 매 실행마다 `daily_quiz_it_<32자리 hex>` 이름의 DB만 생성하고, 이름을 다시 검증한 뒤 해당 DB만 `DROP DATABASE ... WITH (FORCE)`로 제거합니다. 앱 DB, schema, Docker volume은 삭제하지 않으며 최종 검증에서 잔여 임시 DB가 0개인지 확인했습니다.
+
 `build`는 contracts, API, Web을 순서대로 빌드하고 `apps/web/daily-quiz-battle.ait`를 생성합니다. `.ait`, `dist`, local env, DB data, `docs/`는 Git에서 제외됩니다.
 
 2026-08-29 로컬 검증 결과:
 
 - frozen install, format check, lint, typecheck 통과
+- 실제 PostgreSQL 통합 테스트 7/7 통과
+- 빈 임시 DB에 `0001`+`0002`+`0003` migration/seed 멱등 실행과 기존 개발 DB forward migration 통과
 - contracts/API/Web production build와 Apps in Toss `.ait` 패키징 통과
-- 새 PostgreSQL volume에서 migration과 5문항 published seed 적용
 - API bootstrap → start/resume → 답안 5개 → complete 전체 흐름 통과
-- answer/complete exact replay 및 다른 payload의 동일 key 409 확인
-- DB에서 completed attempt 1건, answer 5건, completed idempotency record 6건 확인
+- answer/complete replay, 다른 payload conflict, 실패 idempotency rollback 확인
+- cross-user 권한, 순서/revision 오류, token version 무효화 확인
+- 8-way start는 attempt 1개로 수렴했고, 서로 다른 8개 Idempotency-Key의 answer는 200 1건과 `ANSWER_ALREADY_SUBMITTED` 7건이며 processing record는 0개, 서로 다른 8개 key의 complete는 모두 동일한 200을 반환하고 streak는 한 번만 변경됨을 확인
+- KST 자정과 정확히 01:00 grace deadline의 완료/abandon 상태 확인
+- submitted answer UPDATE/DELETE와 published revision/set item 변경 차단 확인
+- `0003`의 published→draft 차단, non-draft parent 삭제 차단, ordered parent `FOR UPDATE` lock을 통한 publication/item mutation 직렬화 확인
+- semantic follow-up `APPROVED`, High/Medium finding 0건, supplemental real-PostgreSQL probe 통과
 - 브라우저 홈 → 5문제 → 5/5 결과와 다섯 해설 확인
 - 재진입 시 저장된 completed result 복구, 현재 콘솔 오류 0건/API 요청 200 확인
 - 390px viewport에서 가로 overflow 없음 확인
 
-전용 단위 테스트 파일은 아직 추가하지 않았습니다. 현재 증거는 정적 검사, 실제 PostgreSQL 통합 smoke와 브라우저 smoke이며, 날짜 경계·동시성·권한 negative case 자동화는 후속 작업입니다.
+실제 Toss WebView 기기 QR E2E, real mTLS, 수동 접근성, 전체 DDL constraint 조합과 Challenge 동시 claim 검증은 후속 작업입니다.
 
 ## 보안·데이터 원칙
 

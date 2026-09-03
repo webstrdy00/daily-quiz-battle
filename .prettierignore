@@ -4,3 +4,4 @@ coverage
 *.ait
 docs
 pnpm-lock.yaml
+.gjc

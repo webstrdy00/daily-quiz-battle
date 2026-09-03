@@ -10,6 +10,7 @@
     "start": "node dist/server.js",
     "lint": "oxlint src drizzle.config.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "pnpm --filter @daily-quiz-battle/contracts build && node --env-file-if-exists=../../.env --import tsx --test --test-concurrency=1 src/integration/daily.integration.test.ts",
     "db:migrate": "tsx src/db/migrate.ts",
     "db:seed": "tsx src/db/seed.ts",
     "db:generate": "drizzle-kit generate"

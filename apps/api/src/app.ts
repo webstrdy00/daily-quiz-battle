@@ -1,6 +1,6 @@
 import cors from "@fastify/cors";
 import helmet from "@fastify/helmet";
-import Fastify, { type FastifyInstance } from "fastify";
+import Fastify, { LogController, type FastifyInstance } from "fastify";
 import { createIdentityVerifier } from "./auth/identity-verifier.js";
 import { registerAuthRoutes } from "./auth/routes.js";
 import { createAccessTokenService } from "./auth/token.js";
@@ -12,11 +12,13 @@ import { AppError, sendError } from "./shared/errors.js";
 export interface BuildAppOptions {
   config: AppConfig;
   database: Database;
+  clock?: () => Date;
 }
 
 export async function buildApp({
   config,
   database,
+  clock,
 }: BuildAppOptions): Promise<FastifyInstance> {
   const app = Fastify({
     logger: {
@@ -33,7 +35,7 @@ export async function buildApp({
         censor: "[REDACTED]",
       },
     },
-    disableRequestLogging: true,
+    logController: new LogController({ disableRequestLogging: true }),
     requestIdHeader: "x-request-id",
   });
 
@@ -53,8 +55,9 @@ export async function buildApp({
     referrerPolicy: { policy: "no-referrer" },
   });
 
-  app.addHook("onSend", async (_request, reply, payload) => {
+  app.addHook("onSend", async (request, reply, payload) => {
     reply.header("cache-control", "no-store");
+    reply.header("x-request-id", request.id);
     return payload;
   });
 
@@ -91,7 +94,7 @@ export async function buildApp({
     identityVerifier,
     tokenService,
   });
-  registerDailyRoutes(app, { database, tokenService });
+  registerDailyRoutes(app, { database, tokenService, clock });
 
   app.setNotFoundHandler((request, reply) => {
     sendError(
@@ -108,6 +111,32 @@ export async function buildApp({
   app.setErrorHandler((error, request, reply) => {
     if (error instanceof AppError) {
       sendError(error, request, reply);
+      return;
+    }
+
+    // Fastify client-side failures (malformed/empty JSON, oversized body,
+    // unsupported media type) carry a 4xx statusCode and must not surface as 500.
+    const clientStatus =
+      typeof error === "object" &&
+      error !== null &&
+      "statusCode" in error &&
+      typeof error.statusCode === "number"
+        ? error.statusCode
+        : undefined;
+    if (
+      clientStatus !== undefined &&
+      clientStatus >= 400 &&
+      clientStatus < 500
+    ) {
+      sendError(
+        new AppError({
+          statusCode: clientStatus === 415 ? 415 : 400,
+          code: "INVALID_REQUEST",
+          message: "요청 형식이 올바르지 않습니다.",
+        }),
+        request,
+        reply,
+      );
       return;
     }
 

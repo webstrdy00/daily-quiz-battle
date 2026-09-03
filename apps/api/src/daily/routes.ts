@@ -20,13 +20,14 @@ function getIdempotencyKey(request: FastifyRequest): string {
 export interface DailyRouteDependencies {
   database: Database;
   tokenService: AccessTokenService;
+  clock?: () => Date;
 }
 
 export function registerDailyRoutes(
   app: FastifyInstance,
   dependencies: DailyRouteDependencies,
 ): void {
-  const { database, tokenService } = dependencies;
+  const { database, tokenService, clock = () => new Date() } = dependencies;
 
   app.post("/v1/daily/start", async (request) => {
     const principal = await authenticateRequest(
@@ -34,7 +35,7 @@ export function registerDailyRoutes(
       database,
       tokenService,
     );
-    return startDailyQuiz(database, principal.userId);
+    return startDailyQuiz(database, principal.userId, clock());
   });
 
   app.post("/v1/attempts/:attemptId/answers", async (request) => {
@@ -53,6 +54,7 @@ export function registerDailyRoutes(
       params.attemptId,
       idempotencyKey,
       body,
+      clock(),
     );
   });
 
@@ -70,6 +72,7 @@ export function registerDailyRoutes(
       principal.userId,
       params.attemptId,
       idempotencyKey,
+      clock(),
     );
   });
 }
