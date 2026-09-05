@@ -9,8 +9,9 @@
   "packageManager": "pnpm@11.24.0",
   "scripts": {
     "dev:web": "pnpm --filter @daily-quiz-battle/web dev",
+    "dev:admin": "pnpm --filter @daily-quiz-battle/admin dev",
     "dev:api": "pnpm --filter @daily-quiz-battle/api dev",
-    "build": "pnpm --filter @daily-quiz-battle/contracts build && pnpm --filter @daily-quiz-battle/api build && pnpm --filter @daily-quiz-battle/web build",
+    "build": "pnpm --filter @daily-quiz-battle/contracts build && pnpm --filter @daily-quiz-battle/api build && pnpm --filter @daily-quiz-battle/web build && pnpm --filter @daily-quiz-battle/admin build",
     "lint": "pnpm -r --if-present lint",
     "typecheck": "pnpm --filter @daily-quiz-battle/contracts build && pnpm -r --if-present typecheck",
     "format": "prettier --write . --ignore-path .prettierignore",

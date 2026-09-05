@@ -60,6 +60,14 @@ interface UserRow {
   identity_status: "active" | "deleted" | "blocked";
 }
 
+interface DailySetVoidRow {
+  voided_at: Date | string;
+}
+
+interface DailySetVoidJoinRow {
+  voided_at: Date | string | null;
+}
+
 function toIso(value: Date | string): string {
   const date = value instanceof Date ? value : new Date(value);
   if (Number.isNaN(date.getTime())) {
@@ -82,6 +90,48 @@ function notFound(): AppError {
 
 function isExpired(row: ChallengeRow, now: Date): boolean {
   return now >= new Date(toIso(row.expires_at));
+}
+
+function dailySetVoidedError(
+  quizDate: string,
+  voidedAt: Date | string,
+): AppError {
+  return new AppError({
+    statusCode: 409,
+    code: "DAILY_SET_VOIDED",
+    message: "운영 검토로 이 날짜의 퀴즈 결과가 무효 처리되었습니다.",
+    retryable: false,
+    details: { quizDate, voidedAt: toIso(voidedAt) },
+  });
+}
+
+async function loadDailySetVoid(
+  transaction: Transaction,
+  dailySetId: string,
+): Promise<DailySetVoidRow | undefined> {
+  const rows = await transaction<DailySetVoidRow[]>`
+    SELECT voided_at
+    FROM daily_set_voids
+    WHERE daily_set_id = ${dailySetId}
+  `;
+  return rows[0];
+}
+
+async function lockDailySetAndLoadVoid(
+  transaction: Transaction,
+  dailySetId: string,
+): Promise<DailySetVoidRow | undefined> {
+  const rows = await transaction<DailySetVoidJoinRow[]>`
+    SELECT dsv.voided_at
+    FROM daily_sets ds
+    LEFT JOIN daily_set_voids dsv ON dsv.daily_set_id = ds.id
+    WHERE ds.id = ${dailySetId}
+    FOR SHARE OF ds
+  `;
+  const row = rows[0];
+  return row === undefined || row.voided_at === null
+    ? undefined
+    : { voided_at: row.voided_at };
 }
 
 async function lockChallengeByHash(
@@ -216,10 +266,28 @@ export async function createChallenge(
         });
       }
       // ADR-0003: token is never stored; re-derive from the challenge id.
-      const hashRows = await transaction<{ public_token_hash: string }[]>`
-        SELECT public_token_hash FROM challenges WHERE id = ${record.resource_id}
+      const challengeRows = await transaction<
+        {
+          public_token_hash: string;
+          quiz_date: string;
+          voided_at: Date | string | null;
+        }[]
+      >`
+        SELECT
+          c.public_token_hash,
+          ds.quiz_date::text AS quiz_date,
+          dsv.voided_at
+        FROM challenges c
+        JOIN daily_sets ds ON ds.id = c.daily_set_id
+        LEFT JOIN daily_set_voids dsv ON dsv.daily_set_id = c.daily_set_id
+        WHERE c.id = ${record.resource_id}
+        FOR SHARE OF ds
       `;
-      const storedHash = hashRows[0]?.public_token_hash;
+      const challenge = challengeRows[0];
+      if (challenge !== undefined && challenge.voided_at !== null) {
+        throw dailySetVoidedError(challenge.quiz_date, challenge.voided_at);
+      }
+      const storedHash = challenge?.public_token_hash;
       const token =
         storedHash === undefined
           ? null
@@ -255,6 +323,7 @@ export async function createChallenge(
       JOIN users u ON u.id = a.user_id
       WHERE a.id = ${attemptId}
       FOR UPDATE OF a
+      FOR SHARE OF ds
     `;
     const attempt = attempts[0];
     if (attempt === undefined || attempt.user_id !== userId) {
@@ -264,6 +333,15 @@ export async function createChallenge(
         message: "이 퀴즈로 도전을 만들 권한이 없습니다.",
       });
     }
+
+    const dailySetVoid = await loadDailySetVoid(
+      transaction,
+      attempt.daily_set_id,
+    );
+    if (dailySetVoid !== undefined) {
+      throw dailySetVoidedError(attempt.quiz_date, dailySetVoid.voided_at);
+    }
+
     if (attempt.status !== "completed" || attempt.score === null) {
       throw new AppError({
         statusCode: 422,
@@ -393,6 +471,21 @@ export async function getChallengeLanding(
       throw notFound();
     }
 
+    if (row.status !== "expired") {
+      const dailySetVoid = await loadDailySetVoid(
+        transaction,
+        row.daily_set_id,
+      );
+      if (dailySetVoid !== undefined) {
+        return ChallengeLandingResponseSchema.parse({
+          status: "voided",
+          quizDate: row.quiz_date,
+          voidedAt: toIso(dailySetVoid.voided_at),
+          viewerRole,
+        });
+      }
+    }
+
     return ChallengeLandingResponseSchema.parse({
       status: row.status,
       quizDate: row.quiz_date,
@@ -437,6 +530,17 @@ export async function claimChallenge(
         message: "내가 만든 도전에는 참여할 수 없습니다.",
       });
     }
+    if (row.status === "expired") {
+      throw notFound();
+    }
+
+    const dailySetVoid = await lockDailySetAndLoadVoid(
+      transaction,
+      row.daily_set_id,
+    );
+    if (dailySetVoid !== undefined) {
+      throw dailySetVoidedError(row.quiz_date, dailySetVoid.voided_at);
+    }
 
     // Replay: same opponent re-posting claim gets the same result.
     if (row.claimed_by_user_id === userId && row.status !== "open") {
@@ -446,6 +550,9 @@ export async function claimChallenge(
         setFilter: { dailySetId: row.daily_set_id },
         challengeId: row.id,
       });
+      if (daily.status === "voided") {
+        throw dailySetVoidedError(row.quiz_date, daily.voidedAt);
+      }
       return ClaimChallengeResponseSchema.parse({
         challenge: {
           status: row.status === "completed" ? "completed" : "claimed",
@@ -456,9 +563,6 @@ export async function claimChallenge(
       });
     }
 
-    if (row.status === "expired") {
-      throw notFound();
-    }
     if (row.status !== "open") {
       throw new AppError({
         statusCode: 409,
@@ -482,6 +586,9 @@ export async function claimChallenge(
       setFilter: { dailySetId: row.daily_set_id },
       challengeId: row.id,
     });
+    if (daily.status === "voided") {
+      throw dailySetVoidedError(row.quiz_date, daily.voidedAt);
+    }
 
     if (daily.attempt.status === "abandoned") {
       throw new AppError({
@@ -585,6 +692,16 @@ export async function getChallengeResult(
           : null;
     if (viewerRole === null) {
       throw notFound();
+    }
+
+    const dailySetVoid = await loadDailySetVoid(transaction, row.daily_set_id);
+    if (dailySetVoid !== undefined) {
+      return ChallengeResultResponseSchema.parse({
+        status: "voided",
+        quizDate: row.quiz_date,
+        voidedAt: toIso(dailySetVoid.voided_at),
+        viewerRole,
+      });
     }
 
     const meNickname =

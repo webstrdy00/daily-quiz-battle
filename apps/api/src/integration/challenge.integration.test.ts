@@ -9,8 +9,9 @@ import {
   CompleteAttemptResponseSchema,
   CreateChallengeResponseSchema,
   DailyStartResponseSchema,
+  type CompletedAttemptResponse,
   type CreateChallengeResponse,
-  type DailyStartResponse,
+  type DailyAvailableStartResponse,
 } from "@daily-quiz-battle/contracts";
 import { decodeJwt } from "jose";
 import {
@@ -82,7 +83,7 @@ async function bootstrapUser(identity: string): Promise<TestUser> {
   return { token, userId: getTokenUserId(token) };
 }
 
-async function startQuiz(token: string): Promise<DailyStartResponse> {
+async function startQuiz(token: string): Promise<DailyAvailableStartResponse> {
   const response = await harness.app.inject({
     method: "POST",
     url: "/v1/daily/start",
@@ -90,15 +91,27 @@ async function startQuiz(token: string): Promise<DailyStartResponse> {
     payload: {},
   });
   assert.equal(response.statusCode, 200, response.body);
-  return DailyStartResponseSchema.parse(response.json());
+  const start = DailyStartResponseSchema.parse(response.json());
+  if (start.status !== "available") {
+    assert.fail("daily set must be available in this fixture");
+  }
+  return start;
+}
+
+function parseCompletedAttempt(value: unknown): CompletedAttemptResponse {
+  const result = CompleteAttemptResponseSchema.parse(value);
+  if (result.status !== "completed") {
+    assert.fail("attempt must be completed in this fixture");
+  }
+  return result;
 }
 
 async function finishQuiz(
   user: TestUser,
   keyPrefix: string,
   expectedScore: number,
-  existingStart?: DailyStartResponse,
-): Promise<DailyStartResponse> {
+  existingStart?: DailyAvailableStartResponse,
+): Promise<DailyAvailableStartResponse> {
   const start = existingStart ?? (await startQuiz(user.token));
   for (const [index, question] of start.questions.entries()) {
     const correctIndex = correctSelections[index]!;
@@ -127,7 +140,7 @@ async function finishQuiz(
     payload: {},
   });
   assert.equal(completion.statusCode, 200, completion.body);
-  const completed = CompleteAttemptResponseSchema.parse(completion.json());
+  const completed = parseCompletedAttempt(completion.json());
   assert.equal(completed.score, expectedScore);
   return {
     ...start,
@@ -884,4 +897,315 @@ test("expiry boundary expires open but preserves claimed state", async () => {
   const claimedRow = rows.find((row) => row.status === "claimed");
   assert.equal(claimedRow?.claimed_by_user_id, opponent.userId);
   assert.ok(claimedRow?.opponent_attempt_id);
+});
+
+test("void overrides challenge replays and participant projections without rewriting snapshots", async () => {
+  harness.setNow(PRIMARY_DAY_NOON);
+  const creator = await bootstrapUser("void-creator");
+  const creatorAttempt = await finishQuiz(creator, "void-creator", 4);
+  const replayOpponent = await bootstrapUser("void-replay-opponent");
+  const resultOpponent = await bootstrapUser("void-result-opponent");
+  const resultOpponentAttempt = await finishQuiz(
+    resultOpponent,
+    "void-result-opponent",
+    1,
+  );
+  const outsider = await bootstrapUser("void-outsider");
+
+  const replayChallenge = await createChallenge(
+    creator,
+    creatorAttempt.attempt.id,
+    "void-create-old-key",
+  );
+  let challengeRows = await harness.database.client<{ id: string }[]>`
+    SELECT id
+    FROM challenges
+    WHERE creator_attempt_id = ${creatorAttempt.attempt.id}
+  `;
+  assert.equal(challengeRows.length, 1);
+  const replayChallengeId = challengeRows[0]!.id;
+  const firstClaim = await claimChallenge(
+    replayOpponent,
+    replayChallenge.challenge.token,
+    "void-claim-old-key",
+  );
+  assert.equal(firstClaim.statusCode, 200, firstClaim.body);
+  const firstClaimBody = ClaimChallengeResponseSchema.parse(firstClaim.json());
+  assert.equal(firstClaimBody.challenge.status, "claimed");
+  for (const [index, question] of firstClaimBody.daily.questions.entries()) {
+    const answer = await harness.app.inject({
+      method: "POST",
+      url: `/v1/attempts/${firstClaimBody.daily.attempt.id}/answers`,
+      headers: idempotentHeaders(
+        replayOpponent.token,
+        `void-replay-opponent-answer-${index + 1}`,
+      ),
+      payload: {
+        sequence: question.sequence,
+        questionRevisionId: question.revisionId,
+        selectedIndex: correctSelections[index],
+      },
+    });
+    assert.equal(answer.statusCode, 200, answer.body);
+  }
+
+  const completedChallenge = await createChallenge(
+    creator,
+    creatorAttempt.attempt.id,
+    "void-result-create",
+  );
+  challengeRows = await harness.database.client<{ id: string }[]>`
+    SELECT id
+    FROM challenges
+    WHERE creator_attempt_id = ${creatorAttempt.attempt.id}
+  `;
+  const completedChallengeId = challengeRows.find(
+    (row) => row.id !== replayChallengeId,
+  )?.id;
+  assert.ok(completedChallengeId);
+  const completedClaim = await claimChallenge(
+    resultOpponent,
+    completedChallenge.challenge.token,
+    "void-result-claim",
+  );
+  assert.equal(completedClaim.statusCode, 200, completedClaim.body);
+  const completedClaimBody = ClaimChallengeResponseSchema.parse(
+    completedClaim.json(),
+  );
+  assert.equal(completedClaimBody.challenge.status, "completed");
+  assert.equal(
+    completedClaimBody.daily.attempt.id,
+    resultOpponentAttempt.attempt.id,
+  );
+  await harness.database.client`
+    UPDATE challenges
+    SET result_redacted_at = ${"2026-08-29T03:01:00.000Z"}
+    WHERE id = ${completedChallengeId}
+  `;
+
+  const expiredChallenge = await createChallenge(
+    creator,
+    creatorAttempt.attempt.id,
+    "void-expired-create",
+  );
+  challengeRows = await harness.database.client<{ id: string }[]>`
+    SELECT id
+    FROM challenges
+    WHERE creator_attempt_id = ${creatorAttempt.attempt.id}
+  `;
+  const knownIds = new Set([replayChallengeId, completedChallengeId]);
+  const expiredChallengeId = challengeRows.find(
+    (row) => !knownIds.has(row.id),
+  )?.id;
+  assert.ok(expiredChallengeId);
+  harness.setNow(expiredChallenge.challenge.expiresAt);
+  const expiredBeforeVoid = await getLanding(
+    creator,
+    expiredChallenge.challenge.token,
+  );
+  assert.equal(expiredBeforeVoid.statusCode, 200, expiredBeforeVoid.body);
+  assert.equal(
+    ChallengeLandingResponseSchema.parse(expiredBeforeVoid.json()).status,
+    "expired",
+  );
+
+  const setRows = await harness.database.client<{ daily_set_id: string }[]>`
+    SELECT daily_set_id
+    FROM attempts
+    WHERE id = ${creatorAttempt.attempt.id}
+  `;
+  const dailySetId = setRows[0]!.daily_set_id;
+  const snapshotsBefore = await harness.database.client<
+    { id: string; state: string }[]
+  >`
+    SELECT id, row_to_json(challenges)::text AS state
+    FROM challenges
+    WHERE id IN ${harness.database.client([
+      replayChallengeId,
+      completedChallengeId,
+      expiredChallengeId,
+    ])}
+    ORDER BY id
+  `;
+  const scoresBefore = await harness.database.client<
+    { id: string; score: number | null; status: string }[]
+  >`
+    SELECT id, score::int AS score, status::text AS status
+    FROM attempts
+    WHERE id IN ${harness.database.client([
+      creatorAttempt.attempt.id,
+      firstClaimBody.daily.attempt.id,
+      resultOpponentAttempt.attempt.id,
+    ])}
+    ORDER BY id
+  `;
+  assert.deepEqual(
+    scoresBefore.find((row) => row.id === firstClaimBody.daily.attempt.id),
+    {
+      id: firstClaimBody.daily.attempt.id,
+      score: null,
+      status: "started",
+    },
+  );
+
+  const voidedAt = expiredChallenge.challenge.expiresAt;
+  await harness.database.client`
+    INSERT INTO daily_set_voids (
+      daily_set_id,
+      actor_subject,
+      reason,
+      voided_at
+    )
+    VALUES (
+      ${dailySetId},
+      'challenge-integration-operator',
+      '문항 오류',
+      ${voidedAt}
+    )
+  `;
+
+  for (const key of ["void-create-old-key", "void-create-new-key"]) {
+    const response = await harness.app.inject({
+      method: "POST",
+      url: "/v1/challenges",
+      headers: idempotentHeaders(creator.token, key),
+      payload: { attemptId: creatorAttempt.attempt.id },
+    });
+    expectApiError(response, 409, "DAILY_SET_VOIDED");
+    assert.doesNotMatch(response.body, /creatorScore|nickname|outcome/i);
+    assert.equal(response.body.includes("문항 오류"), false);
+  }
+  for (const key of ["void-claim-old-key", "void-claim-new-key"]) {
+    const response = await claimChallenge(
+      replayOpponent,
+      replayChallenge.challenge.token,
+      key,
+    );
+    expectApiError(response, 409, "DAILY_SET_VOIDED");
+    assert.doesNotMatch(response.body, /score|nickname|outcome/i);
+    assert.equal(response.body.includes("문항 오류"), false);
+  }
+
+  const blockedCompletion = await harness.app.inject({
+    method: "POST",
+    url: `/v1/attempts/${firstClaimBody.daily.attempt.id}/complete`,
+    headers: idempotentHeaders(
+      replayOpponent.token,
+      "void-replay-opponent-complete",
+    ),
+    payload: {},
+  });
+  assert.equal(blockedCompletion.statusCode, 200, blockedCompletion.body);
+  const blockedCompletionBody = CompleteAttemptResponseSchema.parse(
+    blockedCompletion.json(),
+  );
+  assert.equal(blockedCompletionBody.status, "voided");
+  assert.doesNotMatch(
+    blockedCompletion.body,
+    /completedAt|review|score|total/i,
+  );
+  assert.equal(blockedCompletion.body.includes("문항 오류"), false);
+
+  for (const viewer of [creator, replayOpponent, outsider]) {
+    const response = await getLanding(viewer, replayChallenge.challenge.token);
+    assert.equal(response.statusCode, 200, response.body);
+    const body = response.json();
+    const projection = ChallengeLandingResponseSchema.parse(body);
+    assert.equal(projection.status, "voided");
+    assert.deepEqual(Object.keys(body as object).sort(), [
+      "quizDate",
+      "status",
+      "viewerRole",
+      "voidedAt",
+    ]);
+    assert.doesNotMatch(
+      JSON.stringify(body),
+      /expiresAt|nickname|outcome|score/i,
+    );
+    assert.equal(
+      response.body.includes("challenge-integration-operator"),
+      false,
+    );
+    assert.equal(response.body.includes("문항 오류"), false);
+  }
+
+  for (const viewer of [creator, resultOpponent]) {
+    const response = await getResult(
+      viewer,
+      completedChallenge.challenge.token,
+    );
+    assert.equal(response.statusCode, 200, response.body);
+    const body = response.json();
+    const projection = ChallengeResultResponseSchema.parse(body);
+    assert.equal(projection.status, "voided");
+    assert.deepEqual(Object.keys(body as object).sort(), [
+      "quizDate",
+      "status",
+      "viewerRole",
+      "voidedAt",
+    ]);
+    assert.doesNotMatch(
+      JSON.stringify(body),
+      /completedAt|nickname|outcome|score/i,
+    );
+    assert.equal(
+      response.body.includes("challenge-integration-operator"),
+      false,
+    );
+    assert.equal(response.body.includes("문항 오류"), false);
+  }
+
+  const outsiderResult = await getResult(
+    outsider,
+    replayChallenge.challenge.token,
+  );
+  expectApiError(outsiderResult, 404, "CHALLENGE_NOT_FOUND");
+  const redactedOutsiderLanding = await getLanding(
+    outsider,
+    completedChallenge.challenge.token,
+  );
+  expectApiError(redactedOutsiderLanding, 404, "CHALLENGE_NOT_FOUND");
+  const expiredOutsiderLanding = await getLanding(
+    outsider,
+    expiredChallenge.challenge.token,
+  );
+  expectApiError(expiredOutsiderLanding, 404, "CHALLENGE_NOT_FOUND");
+  const expiredCreatorResult = await getResult(
+    creator,
+    expiredChallenge.challenge.token,
+  );
+  expectApiError(expiredCreatorResult, 404, "CHALLENGE_NOT_FOUND");
+  const expiredClaim = await claimChallenge(
+    outsider,
+    expiredChallenge.challenge.token,
+    "void-expired-claim",
+  );
+  expectApiError(expiredClaim, 404, "CHALLENGE_NOT_FOUND");
+
+  const snapshotsAfter = await harness.database.client<
+    { id: string; state: string }[]
+  >`
+    SELECT id, row_to_json(challenges)::text AS state
+    FROM challenges
+    WHERE id IN ${harness.database.client([
+      replayChallengeId,
+      completedChallengeId,
+      expiredChallengeId,
+    ])}
+    ORDER BY id
+  `;
+  const scoresAfter = await harness.database.client<
+    { id: string; score: number | null; status: string }[]
+  >`
+    SELECT id, score::int AS score, status::text AS status
+    FROM attempts
+    WHERE id IN ${harness.database.client([
+      creatorAttempt.attempt.id,
+      firstClaimBody.daily.attempt.id,
+      resultOpponentAttempt.attempt.id,
+    ])}
+    ORDER BY id
+  `;
+  assert.deepEqual(snapshotsAfter, snapshotsBefore);
+  assert.deepEqual(scoresAfter, scoresBefore);
 });

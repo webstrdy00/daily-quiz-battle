@@ -8,7 +8,8 @@ import {
   CreateChallengeResponseSchema,
   DailyStartResponseSchema,
   SubmitAnswerResponseSchema,
-  type DailyStartResponse,
+  type CompletedAttemptResponse,
+  type DailyAvailableStartResponse,
   type PublicQuestion,
   type SubmitAnswerRequest,
 } from "@daily-quiz-battle/contracts";
@@ -76,7 +77,7 @@ async function bootstrapUser(anonymousKey: string): Promise<string> {
   return BootstrapResponseSchema.parse(response.json()).accessToken;
 }
 
-async function startQuiz(token: string): Promise<DailyStartResponse> {
+async function startQuiz(token: string): Promise<DailyAvailableStartResponse> {
   const response = await harness.app.inject({
     method: "POST",
     url: "/v1/daily/start",
@@ -84,7 +85,11 @@ async function startQuiz(token: string): Promise<DailyStartResponse> {
     payload: {},
   });
   assert.equal(response.statusCode, 200, response.body);
-  return DailyStartResponseSchema.parse(response.json());
+  const start = DailyStartResponseSchema.parse(response.json());
+  if (start.status !== "available") {
+    assert.fail("daily set must be available in this fixture");
+  }
+  return start;
 }
 
 function answerPayload(
@@ -144,7 +149,7 @@ async function completeQuiz(
 
 async function answerAllQuestions(
   token: string,
-  start: DailyStartResponse,
+  start: DailyAvailableStartResponse,
   keyPrefix: string,
 ): Promise<void> {
   for (const [index, question] of start.questions.entries()) {
@@ -156,6 +161,14 @@ async function answerAllQuestions(
       correctSelections[index]!,
     );
   }
+}
+
+function parseCompletedAttempt(value: unknown): CompletedAttemptResponse {
+  const result = CompleteAttemptResponseSchema.parse(value);
+  if (result.status !== "completed") {
+    assert.fail("attempt must be completed in this fixture");
+  }
+  return result;
 }
 
 function getTokenUserId(token: string): string {
@@ -219,6 +232,8 @@ test("isolated database setup is migrated, seeded, and ready", async () => {
       ["0011_harden_content_invariants.sql", 1],
       ["0012_attempt_challenge_provenance.sql", 1],
       ["0013_decouple_report_challenge_retention.sql", 1],
+      ["0014_daily_set_voids.sql", 1],
+      ["0015_operation_task_runs.sql", 1],
     ],
   );
 
@@ -332,11 +347,8 @@ test("full daily flow resumes and replays without exposing answers early", async
   );
   assert.equal(completed.statusCode, 200, completed.body);
   assert.equal(completedReplay.statusCode, 200, completedReplay.body);
-  const result = CompleteAttemptResponseSchema.parse(completed.json());
-  assert.deepEqual(
-    CompleteAttemptResponseSchema.parse(completedReplay.json()),
-    result,
-  );
+  const result = parseCompletedAttempt(completed.json());
+  assert.deepEqual(parseCompletedAttempt(completedReplay.json()), result);
   assert.equal(result.score, 5);
   assert.equal(result.review.length, 5);
   assert.ok(result.review.every((item) => item.correct));
@@ -523,13 +535,13 @@ test("retired revisions block new starts without invalidating an existing attemp
   assert.equal(completed.statusCode, 200, completed.body);
   assert.equal(completedReplay.statusCode, 200, completedReplay.body);
   assert.equal(completedRecovery.statusCode, 200, completedRecovery.body);
-  const completedResult = CompleteAttemptResponseSchema.parse(completed.json());
+  const completedResult = parseCompletedAttempt(completed.json());
   assert.deepEqual(
-    CompleteAttemptResponseSchema.parse(completedReplay.json()),
+    parseCompletedAttempt(completedReplay.json()),
     completedResult,
   );
   assert.deepEqual(
-    CompleteAttemptResponseSchema.parse(completedRecovery.json()),
+    parseCompletedAttempt(completedRecovery.json()),
     completedResult,
   );
 
@@ -597,7 +609,7 @@ test("completion scores and reviews answers in displayed choice order", async ()
     "shuffled-complete-1",
   );
   assert.equal(completed.statusCode, 200, completed.body);
-  const result = CompleteAttemptResponseSchema.parse(completed.json());
+  const result = parseCompletedAttempt(completed.json());
 
   assert.equal(result.score, 5);
   assert.deepEqual(
@@ -801,7 +813,7 @@ test("authentication, ownership, ordering, and failed idempotency roll back", as
     "rollback-complete-1",
   );
   assert.equal(completed.statusCode, 200, completed.body);
-  assert.equal(CompleteAttemptResponseSchema.parse(completed.json()).score, 5);
+  assert.equal(parseCompletedAttempt(completed.json()).score, 5);
 
   const processingRecords = await harness.database.client<{ count: number }[]>`
     SELECT count(*)::int AS count
@@ -921,14 +933,9 @@ test("concurrent start, answer, and complete requests converge", async () => {
     completes.every((response) => response.statusCode === 200),
     completes.map((response) => response.body).join("\n"),
   );
-  const firstComplete = CompleteAttemptResponseSchema.parse(
-    completes[0]!.json(),
-  );
+  const firstComplete = parseCompletedAttempt(completes[0]!.json());
   for (const response of completes.slice(1)) {
-    assert.deepEqual(
-      CompleteAttemptResponseSchema.parse(response.json()),
-      firstComplete,
-    );
+    assert.deepEqual(parseCompletedAttempt(response.json()), firstComplete);
   }
 
   const state = await harness.database.client<
@@ -1372,3 +1379,229 @@ test(
     });
   },
 );
+
+test("voided daily sets suppress every progress state and preserve historical rows", async () => {
+  const voidedAt = "2026-08-29T03:30:00.000Z";
+  harness.setNow(PRIMARY_DAY_NOON);
+  const untouchedToken = await bootstrapUser("dev-it-void-untouched");
+  const zeroToken = await bootstrapUser("dev-it-void-zero");
+  const partialToken = await bootstrapUser("dev-it-void-partial");
+  const fiveAnswerToken = await bootstrapUser("dev-it-void-five-answers");
+  const completedToken = await bootstrapUser("dev-it-void-completed");
+  const zeroStart = await startQuiz(zeroToken);
+  const partialStart = await startQuiz(partialToken);
+  const fiveAnswerStart = await startQuiz(fiveAnswerToken);
+  const completedStart = await startQuiz(completedToken);
+
+  for (let index = 0; index < 4; index += 1) {
+    await submitSuccessfulAnswer(
+      partialToken,
+      partialStart.attempt.id,
+      `void-partial-answer-${index + 1}`,
+      partialStart.questions[index]!,
+      correctSelections[index]!,
+    );
+  }
+  await answerAllQuestions(
+    fiveAnswerToken,
+    fiveAnswerStart,
+    "void-five-answers",
+  );
+  await answerAllQuestions(
+    completedToken,
+    completedStart,
+    "void-completed-answer",
+  );
+  const preVoidCompletion = await completeQuiz(
+    completedToken,
+    completedStart.attempt.id,
+    "void-completed-old-key",
+  );
+  assert.equal(preVoidCompletion.statusCode, 200, preVoidCompletion.body);
+  assert.equal(parseCompletedAttempt(preVoidCompletion.json()).score, 5);
+
+  const setRows = await harness.database.client<{ daily_set_id: string }[]>`
+    SELECT daily_set_id
+    FROM attempts
+    WHERE id = ${completedStart.attempt.id}
+  `;
+  const dailySetId = setRows[0]!.daily_set_id;
+  const trackedAttemptIds = [
+    zeroStart.attempt.id,
+    partialStart.attempt.id,
+    fiveAnswerStart.attempt.id,
+    completedStart.attempt.id,
+  ];
+  const historicalBefore = await harness.database.client<
+    {
+      id: string;
+      attempt_state: string;
+      answer_state: string;
+      user_state: string;
+    }[]
+  >`
+    SELECT
+      a.id,
+      row_to_json(a)::text AS attempt_state,
+      (
+        SELECT coalesce(
+          jsonb_agg(row_to_json(aa) ORDER BY aa.sequence),
+          '[]'::jsonb
+        )::text
+        FROM attempt_answers aa
+        WHERE aa.attempt_id = a.id
+      ) AS answer_state,
+      row_to_json(u)::text AS user_state
+    FROM attempts a
+    JOIN users u ON u.id = a.user_id
+    WHERE a.id IN ${harness.database.client(trackedAttemptIds)}
+    ORDER BY a.id
+  `;
+  const oldCompletionRecord = await harness.database.client<
+    { response_body: string }[]
+  >`
+    SELECT response_body::text AS response_body
+    FROM idempotency_records
+    WHERE user_id = ${getTokenUserId(completedToken)}
+      AND operation = ${`complete:${completedStart.attempt.id}`}
+      AND status = 'completed'
+  `;
+  assert.equal(oldCompletionRecord.length, 1);
+
+  await harness.database.client`
+    INSERT INTO daily_set_voids (
+      daily_set_id,
+      actor_subject,
+      reason,
+      voided_at
+    )
+    VALUES (
+      ${dailySetId},
+      'daily-integration-operator',
+      '정답 기준 오류',
+      ${voidedAt}
+    )
+  `;
+
+  const startResponses = await Promise.all(
+    [
+      untouchedToken,
+      zeroToken,
+      partialToken,
+      fiveAnswerToken,
+      completedToken,
+    ].map((token) =>
+      harness.app.inject({
+        method: "POST",
+        url: "/v1/daily/start",
+        headers: authorizationHeaders(token),
+        payload: {},
+      }),
+    ),
+  );
+  for (const response of startResponses) {
+    assert.equal(response.statusCode, 200, response.body);
+    const body = response.json();
+    const projection = DailyStartResponseSchema.parse(body);
+    assert.equal(projection.status, "voided");
+    assert.deepEqual(Object.keys(body as object).sort(), [
+      "quizDate",
+      "status",
+      "voidedAt",
+    ]);
+    assert.doesNotMatch(
+      JSON.stringify(body),
+      /attempt|answer|question|review|score/i,
+    );
+    assert.equal(response.body.includes("daily-integration-operator"), false);
+    assert.equal(response.body.includes("정답 기준 오류"), false);
+  }
+  const untouchedAttempts = await harness.database.client<{ count: number }[]>`
+    SELECT count(*)::int AS count
+    FROM attempts
+    WHERE user_id = ${getTokenUserId(untouchedToken)}
+      AND daily_set_id = ${dailySetId}
+  `;
+  assert.equal(untouchedAttempts[0]?.count, 0);
+
+  const replayedAnswer = await submitAnswer(
+    partialToken,
+    partialStart.attempt.id,
+    "void-partial-answer-1",
+    answerPayload(partialStart.questions[0]!, correctSelections[0]),
+  );
+  expectApiError(replayedAnswer, 409, "DAILY_SET_VOIDED");
+  assert.equal(replayedAnswer.body.includes("정답 기준 오류"), false);
+  const newAnswer = await submitAnswer(
+    partialToken,
+    partialStart.attempt.id,
+    "void-partial-answer-new",
+    answerPayload(partialStart.questions[4]!, correctSelections[4]),
+  );
+  expectApiError(newAnswer, 409, "DAILY_SET_VOIDED");
+  assert.equal(newAnswer.body.includes("정답 기준 오류"), false);
+
+  for (const [token, attemptId, key] of [
+    [zeroToken, zeroStart.attempt.id, "void-zero-complete"],
+    [partialToken, partialStart.attempt.id, "void-partial-complete"],
+    [fiveAnswerToken, fiveAnswerStart.attempt.id, "void-five-answers-complete"],
+    [completedToken, completedStart.attempt.id, "void-completed-old-key"],
+    [completedToken, completedStart.attempt.id, "void-completed-new-key"],
+  ] as const) {
+    const response = await completeQuiz(token, attemptId, key);
+    assert.equal(response.statusCode, 200, response.body);
+    const body = response.json();
+    const projection = CompleteAttemptResponseSchema.parse(body);
+    assert.equal(projection.status, "voided");
+    assert.deepEqual(Object.keys(body as object).sort(), [
+      "attemptId",
+      "quizDate",
+      "status",
+      "voidedAt",
+    ]);
+    assert.doesNotMatch(
+      JSON.stringify(body),
+      /answers|questions|review|score|total|completedAt/i,
+    );
+    assert.equal(response.body.includes("daily-integration-operator"), false);
+    assert.equal(response.body.includes("정답 기준 오류"), false);
+  }
+
+  const historicalAfter = await harness.database.client<
+    {
+      id: string;
+      attempt_state: string;
+      answer_state: string;
+      user_state: string;
+    }[]
+  >`
+    SELECT
+      a.id,
+      row_to_json(a)::text AS attempt_state,
+      (
+        SELECT coalesce(
+          jsonb_agg(row_to_json(aa) ORDER BY aa.sequence),
+          '[]'::jsonb
+        )::text
+        FROM attempt_answers aa
+        WHERE aa.attempt_id = a.id
+      ) AS answer_state,
+      row_to_json(u)::text AS user_state
+    FROM attempts a
+    JOIN users u ON u.id = a.user_id
+    WHERE a.id IN ${harness.database.client(trackedAttemptIds)}
+    ORDER BY a.id
+  `;
+  assert.deepEqual(historicalAfter, historicalBefore);
+  const completionRecordsAfter = await harness.database.client<
+    { response_body: string }[]
+  >`
+    SELECT response_body::text AS response_body
+    FROM idempotency_records
+    WHERE user_id = ${getTokenUserId(completedToken)}
+      AND operation = ${`complete:${completedStart.attempt.id}`}
+      AND status = 'completed'
+    ORDER BY id
+  `;
+  assert.deepEqual(completionRecordsAfter, oldCompletionRecord);
+});

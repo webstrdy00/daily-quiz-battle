@@ -1,3 +1,24 @@
+x-api-image: &api-image
+  image: daily-quiz-battle-api:local
+  build:
+    context: .
+    dockerfile: apps/api/Dockerfile
+
+x-local-api-environment: &local-api-environment
+  APP_ENV: development
+  API_HOST: 0.0.0.0
+  API_PORT: "3000"
+  LOG_LEVEL: info
+  DATABASE_URL: postgres://daily_quiz:daily_quiz_local@postgres:5432/daily_quiz
+  IDENTITY_VERIFICATION_MODE: mock
+  ANON_KEY_PEPPER: local-only-anon-key-pepper-change-before-production-2026
+  ACCESS_TOKEN_SECRET: local-only-access-token-secret-change-before-production-2026
+  ADMIN_ACCESS_TOKEN_SECRET: local-only-admin-access-token-secret-change-before-production-2026
+  CHALLENGE_TOKEN_SECRET: local-only-challenge-token-secret-change-before-production-2026
+  METRICS_ACCESS_TOKEN: local-only-metrics-access-token-do-not-use-in-production
+  NOTIFICATION_TARGET_ENCRYPTION_KEY: bG9jYWwtbm90aWZpY2F0aW9uLWtleS0zMi1ieXRlcyE=
+  ALLOWED_ORIGINS: http://localhost:5173,http://127.0.0.1:5173,${LOCAL_WEB_ORIGIN:-http://127.0.0.1:5173},${LOCAL_ADMIN_ORIGIN:-http://127.0.0.1:5174}
+
 services:
   postgres:
     image: postgres:18.6-alpine
@@ -7,7 +28,7 @@ services:
       POSTGRES_USER: daily_quiz
       POSTGRES_PASSWORD: daily_quiz_local
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U daily_quiz -d daily_quiz"]
       interval: 5s
@@ -18,5 +39,109 @@ services:
       - daily_quiz_postgres_data:/var/lib/postgresql
     restart: unless-stopped
 
+  redis:
+    image: redis:8.2-alpine
+    profiles: ["local-app", "operations", "monitoring"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  migrate:
+    <<: *api-image
+    profiles: ["local-app", "operations", "monitoring"]
+    environment: *local-api-environment
+    command: ["node", "apps/api/dist/db/migrate.js"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    <<: *api-image
+    profiles: ["local-app", "monitoring"]
+    environment:
+      <<: *local-api-environment
+      RATE_LIMIT_REDIS_URL: redis://redis:6379
+    ports:
+      - "127.0.0.1:${LOCAL_API_PORT:-3000}:3000"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3000/health/ready').then((response) => { if (!response.ok) process.exit(1); }).catch(() => process.exit(1));",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    init: true
+    restart: unless-stopped
+
+  operations:
+    <<: *api-image
+    profiles: ["operations"]
+    environment:
+      <<: *local-api-environment
+      RATE_LIMIT_REDIS_URL: redis://redis:6379
+      OPERATIONS_SCHEDULER_ENABLED: "true"
+    command: ["node", "apps/api/dist/operations/scheduler.js"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    init: true
+    stop_grace_period: 10m
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    profiles: ["monitoring"]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+    ports:
+      - "127.0.0.1:${LOCAL_PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./ops/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./ops/monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - daily_quiz_prometheus_data:/prometheus
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:12.1.1
+    profiles: ["monitoring"]
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: local-only-grafana-admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    ports:
+      - "127.0.0.1:${LOCAL_GRAFANA_PORT:-3002}:3000"
+    volumes:
+      - daily_quiz_grafana_data:/var/lib/grafana
+    depends_on:
+      prometheus:
+        condition: service_started
+    restart: unless-stopped
+
 volumes:
   daily_quiz_postgres_data:
+  daily_quiz_prometheus_data:
+  daily_quiz_grafana_data:

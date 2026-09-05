@@ -7,13 +7,14 @@ import { createAdminAccessTokenService } from "./admin/token.js";
 import { createIdentityVerifier } from "./auth/identity-verifier.js";
 import { registerAuthRoutes } from "./auth/routes.js";
 import { createAccessTokenService } from "./auth/token.js";
-import type { AppConfig } from "./config.js";
+import { DEVELOPMENT_METRICS_ACCESS_TOKEN, type AppConfig } from "./config.js";
 import { registerChallengeRoutes } from "./challenge/routes.js";
 import { createChallengeTokenService } from "./challenge/token.js";
 import { registerDailyRoutes } from "./daily/routes.js";
 import type { Database } from "./db/client.js";
 import { registerNotificationRoutes } from "./notification/routes.js";
 import { createNotificationTargetCrypto } from "./notification/target-crypto.js";
+import { registerObservabilityMetrics } from "./observability/metrics.js";
 import { registerReportRoutes } from "./report/routes.js";
 import { AppError, sendError } from "./shared/errors.js";
 import { registerRateLimit } from "./shared/rate-limit.js";
@@ -79,7 +80,17 @@ export async function buildApp({
     referrerPolicy: { policy: "no-referrer" },
   });
 
-  await registerRateLimit(app);
+  await registerRateLimit(app, {
+    redisUrl: config.rateLimitRedisUrl,
+    requireRedis: config.appEnvironment !== "development",
+  });
+
+  registerObservabilityMetrics(app, {
+    appEnvironment: config.appEnvironment,
+    database,
+    metricsAccessToken:
+      config.metricsAccessToken ?? DEVELOPMENT_METRICS_ACCESS_TOKEN,
+  });
 
   app.addHook("onSend", async (request, reply, payload) => {
     reply.header("cache-control", "no-store");

@@ -18,15 +18,16 @@ Apps in Toss WebView에서 매일 같은 5문제를 풀고 친구와 결과를 �
 - Challenge 생성·safe landing·원자 claim·참여자 전용 결과와 win/loss/draw
 - Web deep link token 즉시 URL 제거, 공유/취소, claim/resume, visibility-aware 결과 polling
 - 문제 신고 UI/API, 사용자·사유·시간 bucket dedupe와 최소 정보 저장
-- admin JWT scope 경계, 문제 revision lifecycle, daily set 편성·publish, 최소 audit log
+- 독립 CMS의 memory-only admin JWT, revision lifecycle, daily set 편성·publish·void/correction, 최소 audit log
 - 확인 문구가 필요한 계정 삭제, 인증 무효화, 개인 기록 삭제와 과거 Challenge redaction
 - 암호화된 알림 preference, consent-gated outbox, dedupe/retry/terminal worker
-- 만료·보존기간 기반 cleanup job
+- advisory lock 기반 operations scheduler, 만료·보존기간 cleanup, 실행 ledger
+- Redis 공유 rate limit, 보호된 Prometheus metrics, local alert/dashboard profile
 - semantic HTML, ARIA live region, safe area, reduced motion, 작은 화면 대응
-- PostgreSQL migration `0001`~`0013`, 제약조건/trigger, 로컬 seed
+- PostgreSQL migration `0001`~`0015`, 제약조건/trigger, 로컬 seed
 - pull request/main용 CI 정적 검사·PostgreSQL 통합 테스트·build와 별도 gitleaks job
 
-로컬 구현과 외부 연동 완료는 구분합니다. identity와 notification에는 mTLS adapter가 있지만 실제 자격증명·콘솔 템플릿을 사용한 성공 호출은 확인하지 않았습니다. rate limit은 단일 인스턴스 메모리 store이므로 다중 인스턴스 production 전 shared store가 필요합니다. 운영자가 사용하는 CMS 화면도 아직 없으며 admin content API만 구현되어 있습니다.
+로컬 구현과 외부 연동 완료는 구분합니다. identity와 notification에는 mTLS adapter가 있지만 실제 자격증명·콘솔 템플릿을 사용한 성공 호출은 확인하지 않았습니다. development는 in-memory rate limit fallback을 허용하지만 staging/production은 Redis URL이 없으면 시작하지 않습니다. CMS는 별도 Vite bundle로 구현됐지만 production IAM/SSO와 배포 공급자는 아직 정해지지 않았습니다.
 
 ## 아키텍처
 
@@ -124,6 +125,127 @@ docker compose stop postgres
 
 volume 삭제는 로컬 DB를 모두 제거하는 파괴적 작업이므로 이 문서에서는 자동화하지 않습니다.
 
+## Docker 로컬 API 패키지
+
+`local-app` Compose profile은 공급자 결정 전 로컬에서만 API image, migration, health를 확인하기 위한 opt-in 경로입니다. 기본 `docker compose up -d postgres` 사용법은 그대로 유지되며, profile을 지정하지 않으면 API와 migration 서비스는 실행되지 않습니다.
+
+이 image는 Node.js 24와 pnpm 11.24.0으로 contracts/API를 multi-stage build하고, runtime에서는 비root `node` 사용자로 실행합니다. `.env`, 인증서, `docs`, `node_modules`, `dist`, `.git`은 build context에서 제외되며 image에 실제 자격증명을 넣지 않습니다. Compose가 주입하는 secret 형태의 값은 모두 development 전용 local placeholder입니다.
+
+### Image build
+
+저장소 루트에서 local image를 build합니다.
+
+```powershell
+docker compose --profile local-app build api
+```
+
+### PostgreSQL, migration, API 실행과 health 확인
+
+다음 명령은 PostgreSQL health를 기다리고 migration이 성공한 뒤 API를 시작하며 API readiness까지 기다립니다. migration은 checksum 기반으로 이미 적용한 파일을 다시 적용하지 않으며 seed는 실행하지 않습니다.
+
+```powershell
+docker compose --profile local-app up -d --build --wait api
+Invoke-RestMethod http://127.0.0.1:3000/health/ready
+```
+
+API와 PostgreSQL port는 각각 `127.0.0.1:3000`, `127.0.0.1:5432`에만 bind됩니다.
+
+기존 API가 3000을 사용 중이면 PowerShell에서 `$env:LOCAL_API_PORT="3001"`로 설정한 뒤 실행합니다. 이 경우 health 확인 주소도 `http://127.0.0.1:3001/health/ready`입니다. 기존 프로세스를 종료할 필요는 없습니다.
+
+### 일회성 작업
+
+Migration을 명시적으로 다시 실행:
+
+```powershell
+docker compose --profile local-app run --rm migrate
+```
+
+현재 KST 날짜의 로컬 seed를 명시적으로 실행:
+
+```powershell
+docker compose --profile local-app run --rm api node apps/api/dist/db/seed.js
+```
+
+보존기간 cleanup을 명시적으로 실행:
+
+```powershell
+docker compose --profile local-app run --rm api node apps/api/dist/maintenance/run-cleanup.js
+```
+
+알림 outbox worker를 명시적으로 실행:
+
+```powershell
+docker compose --profile local-app run --rm api node apps/api/dist/notification/run-worker.js
+```
+
+위 일회성 seed, cleanup, worker 명령은 계속 독립적으로 사용할 수 있으며 기존 DB나 volume을 초기화하거나 삭제하지 않습니다. `local-app` profile 자체는 migration 외 작업을 자동 실행하지 않습니다.
+
+### Operations scheduler
+
+API와 별도 process로 notification worker와 cleanup을 반복 실행하는 opt-in `operations` profile을 시작합니다. 이 profile은 같은 API image를 사용하고 PostgreSQL health와 Redis, migration 완료를 기다리지만 API server는 시작하지 않습니다.
+
+```powershell
+docker compose --profile operations up -d --build operations
+docker compose logs -f operations
+```
+
+개발 기본값은 notification worker 30초, cleanup 24시간입니다. `OPERATIONS_NOTIFICATION_INTERVAL_SECONDS`는 15~~300의 정수, `OPERATIONS_CLEANUP_INTERVAL_HOURS`는 1~~24의 정수만 허용합니다. 각 task는 이전 batch가 끝난 뒤 다음 interval을 기다리며, PostgreSQL advisory lock으로 여러 scheduler replica 중 하나만 같은 task를 실행합니다. 실패 시 raw error나 secret 없이 task와 정적 status만 기록하고 최대 5분의 지수 backoff를 적용합니다. 성공 log에는 처리 count와 duration만 추가합니다.
+
+실제 Apps in Toss 알림 template set code와 mTLS certificate/key가 없는 development 구성에서는 notification task를 실행하지 않고 `disabled_unconfigured`를 한 번 기록합니다. cleanup은 계속 실행됩니다. 로컬 Node.js에서 같은 scheduler를 실행할 때는 다음 script를 사용합니다.
+
+```powershell
+corepack pnpm --filter @daily-quiz-battle/api operations:schedule
+```
+
+Scheduler만 중지하려면 다음 명령을 사용합니다. Compose가 SIGTERM을 보내면 새 batch를 시작하지 않고 진행 중인 batch와 DB close를 기다리며, local DB volume은 보존됩니다.
+
+```powershell
+docker compose --profile operations stop operations
+```
+
+staging/production에서는 올바른 interval 설정과 함께 `OPERATIONS_SCHEDULER_ENABLED=true`를 명시해야 scheduler가 시작됩니다. production은 이 development Compose profile이 아니라 별도 외부 orchestrator에서 `node apps/api/dist/operations/scheduler.js`를 API와 분리해 실행해야 합니다. Advisory lock은 replica 중복 실행만 막으며 배포, restart/health monitoring, alerting, secret·mTLS certificate 주입, Apps in Toss template 설정을 제공하지 않습니다. 현재 저장소에는 cloud 공급자 설정이나 실제 template/certificate가 없으므로 production scheduler 실행 또는 실제 알림 발송 완료를 검증한 상태가 아닙니다.
+
+### Local monitoring
+
+공급자 선택 전 metrics scrape, alert rule, dashboard를 로컬에서 확인하는 opt-in `monitoring` profile입니다. 다음 명령은 Grafana의 dependency인 Prometheus와 API, migration, Redis, PostgreSQL을 함께 시작하지만 operations scheduler는 시작하지 않습니다.
+
+```powershell
+docker compose --profile monitoring up -d --build --wait grafana
+```
+
+Prometheus는 Docker internal network에서 `http://api:3000/internal/metrics`를 15초마다 scrape합니다. API와 Prometheus가 공유하는 `METRICS_ACCESS_TOKEN`은 repository에 명시된 development placeholder일 뿐 실제 secret이 아니며 production에서 재사용할 수 없습니다. Prometheus와 Grafana host port도 각각 `127.0.0.1:9090`, `127.0.0.1:3002`에만 bind되고 metrics 전용 public port는 노출하지 않습니다.
+
+Prometheus 상태와 alert evaluation은 다음 local URL에서 확인합니다.
+
+- targets: `http://127.0.0.1:9090/targets`
+- alert rules: `http://127.0.0.1:9090/alerts`
+
+Alert rules는 API target down, 5분 동안 최소 20 request가 있는 경우의 5xx 비율 5% 초과, 1초를 넘는 p95 latency release-stop 기준, notification outbox pending 100개 초과, oldest pending age 5분 초과, failed count 증가를 포함합니다. 이 profile에는 Alertmanager나 production notification routing이 없으므로 Prometheus에서 상태를 평가하고 표시할 뿐 외부로 alert를 전송하지 않습니다.
+
+Grafana는 `http://127.0.0.1:3002`에서 `admin` / `local-only-grafana-admin`으로 로그인합니다. Grafana provisioning은 포함하지 않습니다. **Connections → Data sources**에서 Prometheus data source를 추가하고 server URL을 `http://prometheus:9090`으로 저장한 뒤, **Dashboards → New → Import**에서 `ops/monitoring/grafana-dashboard.json`을 upload하고 그 data source를 선택합니다. Dashboard에는 request rate, 5xx ratio, p95 latency, outbox pending/oldest age/failed gauge와 API target health가 있습니다.
+
+기본 port가 이미 사용 중이면 실행 전에 override합니다.
+
+```powershell
+$env:LOCAL_PROMETHEUS_PORT="19090"
+$env:LOCAL_GRAFANA_PORT="13002"
+docker compose --profile monitoring up -d --build --wait grafana
+```
+
+이 구성은 local development 패키지이며 production monitoring 완료를 뜻하지 않습니다. Production provider, durable storage/retention, authentication, TLS, Alertmanager routing, notification destination과 on-call 운영 절차는 아직 결정·구성·검증되지 않았습니다. 외부 interface에 port를 bind하거나 development token과 Grafana password를 staging/production에서 사용하면 안 됩니다.
+
+### 종료
+
+local-app profile의 API, migration, PostgreSQL container와 network를 내리되 named volume은 보존합니다.
+
+```powershell
+docker compose --profile local-app down
+```
+
+`down -v`는 기존 로컬 DB를 삭제하므로 사용하지 않습니다.
+
+이 profile은 `APP_ENV=development`, `IDENTITY_VERIFICATION_MODE=mock`, HTTP, local placeholder secret을 사용하는 **mock/local-only** 구성입니다. Apps in Toss 콘솔 등록, 실제 mTLS identity, 실제 알림 template/발송, TLS termination, production secret 관리, cloud 배포·과금 환경을 구성하거나 검증하지 않습니다. 외부에서 접근 가능한 배포 또는 production image로 사용하면 안 됩니다.
+
 ## 주요 API 흐름
 
 - Health: `GET /health/live`, `GET /health/ready`
@@ -150,25 +272,27 @@ corepack pnpm typecheck
 corepack pnpm build
 ```
 
-통합 테스트는 Node.js 내장 test runner와 Fastify `inject()`를 사용하며 실제 PostgreSQL에서 8개 suite, 47 tests를 직렬 실행합니다. Daily의 날짜·동시성·`choice_order`·streak·retire resume, Challenge의 token·quota·20-way claim·결과·만료·attempt provenance, 신고 dedupe, admin lifecycle/publish/audit, 삭제/redaction race, cleanup, 암호화 알림 preference, outbox worker의 재시도·동의 철회 동시성을 검증합니다.
+통합 테스트는 Node.js 내장 test runner와 Fastify `inject()`를 사용하며 실제 PostgreSQL에서 10개 suite, 57 tests를 직렬 실행합니다. Daily의 날짜·동시성·`choice_order`·streak·retire/void, Challenge의 token·quota·20-way claim·결과·만료·attempt provenance·void privacy, 신고 dedupe, admin lifecycle/publish/audit/correction, 삭제/redaction race, cleanup, 암호화 알림 preference, outbox worker, 보호된 metrics와 실제 Redis 다중 인스턴스 rate limit을 검증합니다.
 
 테스트 DB 관리자 URL은 `.env`의 `TEST_DATABASE_ADMIN_URL`로 지정할 수 있습니다. 지정하지 않으면 로컬 Compose의 `postgres` maintenance DB를 사용합니다. 이 계정에는 `CREATE DATABASE` 권한이 필요합니다. Harness는 매 실행마다 `daily_quiz_it_<32자리 hex>` 이름의 DB만 생성하고, 이름을 다시 검증한 뒤 해당 DB만 `DROP DATABASE ... WITH (FORCE)`로 제거합니다. 앱 DB, schema, Docker volume은 삭제하지 않으며 최종 검증에서 잔여 임시 DB가 0개인지 확인했습니다.
 
-`build`는 contracts, API, Web을 순서대로 빌드하고 `apps/web/daily-quiz-battle.ait`를 생성합니다. `.ait`, `dist`, local env, DB data, `docs/`는 Git에서 제외됩니다.
+`build`는 contracts, API, Web, Admin CMS를 순서대로 빌드하고 `apps/web/daily-quiz-battle.ait`를 생성합니다. `.ait`, `dist`, local env, DB data, `docs/`는 Git에서 제외됩니다.
 
 2026-09-05 KST working tree 로컬 검증 기록:
 
-- format check, lint, typecheck, contracts/API/Web build 통과
-- 실제 PostgreSQL 통합 테스트 **47 tests, 47 pass, 0 fail**
-- 빈 임시 DB에 `0001`~`0013` migration/seed 적용과 teardown 통과
-- contracts/API/Web production build와 Apps in Toss `.ait` 패키징 통과
+- format check, lint, typecheck, contracts/API/Web/Admin build 통과
+- 실제 PostgreSQL·Redis 통합 테스트 **57 tests, 57 pass, 0 fail**
+- 빈 임시 DB에 `0001`~`0015` migration/seed 적용과 teardown 통과
+- contracts/API/Web/Admin production build와 Apps in Toss `.ait` 패키징 통과
 - Daily full flow와 `choice_order` 채점, 과거 Challenge 지연 완료 시 streak 비회귀, retired revision의 기존 attempt resume/new start 차단 확인
 - Challenge create/claim/result, 20-way claim 1명 수렴, same-set attempt 재사용, win/loss/draw, expiry와 참여자 권한 확인
-- report 최소 저장·dedupe, admin JWT scope/lifecycle/daily publish/audit, 삭제/redaction, cleanup, notification preference/outbox/worker 확인
-- 390×844 브라우저에서 Challenge 양측 무승부 결과, raw token이 제거된 `/challenge` URL, 문항 신고, 알림 preference, 계정 삭제 terminal 화면 확인
+- report 최소 저장·dedupe, admin JWT scope/lifecycle/daily publish/void/audit, 삭제/redaction, cleanup scheduler ledger, notification preference/outbox/worker 확인
+- 390×844 브라우저에서 Challenge 양측 무승부 결과와 raw token 제거를 확인했고, 320×640/200%에서 void 결과 privacy·reflow·focus, CMS memory-only 인증·void/correction focus를 실제 Chromium으로 확인
+- Web과 CMS의 WCAG 2 A/AA axe 검사에서 제품 DOM serious/critical 위반 0건 확인(AIT development overlay 제외)
+- local Prometheus target `up`, 8개 alert rule load, Grafana health, migration 15개 backup/restore rehearsal과 잔여 restore DB 0개 확인
 - `corepack pnpm audit` 결과 알려진 취약점 0건. 취약한 transitive `esbuild`는 workspace override로 `0.25.12`에 고정
 
-`.github/workflows/ci.yml`은 pull request/main에서 install, format, lint, typecheck, high-severity dependency audit, PostgreSQL integration test, build와 별도 gitleaks job을 실행하도록 구성됐습니다. 현행 미커밋 workflow의 원격 CI 성공 증거는 아직 없으며, 위 결과는 2026-09-05 KST 로컬 실행 증거입니다.
+`.github/workflows/ci.yml`은 pull request/main 및 수동 실행에서 install, format, lint, typecheck, high-severity dependency audit, PostgreSQL·Redis integration test, build, Docker/Compose·Prometheus·backup script 정적 검사와 별도 gitleaks job을 실행하도록 구성됐습니다. 현행 미커밋 workflow의 원격 CI 성공 증거는 아직 없으며, 위 결과는 2026-09-05 KST 로컬 실행 증거입니다.
 
 ## 보안·데이터 원칙
 

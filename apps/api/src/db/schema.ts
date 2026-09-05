@@ -227,6 +227,30 @@ export const dailySets = pgTable(
   ],
 );
 
+export const dailySetVoids = pgTable(
+  "daily_set_voids",
+  {
+    dailySetId: uuid("daily_set_id")
+      .primaryKey()
+      .references(() => dailySets.id, { onDelete: "restrict" }),
+    actorSubject: varchar("actor_subject", { length: 100 }).notNull(),
+    reason: varchar("reason", { length: 500 }).notNull(),
+    voidedAt: timestamp("voided_at", { withTimezone: true }).notNull(),
+  },
+  (table) => [
+    check(
+      "daily_set_voids_actor_subject_ck",
+      sql`char_length(btrim(${table.actorSubject})) between 1 and 100
+        and ${table.actorSubject} = btrim(${table.actorSubject})`,
+    ),
+    check(
+      "daily_set_voids_reason_ck",
+      sql`char_length(btrim(${table.reason})) between 1 and 500
+        and ${table.reason} = btrim(${table.reason})`,
+    ),
+  ],
+);
+
 export const dailySetItems = pgTable(
   "daily_set_items",
   {
@@ -386,6 +410,7 @@ export const challenges = pgTable(
   },
   (table) => [
     uniqueIndex("challenges_public_token_hash_uq").on(table.publicTokenHash),
+    index("challenges_daily_set_id_idx").on(table.dailySetId),
     index("challenges_creator_attempt_status_idx").on(
       table.creatorAttemptId,
       table.status,
@@ -478,9 +503,43 @@ export const notificationOutbox = pgTable(
     index("notification_outbox_pending_available_at_idx")
       .on(table.availableAt, table.occurredAt)
       .where(sql`${table.status} = 'pending'`),
+    index("notification_outbox_pending_challenge_id_idx")
+      .on(table.challengeId)
+      .where(sql`${table.status} = 'pending'`),
     check(
       "notification_outbox_attempt_count_ck",
       sql`${table.attemptCount} >= 0`,
+    ),
+  ],
+);
+
+export const operationTaskRuns = pgTable(
+  "operation_task_runs",
+  {
+    taskName: text("task_name").primaryKey(),
+    lastStartedAt: timestamp("last_started_at", {
+      withTimezone: true,
+    }).notNull(),
+    lastSucceededAt: timestamp("last_succeeded_at", { withTimezone: true }),
+    lastFailedAt: timestamp("last_failed_at", { withTimezone: true }),
+    consecutiveFailures: integer("consecutive_failures").notNull().default(0),
+    lastDurationMs: integer("last_duration_ms").notNull().default(0),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    check(
+      "operation_task_runs_task_name_ck",
+      sql`${table.taskName} in ('cleanup', 'notification_worker')`,
+    ),
+    check(
+      "operation_task_runs_consecutive_failures_ck",
+      sql`${table.consecutiveFailures} >= 0`,
+    ),
+    check(
+      "operation_task_runs_last_duration_ms_ck",
+      sql`${table.lastDurationMs} >= 0`,
     ),
   ],
 );

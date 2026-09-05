@@ -1,0 +1,20 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Documented development-only placeholder values"
+regexTarget = "match"
+regexes = [
+  '''local-only-[a-z0-9-]+''',
+  '''bG9jYWwtbm90aWZpY2F0aW9uLWtleS0zMi1ieXRlcyE=''',
+]
+
+[[allowlists]]
+description = "Local tooling state, generated output, and developer environment"
+paths = [
+  '''(^|/)\.gjc/''',
+  '''(^|/)node_modules/''',
+  '''(^|/)dist/''',
+  '''(^|/)\.env$''',
+  '''(^|/)\.gitleaks-temp\.json$''',
+]

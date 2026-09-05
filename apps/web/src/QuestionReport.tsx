@@ -182,6 +182,7 @@ export function QuestionReport({
         </label>
         <textarea
           id={`${formId}-detail`}
+          aria-describedby={`${formId}-detail-help ${formId}-detail-count`}
           value={detail}
           maxLength={500}
           rows={4}
@@ -191,7 +192,12 @@ export function QuestionReport({
           }}
           placeholder="검토에 도움이 되는 내용을 적어 주세요."
         />
-        <small className="question-report-count">{detail.length} / 500자</small>
+        <small id={`${formId}-detail-help`}>
+          이름, 연락처 등 개인정보는 입력하지 마세요.
+        </small>
+        <small id={`${formId}-detail-count`} className="question-report-count">
+          {detail.length} / 500자
+        </small>
       </fieldset>
 
       <div className="question-report-actions">

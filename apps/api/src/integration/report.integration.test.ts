@@ -28,6 +28,8 @@ interface StoredReportRow {
   stored_report: Record<string, unknown>;
 }
 
+type AvailableDailyStart = Extract<DailyStartResponse, { status: "available" }>;
+
 const FIRST_BUCKET_TIME = "2026-08-29T03:02:03.000Z";
 const NEXT_BUCKET_TIME = "2026-08-29T03:10:00.000Z";
 let harness: IntegrationHarness;
@@ -104,7 +106,7 @@ async function bootstrapUser(anonymousKey: string): Promise<string> {
   return BootstrapResponseSchema.parse(response.json()).accessToken;
 }
 
-async function startQuiz(token: string): Promise<DailyStartResponse> {
+async function startQuiz(token: string): Promise<AvailableDailyStart> {
   const response = await harness.app.inject({
     method: "POST",
     url: "/v1/daily/start",
@@ -112,7 +114,9 @@ async function startQuiz(token: string): Promise<DailyStartResponse> {
     payload: {},
   });
   assert.equal(response.statusCode, 200, response.body);
-  return DailyStartResponseSchema.parse(response.json());
+  const start = DailyStartResponseSchema.parse(response.json());
+  assert.equal(start.status, "available");
+  return start as AvailableDailyStart;
 }
 
 async function createReport(

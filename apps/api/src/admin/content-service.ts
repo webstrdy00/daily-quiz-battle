@@ -1,17 +1,32 @@
 import {
   AdminCreateDailySetDraftResponseSchema,
   AdminCreateQuestionRevisionResponseSchema,
+  AdminListAuditLogsResponseSchema,
+  AdminListDailySetsResponseSchema,
+  AdminListQuestionRevisionsResponseSchema,
   AdminPublishDailySetResponseSchema,
   AdminUpdateQuestionRevisionStatusResponseSchema,
+  IsoDateTimeSchema,
+  UuidSchema,
+  type AdminAuditAction,
+  type AdminAuditResourceType,
   type AdminCreateDailySetDraftRequest,
   type AdminCreateDailySetDraftResponse,
   type AdminCreateQuestionRevisionRequest,
   type AdminCreateQuestionRevisionResponse,
+  type AdminListAuditLogsQuery,
+  type AdminListAuditLogsResponse,
+  type AdminListDailySetsQuery,
+  type AdminListDailySetsResponse,
+  type AdminListQuestionRevisionsQuery,
+  type AdminListQuestionRevisionsResponse,
   type AdminPublishDailySetResponse,
   type AdminUpdateQuestionRevisionStatusResponse,
   type ContentStatus,
+  type DailySetStatus,
 } from "@daily-quiz-battle/contracts";
 import type { TransactionSql } from "postgres";
+import { z } from "zod";
 import type { Database } from "../db/client.js";
 import { AppError } from "../shared/errors.js";
 
@@ -36,7 +51,7 @@ interface DailySetRow {
   id: string;
   quiz_date: string;
   version: number;
-  status: "draft" | "published" | "retired";
+  status: DailySetStatus;
   published_at: Date | string | null;
 }
 
@@ -44,6 +59,55 @@ interface DailySetItemRow {
   position: number;
   question_revision_id: string;
 }
+
+interface QuestionRevisionListRow extends QuestionRevisionRow {
+  prompt: string;
+  choices: unknown;
+  correct_index: number;
+  explanation: string;
+  source_url: string;
+  reviewer_id: string;
+  next_review_at: Date | string | null;
+}
+
+interface DailySetListRow extends DailySetRow {
+  created_at: Date | string;
+  void_actor_subject: string | null;
+  void_reason: string | null;
+  voided_at: Date | string | null;
+}
+
+interface DailySetListItemRow {
+  daily_set_id: string;
+  position: number;
+  choice_order: unknown;
+  revision_id: string;
+  question_id: string;
+  revision_number: number;
+  prompt: string;
+  category: string;
+  difficulty: "easy" | "medium" | "hard";
+  lifecycle_status: ContentStatus;
+}
+
+interface AuditLogListRow {
+  id: string;
+  actor_subject: string;
+  action: AdminAuditAction;
+  resource_type: AdminAuditResourceType;
+  resource_id: string;
+  metadata: unknown;
+  created_at: Date | string;
+}
+
+const PaginationCursorPayloadSchema = z
+  .object({
+    createdAt: IsoDateTimeSchema,
+    id: UuidSchema,
+  })
+  .strict();
+
+type PaginationCursorPayload = z.infer<typeof PaginationCursorPayloadSchema>;
 
 const LEGAL_STATUS_TRANSITIONS: Record<
   ContentStatus,
@@ -80,11 +144,53 @@ function revisionNotFound(): AppError {
   });
 }
 
+function encodePaginationCursor(row: {
+  id: string;
+  created_at: Date | string;
+}): string {
+  return Buffer.from(
+    JSON.stringify({
+      createdAt: toIsoDateTime(row.created_at),
+      id: row.id,
+    }),
+  ).toString("base64url");
+}
+
+function decodePaginationCursor(
+  cursor: string | undefined,
+): PaginationCursorPayload | null {
+  if (cursor === undefined) {
+    return null;
+  }
+
+  try {
+    const payload: unknown = JSON.parse(
+      Buffer.from(cursor, "base64url").toString("utf8"),
+    );
+    const parsed = PaginationCursorPayloadSchema.safeParse(payload);
+    if (parsed.success) {
+      return parsed.data;
+    }
+  } catch {
+    // The caller receives the same query-validation response for every
+    // malformed opaque cursor.
+  }
+
+  throw new AppError({
+    statusCode: 400,
+    code: "INVALID_REQUEST",
+    message: "요청 형식이 올바르지 않습니다.",
+    details: {
+      fields: [{ path: "cursor", code: "invalid_format" }],
+    },
+  });
+}
+
 async function insertAuditLog(
   transaction: Transaction,
   actorSubject: string,
-  action: string,
-  resourceType: "question_revision" | "daily_set",
+  action: AdminAuditAction,
+  resourceType: AdminAuditResourceType,
   resourceId: string,
   metadata: Record<string, string>,
 ): Promise<void> {
@@ -104,6 +210,233 @@ async function insertAuditLog(
       ${JSON.stringify(metadata)}::jsonb
     )
   `;
+}
+
+export async function listQuestionRevisions(
+  database: Database,
+  query: AdminListQuestionRevisionsQuery,
+): Promise<AdminListQuestionRevisionsResponse> {
+  const cursor = decodePaginationCursor(query.cursor);
+  const cursorCreatedAt = cursor?.createdAt ?? null;
+  const cursorId = cursor?.id ?? null;
+  const status = query.status ?? null;
+  const rows = await database.client<QuestionRevisionListRow[]>`
+    SELECT
+      id,
+      question_id,
+      revision_number::int AS revision_number,
+      prompt,
+      choices,
+      correct_index::int AS correct_index,
+      explanation,
+      source_url,
+      source_checked_at,
+      category,
+      difficulty::text AS difficulty,
+      lifecycle_status::text AS lifecycle_status,
+      reviewer_id,
+      time_sensitive,
+      valid_until,
+      next_review_at,
+      published_at,
+      retired_at,
+      created_at
+    FROM question_revisions
+    WHERE (
+      ${status}::content_status IS NULL
+      OR lifecycle_status = ${status}::content_status
+    )
+      AND (
+        ${cursorCreatedAt}::timestamptz IS NULL
+        OR (created_at, id) < (
+          ${cursorCreatedAt}::timestamptz,
+          ${cursorId}::uuid
+        )
+      )
+    ORDER BY created_at DESC, id DESC
+    LIMIT ${query.limit + 1}
+  `;
+  const hasNextPage = rows.length > query.limit;
+  const page = rows.slice(0, query.limit);
+  const lastRow = page.at(-1);
+
+  return AdminListQuestionRevisionsResponseSchema.parse({
+    questionRevisions: page.map((row) => ({
+      revisionId: row.id,
+      questionId: row.question_id,
+      revisionNumber: row.revision_number,
+      prompt: row.prompt,
+      choices: row.choices,
+      correctIndex: row.correct_index,
+      explanation: row.explanation,
+      sourceUrl: row.source_url,
+      sourceCheckedAt: toIsoDateTime(row.source_checked_at),
+      category: row.category,
+      difficulty: row.difficulty,
+      status: row.lifecycle_status,
+      reviewerId: row.reviewer_id,
+      timeSensitive: row.time_sensitive,
+      validUntil: toNullableIsoDateTime(row.valid_until),
+      nextReviewAt: toNullableIsoDateTime(row.next_review_at),
+      publishedAt: toNullableIsoDateTime(row.published_at),
+      retiredAt: toNullableIsoDateTime(row.retired_at),
+      createdAt: toIsoDateTime(row.created_at),
+    })),
+    nextCursor:
+      hasNextPage && lastRow !== undefined
+        ? encodePaginationCursor(lastRow)
+        : null,
+  });
+}
+
+export async function listDailySets(
+  database: Database,
+  query: AdminListDailySetsQuery,
+): Promise<AdminListDailySetsResponse> {
+  const status = query.status ?? null;
+  const dailySets = await database.client<DailySetListRow[]>`
+    SELECT
+      ds.id,
+      ds.quiz_date::text AS quiz_date,
+      ds.version::int AS version,
+      ds.status::text AS status,
+      ds.published_at,
+      ds.created_at,
+      dsv.actor_subject AS void_actor_subject,
+      dsv.reason AS void_reason,
+      dsv.voided_at
+    FROM daily_sets ds
+    LEFT JOIN daily_set_voids dsv ON dsv.daily_set_id = ds.id
+    WHERE ds.quiz_date BETWEEN ${query.from}::date AND ${query.to}::date
+      AND (
+        ${status}::daily_set_status IS NULL
+        OR ds.status = ${status}::daily_set_status
+      )
+    ORDER BY ds.quiz_date DESC, ds.id DESC
+  `;
+
+  if (dailySets.length === 0) {
+    return AdminListDailySetsResponseSchema.parse({ dailySets: [] });
+  }
+
+  const dailySetIds = dailySets.map((dailySet) => dailySet.id);
+  const itemRows = await database.client<DailySetListItemRow[]>`
+    SELECT
+      dsi.daily_set_id,
+      dsi.position::int AS position,
+      dsi.choice_order,
+      qr.id AS revision_id,
+      qr.question_id,
+      qr.revision_number::int AS revision_number,
+      qr.prompt,
+      qr.category,
+      qr.difficulty::text AS difficulty,
+      qr.lifecycle_status::text AS lifecycle_status
+    FROM daily_set_items dsi
+    JOIN question_revisions qr ON qr.id = dsi.question_revision_id
+    WHERE dsi.daily_set_id IN ${database.client(dailySetIds)}
+    ORDER BY dsi.daily_set_id, dsi.position
+  `;
+  const itemsByDailySetId = new Map<
+    string,
+    Array<{
+      position: number;
+      choiceOrder: unknown;
+      revision: {
+        revisionId: string;
+        questionId: string;
+        revisionNumber: number;
+        prompt: string;
+        category: string;
+        difficulty: "easy" | "medium" | "hard";
+        status: ContentStatus;
+      };
+    }>
+  >();
+  for (const row of itemRows) {
+    const items = itemsByDailySetId.get(row.daily_set_id) ?? [];
+    items.push({
+      position: row.position,
+      choiceOrder: row.choice_order,
+      revision: {
+        revisionId: row.revision_id,
+        questionId: row.question_id,
+        revisionNumber: row.revision_number,
+        prompt: row.prompt,
+        category: row.category,
+        difficulty: row.difficulty,
+        status: row.lifecycle_status,
+      },
+    });
+    itemsByDailySetId.set(row.daily_set_id, items);
+  }
+
+  return AdminListDailySetsResponseSchema.parse({
+    dailySets: dailySets.map((dailySet) => ({
+      dailySetId: dailySet.id,
+      quizDate: dailySet.quiz_date,
+      version: dailySet.version,
+      status: dailySet.status,
+      publishedAt: toNullableIsoDateTime(dailySet.published_at),
+      createdAt: toIsoDateTime(dailySet.created_at),
+      void:
+        dailySet.voided_at === null
+          ? null
+          : {
+              actorSubject: dailySet.void_actor_subject,
+              reason: dailySet.void_reason,
+              voidedAt: toIsoDateTime(dailySet.voided_at),
+            },
+      items: itemsByDailySetId.get(dailySet.id) ?? [],
+    })),
+  });
+}
+
+export async function listAuditLogs(
+  database: Database,
+  query: AdminListAuditLogsQuery,
+): Promise<AdminListAuditLogsResponse> {
+  const cursor = decodePaginationCursor(query.cursor);
+  const cursorCreatedAt = cursor?.createdAt ?? null;
+  const cursorId = cursor?.id ?? null;
+  const rows = await database.client<AuditLogListRow[]>`
+    SELECT
+      id,
+      actor_subject,
+      action,
+      resource_type,
+      resource_id,
+      metadata,
+      created_at
+    FROM admin_audit_logs
+    WHERE (
+      ${cursorCreatedAt}::timestamptz IS NULL
+      OR (created_at, id) < (
+        ${cursorCreatedAt}::timestamptz,
+        ${cursorId}::uuid
+      )
+    )
+    ORDER BY created_at DESC, id DESC
+    LIMIT ${query.limit + 1}
+  `;
+  const hasNextPage = rows.length > query.limit;
+  const page = rows.slice(0, query.limit);
+  const lastRow = page.at(-1);
+
+  return AdminListAuditLogsResponseSchema.parse({
+    auditLogs: page.map((row) => ({
+      actorSubject: row.actor_subject,
+      action: row.action,
+      resourceType: row.resource_type,
+      resourceId: row.resource_id,
+      metadata: row.metadata,
+      createdAt: toIsoDateTime(row.created_at),
+    })),
+    nextCursor:
+      hasNextPage && lastRow !== undefined
+        ? encodePaginationCursor(lastRow)
+        : null,
+  });
 }
 
 export async function createQuestionRevision(

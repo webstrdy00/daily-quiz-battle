@@ -10,8 +10,49 @@ interface InlineMessage {
   requestId?: string;
 }
 
+type ActiveChallengeLanding = Exclude<
+  ChallengeLandingResponse,
+  { status: "voided" }
+>;
+type WaitingChallengeResult = Exclude<
+  ChallengeResultResponse,
+  { status: "completed" | "redacted" | "voided" }
+>;
+type FinalChallengeResult = Extract<
+  ChallengeResultResponse,
+  { status: "completed" | "redacted" }
+>;
+
 export type ChallengeIssueKind =
   "self" | "expired" | "not-found" | "already-claimed";
+
+export function VoidedResultScreen({
+  onToday,
+  headingRef,
+}: {
+  onToday: () => void;
+  headingRef: Ref<HTMLHeadingElement>;
+}) {
+  return (
+    <main className="app-shell voided-shell">
+      <section className="card voided-card" aria-labelledby="voided-title">
+        <span className="status-icon voided-icon" aria-hidden="true">
+          –
+        </span>
+        <p className="eyebrow">RESULT NOTICE</p>
+        <h1 id="voided-title" ref={headingRef} tabIndex={-1}>
+          해당 날짜의 결과가 무효 처리됐어요
+        </h1>
+        <p>
+          운영 검토에 따라 기존 점수, 정답, 대결 상대와 승패는 표시하지 않아요.
+        </p>
+        <button className="primary-button" onClick={onToday}>
+          오늘 화면으로 이동
+        </button>
+      </section>
+    </main>
+  );
+}
 
 export function ChallengeLandingScreen({
   landing,
@@ -21,7 +62,7 @@ export function ChallengeLandingScreen({
   error,
   headingRef,
 }: {
-  landing: ChallengeLandingResponse;
+  landing: ActiveChallengeLanding;
   onClaim: () => void;
   onToday: () => void;
   busy: boolean;
@@ -79,7 +120,7 @@ export function ChallengeWaitingScreen({
   message,
   headingRef,
 }: {
-  result: ChallengeResultResponse | null;
+  result: WaitingChallengeResult | null;
   paused: boolean;
   refreshing: boolean;
   onRefresh: () => void;
@@ -134,10 +175,6 @@ export function ChallengeWaitingScreen({
         </section>
       </main>
     );
-  }
-
-  if (result.status === "completed" || result.status === "redacted") {
-    return null;
   }
 
   const isCreator = result.viewerRole === "creator";
@@ -222,14 +259,10 @@ export function ChallengeResultScreen({
   onToday,
   headingRef,
 }: {
-  result: ChallengeResultResponse;
+  result: FinalChallengeResult;
   onToday: () => void;
   headingRef: Ref<HTMLHeadingElement>;
 }) {
-  if (result.status !== "completed" && result.status !== "redacted") {
-    return null;
-  }
-
   if (result.status === "redacted") {
     return (
       <main className="app-shell challenge-shell">

@@ -70,6 +70,10 @@ export class ApiClientError extends Error {
   }
 }
 
+export function isDailySetVoidedError(error: unknown): error is ApiClientError {
+  return error instanceof ApiClientError && error.code === "DAILY_SET_VOIDED";
+}
+
 function assertSecureApiEndpoint(): void {
   const endpoint = new URL(apiBaseUrl, window.location.origin);
   const loopback =

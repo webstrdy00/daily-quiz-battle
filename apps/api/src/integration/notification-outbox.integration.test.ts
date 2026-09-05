@@ -6,7 +6,8 @@ import {
   CompleteAttemptResponseSchema,
   CreateChallengeResponseSchema,
   DailyStartResponseSchema,
-  type DailyStartResponse,
+  type CompletedAttemptResponse,
+  type DailyAvailableStartResponse,
 } from "@daily-quiz-battle/contracts";
 import { decodeJwt } from "jose";
 import {
@@ -119,7 +120,7 @@ async function disableNotifications(user: TestUser): Promise<void> {
   assert.equal(response.statusCode, 200, response.body);
 }
 
-async function startQuiz(user: TestUser): Promise<DailyStartResponse> {
+async function startQuiz(user: TestUser): Promise<DailyAvailableStartResponse> {
   const response = await harness.app.inject({
     method: "POST",
     url: "/v1/daily/start",
@@ -127,15 +128,27 @@ async function startQuiz(user: TestUser): Promise<DailyStartResponse> {
     payload: {},
   });
   assert.equal(response.statusCode, 200, response.body);
-  return DailyStartResponseSchema.parse(response.json());
+  const start = DailyStartResponseSchema.parse(response.json());
+  if (start.status !== "available") {
+    assert.fail("daily set must be available in this fixture");
+  }
+  return start;
+}
+
+function parseCompletedAttempt(value: unknown): CompletedAttemptResponse {
+  const result = CompleteAttemptResponseSchema.parse(value);
+  if (result.status !== "completed") {
+    assert.fail("attempt must be completed in this fixture");
+  }
+  return result;
 }
 
 async function finishQuiz(
   user: TestUser,
   label: string,
   score: number,
-  existingStart?: DailyStartResponse,
-): Promise<DailyStartResponse> {
+  existingStart?: DailyAvailableStartResponse,
+): Promise<DailyAvailableStartResponse> {
   const start = existingStart ?? (await startQuiz(user));
   for (const [index, question] of start.questions.entries()) {
     const correctIndex = correctSelections[index]!;
@@ -160,7 +173,7 @@ async function finishQuiz(
     payload: {},
   });
   assert.equal(completion.statusCode, 200, completion.body);
-  const completed = CompleteAttemptResponseSchema.parse(completion.json());
+  const completed = parseCompletedAttempt(completion.json());
   assert.equal(completed.score, score);
   return {
     ...start,
@@ -250,7 +263,7 @@ async function createCompletedChallenge(
       payload: {},
     });
     assert.equal(replay.statusCode, 200, replay.body);
-    assert.equal(CompleteAttemptResponseSchema.parse(replay.json()).score, 2);
+    assert.equal(parseCompletedAttempt(replay.json()).score, 2);
   }
 
   return {
@@ -724,4 +737,44 @@ test("account deletion removes an unsent recipient outbox", async () => {
   );
   assert.deepEqual(counts, zeroCounts);
   assert.deepEqual(recording.callIds, []);
+});
+
+test("worker terminally skips a pending event whose daily set was voided", async () => {
+  const fixture = await createCompletedChallenge("voided-worker");
+  await makeAvailable(fixture.challengeId);
+  const setRows = await harness.database.client<{ daily_set_id: string }[]>`
+    SELECT daily_set_id
+    FROM challenges
+    WHERE id = ${fixture.challengeId}
+  `;
+  const dailySetId = setRows[0]!.daily_set_id;
+  await harness.database.client`
+    INSERT INTO daily_set_voids (
+      daily_set_id,
+      actor_subject,
+      reason,
+      voided_at
+    )
+    VALUES (
+      ${dailySetId},
+      'outbox-integration-operator',
+      '결과 알림 중단 검증',
+      ${WORKER_AT.toISOString()}
+    )
+  `;
+
+  const recording = createRecordingSender();
+  const counts = await runNotificationWorker(
+    harness.database,
+    recording.sender,
+    { now: WORKER_AT },
+  );
+  assert.deepEqual(counts, { ...zeroCounts, skipped: 1 });
+  assert.deepEqual(recording.callIds, []);
+
+  const row = (await getOutboxRows(fixture.challengeId))[0]!;
+  assert.equal(row.status, "failed");
+  assert.equal(row.last_error, "daily_set_voided");
+  assert.equal(row.attempt_count, 0);
+  assert.equal(row.published_at, null);
 });

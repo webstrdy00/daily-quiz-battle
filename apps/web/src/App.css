@@ -748,6 +748,30 @@ fieldset {
   align-content: start;
 }
 
+.voided-shell {
+  display: grid;
+  align-content: start;
+}
+
+.voided-card {
+  margin-top: min(12vh, 96px);
+  padding: 38px 28px 28px;
+  text-align: center;
+}
+
+.voided-card h1 {
+  font-size: clamp(26px, 7vw, 36px);
+}
+
+.voided-card .primary-button {
+  margin-top: 24px;
+}
+
+.voided-icon {
+  color: var(--text-secondary);
+  background: var(--line);
+}
+
 .challenge-shell .hero-card {
   margin-top: min(10vh, 72px);
 }

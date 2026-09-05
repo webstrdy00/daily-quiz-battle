@@ -3,8 +3,12 @@ import { after, before, test } from "node:test";
 import {
   AdminCreateDailySetDraftResponseSchema,
   AdminCreateQuestionRevisionResponseSchema,
+  AdminListAuditLogsResponseSchema,
+  AdminListDailySetsResponseSchema,
+  AdminListQuestionRevisionsResponseSchema,
   AdminPublishDailySetResponseSchema,
   AdminUpdateQuestionRevisionStatusResponseSchema,
+  AdminVoidDailySetResponseSchema,
   ApiErrorSchema,
   BootstrapResponseSchema,
   UuidSchema,
@@ -789,4 +793,572 @@ test("daily composition, publication rules, rolling uniqueness, validity, and au
       false,
     );
   }
+});
+
+test("admin content reads enforce the existing content-write boundary", async () => {
+  const urls = [
+    `${ADMIN_CONTENT_URL}/question-revisions`,
+    `${ADMIN_CONTENT_URL}/daily-sets?from=2040-01-01&to=2040-01-02`,
+    `${ADMIN_CONTENT_URL}/audit-logs`,
+  ];
+  for (const url of urls) {
+    const unauthenticated = await harness.app.inject({ method: "GET", url });
+    expectApiError(unauthenticated, 401, "ADMIN_UNAUTHORIZED");
+  }
+
+  const userToken = await bootstrapUser("dev-admin-content-read-user");
+  const userCredential = await harness.app.inject({
+    method: "GET",
+    url: `${ADMIN_CONTENT_URL}/question-revisions`,
+    headers: authorizationHeaders(userToken),
+  });
+  expectApiError(userCredential, 401, "ADMIN_UNAUTHORIZED");
+
+  const readOnlyToken = await issueAdminToken("admin-content-reader", [
+    "content:read",
+  ]);
+  const insufficientScope = await harness.app.inject({
+    method: "GET",
+    url: `${ADMIN_CONTENT_URL}/audit-logs`,
+    headers: authorizationHeaders(readOnlyToken),
+  });
+  expectApiError(insufficientScope, 403, "ADMIN_FORBIDDEN");
+});
+
+test("admin content reads validate, filter, and keyset-page CMS data", async () => {
+  harness.setNow("2040-01-10T00:00:00.000Z");
+  const actorSubject = "admin-cms-read-writer";
+  const token = await issueAdminToken(actorSubject);
+  const reviewPayloads = [
+    questionPayload("cms-read-a", "easy", "  CMS-READ-ALPHA  "),
+    questionPayload("cms-read-b", "easy", "cms-read-alpha"),
+    questionPayload("cms-read-c", "medium", "cms-read-beta"),
+  ];
+  const reviewRevisions = [];
+  for (const payload of reviewPayloads) {
+    const revision = await createRevision(token, payload);
+    await updateRevisionStatus(token, revision.revisionId, "review");
+    reviewRevisions.push(revision);
+  }
+  const reviewRevisionIds = reviewRevisions.map(
+    (revision) => revision.revisionId,
+  );
+  await harness.database.client`
+    UPDATE question_revisions
+    SET created_at = ${"2040-01-03T00:00:00.000Z"}
+    WHERE id IN ${harness.database.client(reviewRevisionIds)}
+  `;
+
+  const expectedRevisionOrder = [...reviewRevisionIds].sort((left, right) =>
+    left < right ? 1 : left > right ? -1 : 0,
+  );
+  const firstRevisionPageResponse = await harness.app.inject({
+    method: "GET",
+    url: `${ADMIN_CONTENT_URL}/question-revisions?status=review&limit=2`,
+    headers: authorizationHeaders(token),
+  });
+  assert.equal(
+    firstRevisionPageResponse.statusCode,
+    200,
+    firstRevisionPageResponse.body,
+  );
+  const firstRevisionPage = AdminListQuestionRevisionsResponseSchema.parse(
+    firstRevisionPageResponse.json(),
+  );
+  assert.deepEqual(
+    firstRevisionPage.questionRevisions.map((revision) => revision.revisionId),
+    expectedRevisionOrder.slice(0, 2),
+  );
+  assert.ok(
+    firstRevisionPage.questionRevisions.every(
+      (revision) => revision.status === "review",
+    ),
+  );
+  assert.ok(
+    firstRevisionPage.questionRevisions.every(
+      (revision) =>
+        revision.category === revision.category.trim().toLowerCase(),
+    ),
+  );
+  assert.ok(
+    firstRevisionPage.questionRevisions.every(
+      (revision) =>
+        revision.prompt.length > 0 &&
+        revision.sourceUrl.startsWith("https://example.com/content/") &&
+        revision.sourceCheckedAt === DEFAULT_SOURCE_CHECKED_AT &&
+        revision.reviewerId.startsWith("reviewer-") &&
+        revision.createdAt === "2040-01-03T00:00:00.000Z",
+    ),
+  );
+  assert.notEqual(firstRevisionPage.nextCursor, null);
+
+  const secondRevisionPageResponse = await harness.app.inject({
+    method: "GET",
+    url: `${ADMIN_CONTENT_URL}/question-revisions?status=review&limit=2&cursor=${encodeURIComponent(
+      firstRevisionPage.nextCursor!,
+    )}`,
+    headers: authorizationHeaders(token),
+  });
+  assert.equal(
+    secondRevisionPageResponse.statusCode,
+    200,
+    secondRevisionPageResponse.body,
+  );
+  const secondRevisionPage = AdminListQuestionRevisionsResponseSchema.parse(
+    secondRevisionPageResponse.json(),
+  );
+  assert.equal(
+    secondRevisionPage.questionRevisions[0]?.revisionId,
+    expectedRevisionOrder[2],
+  );
+  assert.equal(
+    secondRevisionPage.questionRevisions.some((revision) =>
+      firstRevisionPage.questionRevisions.some(
+        (firstRevision) => firstRevision.revisionId === revision.revisionId,
+      ),
+    ),
+    false,
+  );
+
+  for (const revision of reviewRevisions) {
+    await updateRevisionStatus(token, revision.revisionId, "approved");
+    await updateRevisionStatus(token, revision.revisionId, "published");
+  }
+  const finalRevisions = await Promise.all([
+    publishRevision(token, "cms-read-d", "medium", "cms-read-beta"),
+    publishRevision(token, "cms-read-e", "hard", "cms-read-gamma"),
+  ]);
+  const publishedRevisions: PublishedRevision[] = [
+    {
+      ...reviewRevisions[0]!,
+      category: "cms-read-alpha",
+      difficulty: "easy",
+    },
+    {
+      ...reviewRevisions[1]!,
+      category: "cms-read-alpha",
+      difficulty: "easy",
+    },
+    {
+      ...reviewRevisions[2]!,
+      category: "cms-read-beta",
+      difficulty: "medium",
+    },
+    ...finalRevisions,
+  ];
+  const firstDailySet = await createDailySet(
+    token,
+    "2040-02-01",
+    publishedRevisions,
+  );
+  const secondDailySet = await createDailySet(
+    token,
+    "2040-02-02",
+    publishedRevisions,
+  );
+
+  const dailySetsResponse = await harness.app.inject({
+    method: "GET",
+    url: `${ADMIN_CONTENT_URL}/daily-sets?from=2040-02-01&to=2040-02-02&status=draft`,
+    headers: authorizationHeaders(token),
+  });
+  assert.equal(dailySetsResponse.statusCode, 200, dailySetsResponse.body);
+  const dailySets = AdminListDailySetsResponseSchema.parse(
+    dailySetsResponse.json(),
+  ).dailySets;
+  assert.deepEqual(
+    dailySets.map((dailySet) => dailySet.quizDate),
+    ["2040-02-02", "2040-02-01"],
+  );
+  assert.ok(dailySets.every((dailySet) => dailySet.status === "draft"));
+  assert.ok(dailySets.every((dailySet) => dailySet.items.length === 5));
+  assert.deepEqual(
+    dailySets[0]?.items.map((item) => item.position),
+    [1, 2, 3, 4, 5],
+  );
+  assert.ok(
+    dailySets.every((dailySet) =>
+      dailySet.items.every(
+        (item) =>
+          item.revision.status === "published" &&
+          item.revision.prompt.startsWith("Sensitive prompt cms-read-"),
+      ),
+    ),
+  );
+
+  const invalidRequests = await Promise.all([
+    harness.app.inject({
+      method: "GET",
+      url: `${ADMIN_CONTENT_URL}/question-revisions?status=unknown`,
+      headers: authorizationHeaders(token),
+    }),
+    harness.app.inject({
+      method: "GET",
+      url: `${ADMIN_CONTENT_URL}/question-revisions?limit=101`,
+      headers: authorizationHeaders(token),
+    }),
+    harness.app.inject({
+      method: "GET",
+      url: `${ADMIN_CONTENT_URL}/question-revisions?cursor=bm90LWpzb24`,
+      headers: authorizationHeaders(token),
+    }),
+    harness.app.inject({
+      method: "GET",
+      url: `${ADMIN_CONTENT_URL}/daily-sets?from=2040-01-01&to=2040-04-01`,
+      headers: authorizationHeaders(token),
+    }),
+    harness.app.inject({
+      method: "GET",
+      url: `${ADMIN_CONTENT_URL}/daily-sets?from=2040-02-02&to=2040-02-01`,
+      headers: authorizationHeaders(token),
+    }),
+    harness.app.inject({
+      method: "GET",
+      url: `${ADMIN_CONTENT_URL}/audit-logs?limit=0`,
+      headers: authorizationHeaders(token),
+    }),
+  ]);
+  for (const response of invalidRequests) {
+    expectApiError(response, 400, "INVALID_REQUEST");
+  }
+
+  const dailySetIds = [firstDailySet.dailySetId, secondDailySet.dailySetId];
+  await harness.database.client`
+    UPDATE admin_audit_logs
+    SET created_at = ${"2042-01-01T00:00:00.000Z"}
+    WHERE resource_type = 'daily_set'
+      AND resource_id IN ${harness.database.client(dailySetIds)}
+  `;
+  const expectedAuditRows = await harness.database.client<
+    { resource_id: string }[]
+  >`
+    SELECT resource_id
+    FROM admin_audit_logs
+    WHERE resource_type = 'daily_set'
+      AND resource_id IN ${harness.database.client(dailySetIds)}
+    ORDER BY created_at DESC, id DESC
+  `;
+  const expectedAuditOrder = expectedAuditRows.map((row) => row.resource_id);
+  const firstAuditPageResponse = await harness.app.inject({
+    method: "GET",
+    url: `${ADMIN_CONTENT_URL}/audit-logs?limit=1`,
+    headers: authorizationHeaders(token),
+  });
+  assert.equal(
+    firstAuditPageResponse.statusCode,
+    200,
+    firstAuditPageResponse.body,
+  );
+  const firstAuditPage = AdminListAuditLogsResponseSchema.parse(
+    firstAuditPageResponse.json(),
+  );
+  const firstAuditLog = firstAuditPage.auditLogs[0];
+  assert.ok(firstAuditLog);
+  assert.deepEqual(Object.keys(firstAuditLog).sort(), [
+    "action",
+    "actorSubject",
+    "createdAt",
+    "metadata",
+    "resourceId",
+    "resourceType",
+  ]);
+  assert.equal(firstAuditLog.actorSubject, actorSubject);
+  assert.equal(firstAuditLog.action, "daily_set.create");
+  assert.equal(firstAuditLog.resourceType, "daily_set");
+  assert.equal(firstAuditLog.resourceId, expectedAuditOrder[0]);
+  assert.equal(firstAuditLog.createdAt, "2042-01-01T00:00:00.000Z");
+  assert.deepEqual(firstAuditLog.metadata, {
+    action: "daily_set.create",
+    status: "draft",
+  });
+  assert.equal(JSON.stringify(firstAuditPage).includes(token), false);
+  assert.doesNotMatch(
+    JSON.stringify(firstAuditPage),
+    /prompt|choices|correctIndex|explanation|sourceUrl/i,
+  );
+  assert.notEqual(firstAuditPage.nextCursor, null);
+
+  const secondAuditPageResponse = await harness.app.inject({
+    method: "GET",
+    url: `${ADMIN_CONTENT_URL}/audit-logs?limit=1&cursor=${encodeURIComponent(
+      firstAuditPage.nextCursor!,
+    )}`,
+    headers: authorizationHeaders(token),
+  });
+  assert.equal(
+    secondAuditPageResponse.statusCode,
+    200,
+    secondAuditPageResponse.body,
+  );
+  const secondAuditPage = AdminListAuditLogsResponseSchema.parse(
+    secondAuditPageResponse.json(),
+  );
+  assert.equal(secondAuditPage.auditLogs[0]?.resourceId, expectedAuditOrder[1]);
+});
+
+test("daily-set void requires its dedicated scope and is immutable, replayable, and listable", async () => {
+  const voidedAt = "2041-03-01T09:30:00.000Z";
+  harness.setNow(voidedAt);
+  const writerToken = await issueAdminToken("admin-void-content-writer");
+  const firstVoidToken = await issueAdminToken("admin-void-operator-a", [
+    "content:void",
+  ]);
+  const secondVoidToken = await issueAdminToken("admin-void-operator-b", [
+    "content:void",
+  ]);
+  const revisions = await Promise.all([
+    publishRevision(writerToken, "void-a", "easy", "void-alpha"),
+    publishRevision(writerToken, "void-b", "easy", "void-alpha"),
+    publishRevision(writerToken, "void-c", "medium", "void-beta"),
+    publishRevision(writerToken, "void-d", "medium", "void-beta"),
+    publishRevision(writerToken, "void-e", "hard", "void-gamma"),
+  ]);
+  const publishedDraft = await createDailySet(
+    writerToken,
+    "2041-03-10",
+    revisions,
+  );
+  const publishedResponse = await publishDailySet(
+    writerToken,
+    publishedDraft.dailySetId,
+  );
+  assert.equal(publishedResponse.statusCode, 200, publishedResponse.body);
+  const draft = await createDailySet(writerToken, "2041-03-11", revisions);
+
+  const writerDenied = await harness.app.inject({
+    method: "PUT",
+    url: `${ADMIN_CONTENT_URL}/daily-sets/${publishedDraft.dailySetId}/void`,
+    headers: authorizationHeaders(writerToken),
+    payload: { reason: "잘못된 점수 기준" },
+  });
+  expectApiError(writerDenied, 403, "ADMIN_FORBIDDEN");
+
+  const draftDenied = await harness.app.inject({
+    method: "PUT",
+    url: `${ADMIN_CONTENT_URL}/daily-sets/${draft.dailySetId}/void`,
+    headers: authorizationHeaders(firstVoidToken),
+    payload: { reason: "게시 전 무효 처리 시도" },
+  });
+  expectApiError(draftDenied, 409, "DAILY_SET_NOT_PUBLISHED");
+
+  const fixture = await harness.database.client.begin(async (transaction) => {
+    const users = await transaction<{ id: string }[]>`
+      INSERT INTO users (
+        anon_key_fingerprint,
+        identity_verified_at
+      )
+      VALUES (
+        ${"f".repeat(64)},
+        ${voidedAt}
+      )
+      RETURNING id
+    `;
+    const userId = users[0]!.id;
+    const attempts = await transaction<{ id: string }[]>`
+      INSERT INTO attempts (
+        user_id,
+        daily_set_id,
+        status,
+        score,
+        completed_at
+      )
+      VALUES (
+        ${userId},
+        ${publishedDraft.dailySetId},
+        'completed',
+        3,
+        ${voidedAt}
+      )
+      RETURNING id
+    `;
+    const challenges = await transaction<{ id: string }[]>`
+      INSERT INTO challenges (
+        public_token_hash,
+        daily_set_id,
+        creator_user_id,
+        creator_attempt_id,
+        creator_score,
+        creator_nickname_snapshot,
+        status,
+        completed_at,
+        expires_at,
+        result_redacted_at
+      )
+      VALUES (
+        ${"e".repeat(64)},
+        ${publishedDraft.dailySetId},
+        ${userId},
+        ${attempts[0]!.id},
+        3,
+        '무효테스트',
+        'completed',
+        ${voidedAt},
+        ${"2041-03-04T09:30:00.000Z"},
+        ${voidedAt}
+      )
+      RETURNING id
+    `;
+    await transaction`
+      INSERT INTO notification_outbox (
+        event_type,
+        recipient_user_id,
+        challenge_id,
+        dedupe_key,
+        status,
+        available_at,
+        occurred_at
+      )
+      VALUES (
+        'challenge.completed',
+        ${userId},
+        ${challenges[0]!.id},
+        ${`challenge.completed:${challenges[0]!.id}`},
+        'pending',
+        ${voidedAt},
+        ${voidedAt}
+      )
+    `;
+    return { challengeId: challenges[0]!.id };
+  });
+
+  const reason = "잘못된 점수 기준";
+  const raced = await Promise.all([
+    harness.app.inject({
+      method: "PUT",
+      url: `${ADMIN_CONTENT_URL}/daily-sets/${publishedDraft.dailySetId}/void`,
+      headers: authorizationHeaders(firstVoidToken),
+      payload: { reason: `  ${reason}  ` },
+    }),
+    harness.app.inject({
+      method: "PUT",
+      url: `${ADMIN_CONTENT_URL}/daily-sets/${publishedDraft.dailySetId}/void`,
+      headers: authorizationHeaders(secondVoidToken),
+      payload: { reason },
+    }),
+  ]);
+  assert.ok(
+    raced.every((response) => response.statusCode === 200),
+    raced.map((response) => response.body).join("\n"),
+  );
+  const voidResults = raced.map((response) =>
+    AdminVoidDailySetResponseSchema.parse(response.json()),
+  );
+  assert.deepEqual(voidResults.map((result) => result.replayed).sort(), [
+    false,
+    true,
+  ]);
+  assert.deepEqual(voidResults[0]!.void, voidResults[1]!.void);
+  assert.equal(voidResults[0]!.void.reason, reason);
+  assert.equal(voidResults[0]!.void.voidedAt, voidedAt);
+  assert.ok(
+    ["admin-void-operator-a", "admin-void-operator-b"].includes(
+      voidResults[0]!.void.actorSubject,
+    ),
+  );
+
+  const sameReasonReplay = await harness.app.inject({
+    method: "PUT",
+    url: `${ADMIN_CONTENT_URL}/daily-sets/${publishedDraft.dailySetId}/void`,
+    headers: authorizationHeaders(firstVoidToken),
+    payload: { reason },
+  });
+  assert.equal(sameReasonReplay.statusCode, 200, sameReasonReplay.body);
+  const replayed = AdminVoidDailySetResponseSchema.parse(
+    sameReasonReplay.json(),
+  );
+  assert.equal(replayed.replayed, true);
+  assert.deepEqual(replayed.void, voidResults[0]!.void);
+
+  const conflictingReason = await harness.app.inject({
+    method: "PUT",
+    url: `${ADMIN_CONTENT_URL}/daily-sets/${publishedDraft.dailySetId}/void`,
+    headers: authorizationHeaders(firstVoidToken),
+    payload: { reason: "다른 운영 사유" },
+  });
+  expectApiError(conflictingReason, 409, "DAILY_SET_ALREADY_VOIDED");
+
+  const persisted = await harness.database.client<
+    {
+      actor_subject: string;
+      reason: string;
+      voided_at: Date | string;
+      audit_count: number;
+      audit_actor: string;
+      audit_metadata: unknown;
+      outbox_status: string;
+      last_error: string | null;
+    }[]
+  >`
+    SELECT
+      dsv.actor_subject,
+      dsv.reason,
+      dsv.voided_at,
+      (
+        SELECT count(*)::int
+        FROM admin_audit_logs aal
+        WHERE aal.action = 'daily_set.void'
+          AND aal.resource_id = dsv.daily_set_id
+      ) AS audit_count,
+      (
+        SELECT aal.actor_subject
+        FROM admin_audit_logs aal
+        WHERE aal.action = 'daily_set.void'
+          AND aal.resource_id = dsv.daily_set_id
+      ) AS audit_actor,
+      (
+        SELECT aal.metadata
+        FROM admin_audit_logs aal
+        WHERE aal.action = 'daily_set.void'
+          AND aal.resource_id = dsv.daily_set_id
+      ) AS audit_metadata,
+      no.status::text AS outbox_status,
+      no.last_error
+    FROM daily_set_voids dsv
+    JOIN challenges c ON c.daily_set_id = dsv.daily_set_id
+    JOIN notification_outbox no ON no.challenge_id = c.id
+    WHERE dsv.daily_set_id = ${publishedDraft.dailySetId}
+      AND c.id = ${fixture.challengeId}
+  `;
+  assert.equal(persisted.length, 1);
+  assert.equal(persisted[0]!.actor_subject, voidResults[0]!.void.actorSubject);
+  assert.equal(persisted[0]!.reason, reason);
+  assert.equal(new Date(persisted[0]!.voided_at).toISOString(), voidedAt);
+  assert.equal(persisted[0]!.audit_count, 1);
+  assert.equal(persisted[0]!.audit_actor, voidResults[0]!.void.actorSubject);
+  assert.deepEqual(persisted[0]!.audit_metadata, {
+    action: "daily_set.void",
+    reason,
+  });
+  assert.equal(persisted[0]!.outbox_status, "failed");
+  assert.equal(persisted[0]!.last_error, "daily_set_voided");
+
+  const listedResponse = await harness.app.inject({
+    method: "GET",
+    url: `${ADMIN_CONTENT_URL}/daily-sets?from=2041-03-10&to=2041-03-10&status=published`,
+    headers: authorizationHeaders(writerToken),
+  });
+  assert.equal(listedResponse.statusCode, 200, listedResponse.body);
+  const listed = AdminListDailySetsResponseSchema.parse(
+    listedResponse.json(),
+  ).dailySets;
+  assert.equal(listed.length, 1);
+  assert.deepEqual(listed[0]?.void, voidResults[0]!.void);
+  assert.equal(listed[0]?.status, "published");
+  assert.equal(listed[0]?.items.length, 5);
+
+  await assert.rejects(
+    harness.database.client`
+      UPDATE daily_set_voids
+      SET reason = '변조'
+      WHERE daily_set_id = ${publishedDraft.dailySetId}
+    `,
+    /daily set void records are immutable/,
+  );
+  await assert.rejects(
+    harness.database.client`
+      DELETE FROM daily_set_voids
+      WHERE daily_set_id = ${publishedDraft.dailySetId}
+    `,
+    /daily set void records are immutable/,
+  );
 });

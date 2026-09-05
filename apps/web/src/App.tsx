@@ -23,6 +23,7 @@ import {
   getChallengeLanding,
   getChallengeResult,
   getResultNotificationPreference,
+  isDailySetVoidedError,
   startDailyQuiz,
   submitAnswer,
   updateResultNotificationPreference,
@@ -32,6 +33,7 @@ import {
   ChallengeLandingScreen,
   ChallengeResultScreen,
   ChallengeWaitingScreen,
+  VoidedResultScreen,
   type ChallengeIssueKind,
 } from "./ChallengeScreens";
 import { AccountSettings } from "./AccountSettings";
@@ -54,7 +56,22 @@ type Screen =
   | "challenge-landing"
   | "challenge-waiting"
   | "challenge-result"
-  | "challenge-issue";
+  | "challenge-issue"
+  | "voided";
+
+type AvailableDaily = Extract<DailyStartResponse, { status: "available" }>;
+type CompletedResult = Extract<
+  CompleteAttemptResponse,
+  { status: "completed" }
+>;
+type ActiveChallengeLanding = Exclude<
+  ChallengeLandingResponse,
+  { status: "voided" }
+>;
+type ActiveChallengeResult = Exclude<
+  ChallengeResultResponse,
+  { status: "voided" }
+>;
 
 interface DisplayError {
   title: string;
@@ -119,6 +136,10 @@ function toDisplayError(error: unknown): DisplayError {
     title: "문제가 발생했어요",
     message: "잠시 후 다시 시도해 주세요.",
   };
+}
+
+function assertNever(value: never): never {
+  throw new Error(`처리할 수 없는 응답 상태입니다: ${JSON.stringify(value)}`);
 }
 
 function LoadingScreen({
@@ -190,7 +211,7 @@ function HomeScreen({
   onSettings,
   headingRef,
 }: {
-  daily: DailyStartResponse;
+  daily: AvailableDaily;
   onStart: () => void;
   onSettings: () => void;
   headingRef: Ref<HTMLHeadingElement>;
@@ -266,7 +287,7 @@ function QuizScreen({
   actionError,
   headingRef,
 }: {
-  daily: DailyStartResponse;
+  daily: AvailableDaily;
   selectedIndex: number | null;
   onSelect: (index: number) => void;
   onSubmit: () => void;
@@ -397,8 +418,8 @@ function ResultScreen({
   onReportPendingChange,
   headingRef,
 }: {
-  daily: DailyStartResponse;
-  result: CompleteAttemptResponse;
+  daily: AvailableDaily;
+  result: CompletedResult;
   onRestart: () => void;
   onSettings: () => void;
   onShare: () => void;
@@ -551,15 +572,15 @@ function ResultScreen({
 
 function App() {
   const [screen, setScreen] = useState<Screen>("loading");
-  const [daily, setDaily] = useState<DailyStartResponse | null>(null);
-  const [result, setResult] = useState<CompleteAttemptResponse | null>(null);
+  const [daily, setDaily] = useState<AvailableDaily | null>(null);
+  const [result, setResult] = useState<CompletedResult | null>(null);
   const [challengeToken, setChallengeToken] = useState<string | null>(
     takeInitialChallengeToken,
   );
   const [challengeLanding, setChallengeLanding] =
-    useState<ChallengeLandingResponse | null>(null);
+    useState<ActiveChallengeLanding | null>(null);
   const [challengeResult, setChallengeResult] =
-    useState<ChallengeResultResponse | null>(null);
+    useState<ActiveChallengeResult | null>(null);
   const [challengeRole, setChallengeRole] = useState<
     "creator" | "opponent" | null
   >(null);
@@ -593,33 +614,74 @@ function App() {
   const notificationAgreementAbort = useRef<AbortController | null>(null);
   const loggedDailyCompletions = useRef(new Set<string>());
   const loggedChallengeCompletion = useRef(false);
+  const completionAnalyticsBlocked = useRef(false);
   const mainHeading = useRef<HTMLHeadingElement>(null);
   const lastFocusedHeading = useRef<string | null>(null);
 
+  const showVoidedResult = useCallback(() => {
+    initializationAbort.current?.abort();
+    initializationAbort.current = null;
+    initializationGeneration.current += 1;
+    completionAnalyticsBlocked.current = true;
+    setDaily(null);
+    setResult(null);
+    setChallengeToken(null);
+    setChallengeLanding(null);
+    setChallengeResult(null);
+    setChallengeRole(null);
+    setSelectedIndex(null);
+    setShareMessage(null);
+    setFatalError(null);
+    setActionError(null);
+    setReportPending(false);
+    setRefreshingChallenge(false);
+    setPollingPaused(true);
+    pendingAnswer.current = null;
+    pendingCompleteKey.current = null;
+    pendingChallengeCreateKey.current = null;
+    pendingClaimKey.current = null;
+    setBusy(false);
+    setScreen("voided");
+  }, []);
+
   const showChallengeResult = useCallback(
     (loadedResult: ChallengeResultResponse) => {
-      setChallengeResult(loadedResult);
-      setChallengeRole(loadedResult.viewerRole);
-
-      if (loadedResult.status === "completed") {
-        if (!loggedChallengeCompletion.current) {
-          loggedChallengeCompletion.current = true;
-          void logAnalyticsEvent("complete_challenge", {
-            role: loadedResult.viewerRole,
-            outcome: loadedResult.outcome,
-          });
-        }
-        setScreen("challenge-result");
-        return;
+      switch (loadedResult.status) {
+        case "voided":
+          showVoidedResult();
+          return;
+        case "completed":
+          setChallengeResult(loadedResult);
+          setChallengeRole(loadedResult.viewerRole);
+          if (
+            !completionAnalyticsBlocked.current &&
+            !loggedChallengeCompletion.current
+          ) {
+            loggedChallengeCompletion.current = true;
+            void logAnalyticsEvent("complete_challenge", {
+              role: loadedResult.viewerRole,
+              outcome: loadedResult.outcome,
+            });
+          }
+          setScreen("challenge-result");
+          return;
+        case "redacted":
+          setChallengeResult(loadedResult);
+          setChallengeRole(loadedResult.viewerRole);
+          setScreen("challenge-result");
+          return;
+        case "open":
+        case "claimed":
+          setChallengeResult(loadedResult);
+          setChallengeRole(loadedResult.viewerRole);
+          setPollingPaused(document.hidden);
+          setScreen("challenge-waiting");
+          return;
+        default:
+          assertNever(loadedResult);
       }
-      if (loadedResult.status === "redacted") {
-        setScreen("challenge-result");
-        return;
-      }
-      setPollingPaused(document.hidden);
-      setScreen("challenge-waiting");
     },
-    [],
+    [showVoidedResult],
   );
 
   const initializeDaily = useCallback(async () => {
@@ -642,7 +704,17 @@ function App() {
       if (!isCurrent()) {
         return;
       }
-      setDaily(loadedDaily);
+      switch (loadedDaily.status) {
+        case "voided":
+          showVoidedResult();
+          return;
+        case "available":
+          completionAnalyticsBlocked.current = false;
+          setDaily(loadedDaily);
+          break;
+        default:
+          assertNever(loadedDaily);
+      }
       setSelectedIndex(null);
 
       if (loadedDaily.attempt.status === "abandoned") {
@@ -660,14 +732,27 @@ function App() {
         if (!isCurrent()) {
           return;
         }
-        setResult(loadedResult);
-        setScreen("result");
+        switch (loadedResult.status) {
+          case "voided":
+            showVoidedResult();
+            return;
+          case "completed":
+            setResult(loadedResult);
+            setScreen("result");
+            break;
+          default:
+            assertNever(loadedResult);
+        }
       } else {
         setResult(null);
         setScreen("home");
       }
     } catch (error) {
       if (!isCurrent()) {
+        return;
+      }
+      if (isDailySetVoidedError(error)) {
+        showVoidedResult();
         return;
       }
       setFatalError(toDisplayError(error));
@@ -678,7 +763,7 @@ function App() {
         setBusy(false);
       }
     }
-  }, []);
+  }, [showVoidedResult]);
 
   const initializeChallenge = useCallback(
     async (token: string) => {
@@ -701,12 +786,23 @@ function App() {
         if (!isCurrent()) {
           return;
         }
-        setChallengeLanding(landing);
-
-        if (landing.status === "expired") {
-          setChallengeIssue("expired");
-          setScreen("challenge-issue");
-          return;
+        switch (landing.status) {
+          case "voided":
+            showVoidedResult();
+            return;
+          case "expired":
+            setChallengeLanding(landing);
+            setChallengeIssue("expired");
+            setScreen("challenge-issue");
+            return;
+          case "open":
+          case "claimed":
+          case "completed":
+            completionAnalyticsBlocked.current = false;
+            setChallengeLanding(landing);
+            break;
+          default:
+            assertNever(landing);
         }
         if (landing.viewerRole === "none") {
           if (landing.status === "open") {
@@ -745,6 +841,10 @@ function App() {
         if (!isCurrent()) {
           return;
         }
+        if (isDailySetVoidedError(error)) {
+          showVoidedResult();
+          return;
+        }
         const issue = challengeIssueFromError(error);
         if (issue !== null) {
           setChallengeIssue(issue);
@@ -760,7 +860,7 @@ function App() {
         }
       }
     },
-    [showChallengeResult],
+    [showChallengeResult, showVoidedResult],
   );
 
   useEffect(() => {
@@ -805,7 +905,10 @@ function App() {
 
   const recordDailyCompletion = useCallback(
     (attemptId: string, source: "solo" | "challenge") => {
-      if (loggedDailyCompletions.current.has(attemptId)) {
+      if (
+        completionAnalyticsBlocked.current ||
+        loggedDailyCompletions.current.has(attemptId)
+      ) {
         return;
       }
       loggedDailyCompletions.current.add(attemptId);
@@ -829,10 +932,18 @@ function App() {
         pendingCompleteKey.current,
       );
       pendingCompleteKey.current = null;
-      recordDailyCompletion(
-        daily.attempt.id,
-        challengeRole === "opponent" ? "challenge" : "solo",
-      );
+      switch (completed.status) {
+        case "voided":
+          showVoidedResult();
+          return;
+        case "completed":
+          break;
+        default:
+          assertNever(completed);
+      }
+      if (completionAnalyticsBlocked.current) {
+        return;
+      }
       setResult(completed);
       setDaily((current) =>
         current === null
@@ -849,15 +960,26 @@ function App() {
       if (challengeToken !== null && challengeRole === "opponent") {
         try {
           showChallengeResult(await getChallengeResult(challengeToken));
+          recordDailyCompletion(daily.attempt.id, "challenge");
         } catch (challengeError) {
+          if (isDailySetVoidedError(challengeError)) {
+            showVoidedResult();
+            return;
+          }
+          recordDailyCompletion(daily.attempt.id, "challenge");
           setActionError(toDisplayError(challengeError));
           setChallengeResult(null);
           setScreen("challenge-waiting");
         }
       } else {
+        recordDailyCompletion(daily.attempt.id, "solo");
         setScreen("result");
       }
     } catch (error) {
+      if (isDailySetVoidedError(error)) {
+        showVoidedResult();
+        return;
+      }
       setActionError(toDisplayError(error));
       setScreen("quiz");
     } finally {
@@ -869,6 +991,7 @@ function App() {
     daily,
     recordDailyCompletion,
     showChallengeResult,
+    showVoidedResult,
   ]);
 
   const handleSubmit = useCallback(async () => {
@@ -913,6 +1036,9 @@ function App() {
         },
         pending.key,
       );
+      if (completionAnalyticsBlocked.current) {
+        return;
+      }
       pendingAnswer.current = null;
       setSelectedIndex(null);
 
@@ -943,6 +1069,10 @@ function App() {
         }, 0);
       }
     } catch (error) {
+      if (isDailySetVoidedError(error)) {
+        showVoidedResult();
+        return;
+      }
       if (
         error instanceof ApiClientError &&
         (error.code === "ANSWER_ALREADY_SUBMITTED" ||
@@ -960,7 +1090,16 @@ function App() {
                   )
                 ).daily
               : await startDailyQuiz();
-          setDaily(loadedDaily);
+          switch (loadedDaily.status) {
+            case "voided":
+              showVoidedResult();
+              return;
+            case "available":
+              setDaily(loadedDaily);
+              break;
+            default:
+              assertNever(loadedDaily);
+          }
           setSelectedIndex(null);
           setResult(null);
           setActionError(null);
@@ -988,10 +1127,18 @@ function App() {
               pendingCompleteKey.current,
             );
             pendingCompleteKey.current = null;
-            recordDailyCompletion(
-              loadedDaily.attempt.id,
-              challengeRole === "opponent" ? "challenge" : "solo",
-            );
+            switch (completed.status) {
+              case "voided":
+                showVoidedResult();
+                return;
+              case "completed":
+                break;
+              default:
+                assertNever(completed);
+            }
+            if (completionAnalyticsBlocked.current) {
+              return;
+            }
             setDaily({
               ...loadedDaily,
               attempt: {
@@ -1002,8 +1149,19 @@ function App() {
             });
             setResult(completed);
             if (challengeToken !== null && challengeRole === "opponent") {
-              showChallengeResult(await getChallengeResult(challengeToken));
+              try {
+                showChallengeResult(await getChallengeResult(challengeToken));
+                recordDailyCompletion(loadedDaily.attempt.id, "challenge");
+              } catch (challengeError) {
+                if (isDailySetVoidedError(challengeError)) {
+                  showVoidedResult();
+                  return;
+                }
+                recordDailyCompletion(loadedDaily.attempt.id, "challenge");
+                throw challengeError;
+              }
             } else {
+              recordDailyCompletion(loadedDaily.attempt.id, "solo");
               setScreen("result");
             }
           } else {
@@ -1016,6 +1174,10 @@ function App() {
             );
           }
         } catch (recoveryError) {
+          if (isDailySetVoidedError(recoveryError)) {
+            showVoidedResult();
+            return;
+          }
           setActionError(toDisplayError(recoveryError));
           setScreen("quiz");
         }
@@ -1034,6 +1196,7 @@ function App() {
     recordDailyCompletion,
     selectedIndex,
     showChallengeResult,
+    showVoidedResult,
   ]);
 
   const handleClaim = useCallback(async () => {
@@ -1050,6 +1213,9 @@ function App() {
         challengeToken,
         pendingClaimKey.current,
       );
+      if (completionAnalyticsBlocked.current) {
+        return;
+      }
       pendingClaimKey.current = null;
       setDaily(claimed.daily);
       setResult(null);
@@ -1066,6 +1232,10 @@ function App() {
         setScreen("quiz");
       }
     } catch (error) {
+      if (isDailySetVoidedError(error)) {
+        showVoidedResult();
+        return;
+      }
       const issue = challengeIssueFromError(error);
       if (issue !== null) {
         pendingClaimKey.current = null;
@@ -1080,7 +1250,7 @@ function App() {
     } finally {
       setBusy(false);
     }
-  }, [challengeLanding, challengeToken, showChallengeResult]);
+  }, [challengeToken, showChallengeResult, showVoidedResult]);
 
   const handleShareChallenge = useCallback(async () => {
     if (challengeToken === null && (daily === null || result === null)) {
@@ -1105,6 +1275,9 @@ function App() {
           { attemptId: daily.attempt.id },
           pendingChallengeCreateKey.current,
         );
+        if (completionAnalyticsBlocked.current) {
+          return;
+        }
         pendingChallengeCreateKey.current = null;
         token = created.challenge.token;
         setChallengeToken(token);
@@ -1114,6 +1287,9 @@ function App() {
       }
 
       const outcome = await shareChallenge(token);
+      if (completionAnalyticsBlocked.current) {
+        return;
+      }
       if (outcome === "cancelled") {
         setShareMessage("공유를 취소했어요. 만든 도전장은 그대로 유지돼요.");
         void logAnalyticsEvent("share_challenge_cancelled", {
@@ -1126,12 +1302,16 @@ function App() {
         setScreen("challenge-waiting");
       }
     } catch (error) {
+      if (isDailySetVoidedError(error)) {
+        showVoidedResult();
+        return;
+      }
       setActionError(toDisplayError(error));
       setScreen(returnScreen);
     } finally {
       setBusy(false);
     }
-  }, [challengeToken, daily, result, screen]);
+  }, [challengeToken, daily, result, screen, showVoidedResult]);
 
   const refreshChallengeResult = useCallback(async () => {
     if (challengeToken === null) {
@@ -1143,6 +1323,10 @@ function App() {
     try {
       showChallengeResult(await getChallengeResult(challengeToken));
     } catch (error) {
+      if (isDailySetVoidedError(error)) {
+        showVoidedResult();
+        return;
+      }
       const issue = challengeIssueFromError(error);
       if (issue !== null) {
         setChallengeIssue(issue);
@@ -1153,7 +1337,7 @@ function App() {
     } finally {
       setRefreshingChallenge(false);
     }
-  }, [challengeToken, showChallengeResult]);
+  }, [challengeToken, showChallengeResult, showVoidedResult]);
 
   useEffect(() => {
     if (screen !== "challenge-waiting" || challengeToken === null) {
@@ -1163,6 +1347,7 @@ function App() {
     const delays = [2_000, 4_000, 8_000, 15_000, 30_000];
     let active = true;
     let timer: number | null = null;
+    let requestController: AbortController | null = null;
     let delayIndex = 0;
 
     const clearTimer = () => {
@@ -1184,21 +1369,41 @@ function App() {
       if (!active || document.hidden) {
         return;
       }
+      requestController?.abort();
+      const controller = new AbortController();
+      requestController = controller;
       try {
-        const loadedResult = await getChallengeResult(challengeToken);
+        const loadedResult = await getChallengeResult(
+          challengeToken,
+          controller.signal,
+        );
         if (!active) {
           return;
         }
         setActionError(null);
         showChallengeResult(loadedResult);
-        if (
-          loadedResult.status !== "completed" &&
-          loadedResult.status !== "redacted"
-        ) {
-          schedule();
+        switch (loadedResult.status) {
+          case "open":
+          case "claimed":
+            schedule();
+            break;
+          case "completed":
+          case "redacted":
+          case "voided":
+            break;
+          default:
+            assertNever(loadedResult);
         }
       } catch (error) {
-        if (!active) {
+        if (
+          !active ||
+          document.hidden ||
+          (error instanceof ApiClientError && error.code === "REQUEST_ABORTED")
+        ) {
+          return;
+        }
+        if (isDailySetVoidedError(error)) {
+          showVoidedResult();
           return;
         }
         const issue = challengeIssueFromError(error);
@@ -1209,10 +1414,18 @@ function App() {
           setActionError(toDisplayError(error));
           schedule();
         }
+      } finally {
+        if (requestController === controller) {
+          requestController = null;
+        }
       }
     };
     const handleVisibilityChange = () => {
       clearTimer();
+      if (document.hidden) {
+        requestController?.abort();
+        requestController = null;
+      }
       setPollingPaused(document.hidden);
       if (!document.hidden) {
         delayIndex = 0;
@@ -1228,9 +1441,77 @@ function App() {
     return () => {
       active = false;
       clearTimer();
+      requestController?.abort();
+      requestController = null;
       document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
-  }, [challengeToken, screen, showChallengeResult]);
+  }, [challengeToken, screen, showChallengeResult, showVoidedResult]);
+
+  useEffect(() => {
+    if (screen !== "result") {
+      return;
+    }
+
+    let active = true;
+    let requestController: AbortController | null = null;
+
+    const revalidateDaily = async () => {
+      if (!active || document.hidden || requestController !== null) {
+        return;
+      }
+
+      const controller = new AbortController();
+      requestController = controller;
+      try {
+        const loadedDaily = await startDailyQuiz(controller.signal);
+        if (!active) {
+          return;
+        }
+        switch (loadedDaily.status) {
+          case "voided":
+            showVoidedResult();
+            break;
+          case "available":
+            break;
+          default:
+            assertNever(loadedDaily);
+        }
+      } catch (error) {
+        if (!active) {
+          return;
+        }
+        if (isDailySetVoidedError(error)) {
+          showVoidedResult();
+        }
+      } finally {
+        if (requestController === controller) {
+          requestController = null;
+        }
+      }
+    };
+    const handleVisibilityChange = () => {
+      if (document.hidden) {
+        requestController?.abort();
+        requestController = null;
+        return;
+      }
+      void revalidateDaily();
+    };
+    const handleFocus = () => {
+      void revalidateDaily();
+    };
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    window.addEventListener("focus", handleFocus);
+
+    return () => {
+      active = false;
+      requestController?.abort();
+      requestController = null;
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      window.removeEventListener("focus", handleFocus);
+    };
+  }, [screen, showVoidedResult]);
 
   const handleGoToDaily = useCallback(() => {
     setChallengeToken(null);
@@ -1378,6 +1659,7 @@ function App() {
       pendingClaimKey.current = null;
       loggedDailyCompletions.current.clear();
       loggedChallengeCompletion.current = false;
+      completionAnalyticsBlocked.current = true;
       setScreen("deleted");
     } catch (error) {
       setActionError(toDisplayError(error));
@@ -1392,6 +1674,11 @@ function App() {
         headingRef={mainHeading}
         challenge={challengeToken !== null}
       />
+    );
+  }
+  if (screen === "voided") {
+    return (
+      <VoidedResultScreen onToday={handleGoToDaily} headingRef={mainHeading} />
     );
   }
   if (screen === "challenge-issue") {
@@ -1415,7 +1702,12 @@ function App() {
       />
     );
   }
-  if (screen === "challenge-result" && challengeResult !== null) {
+  if (
+    screen === "challenge-result" &&
+    challengeResult !== null &&
+    (challengeResult.status === "completed" ||
+      challengeResult.status === "redacted")
+  ) {
     return (
       <ChallengeResultScreen
         result={challengeResult}
@@ -1461,6 +1753,18 @@ function App() {
             </div>
           </section>
         </main>
+      );
+    }
+    if (
+      challengeResult.status === "completed" ||
+      challengeResult.status === "redacted"
+    ) {
+      return (
+        <ChallengeResultScreen
+          result={challengeResult}
+          onToday={handleGoToDaily}
+          headingRef={mainHeading}
+        />
       );
     }
     return (

@@ -10,10 +10,11 @@
     "start": "node dist/server.js",
     "lint": "oxlint src drizzle.config.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "pnpm --filter @daily-quiz-battle/contracts build && node --env-file-if-exists=../../.env --import tsx --test --test-concurrency=1 src/integration/daily.integration.test.ts src/integration/challenge.integration.test.ts src/integration/report.integration.test.ts src/integration/admin-content.integration.test.ts src/integration/account-deletion.integration.test.ts src/integration/cleanup.integration.test.ts src/integration/notification-preference.integration.test.ts src/integration/notification-outbox.integration.test.ts",
+    "test": "pnpm --filter @daily-quiz-battle/contracts build && node --env-file-if-exists=../../.env --import tsx --test --test-concurrency=1 src/integration/daily.integration.test.ts src/integration/challenge.integration.test.ts src/integration/report.integration.test.ts src/integration/admin-content.integration.test.ts src/integration/account-deletion.integration.test.ts src/integration/cleanup.integration.test.ts src/integration/notification-preference.integration.test.ts src/integration/notification-outbox.integration.test.ts src/integration/observability.integration.test.ts src/integration/rate-limit.integration.test.ts",
     "admin:token": "tsx src/admin/issue-token.ts",
     "maintenance:cleanup": "tsx src/maintenance/run-cleanup.ts",
     "notification:work": "tsx src/notification/run-worker.ts",
+    "operations:schedule": "tsx src/operations/scheduler.ts",
     "db:migrate": "tsx src/db/migrate.ts",
     "db:seed": "tsx src/db/seed.ts",
     "db:generate": "drizzle-kit generate"
@@ -23,8 +24,10 @@
     "@fastify/cors": "11.3.0",
     "@fastify/helmet": "13.1.1",
     "@fastify/rate-limit": "10.3.0",
+    "@prometheus-io/client": "0.16.1",
     "drizzle-orm": "0.45.2",
     "fastify": "5.12.1",
+    "ioredis": "5.8.2",
     "jose": "6.2.10",
     "postgres": "3.4.9",
     "zod": "4.5.2"

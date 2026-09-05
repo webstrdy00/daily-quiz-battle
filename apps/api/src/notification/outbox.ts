@@ -26,6 +26,7 @@ interface PendingNotificationRow {
   creator_user_id: string | null;
   challenge_status: "open" | "claimed" | "completed" | "expired" | null;
   result_redacted_at: Date | string | null;
+  voided_at: Date | string | null;
 }
 
 export interface NotificationWorkerCounts {
@@ -69,6 +70,11 @@ export async function enqueueChallengeCompletionNotifications(
       AND c.status = 'completed'
       AND c.completed_at IS NOT NULL
       AND c.result_redacted_at IS NULL
+      AND NOT EXISTS (
+        SELECT 1
+        FROM daily_set_voids dsv
+        WHERE dsv.daily_set_id = c.daily_set_id
+      )
       AND u.identity_status = 'active'
       AND p.result_enabled
       AND p.revoked_at IS NULL
@@ -90,7 +96,8 @@ function isEligible(row: PendingNotificationRow): boolean {
     row.public_token_hash !== null &&
     row.creator_user_id === row.recipient_user_id &&
     row.challenge_status === "completed" &&
-    row.result_redacted_at === null
+    row.result_redacted_at === null &&
+    row.voided_at === null
   );
 }
 
@@ -162,11 +169,13 @@ export async function runNotificationWorker(
         c.public_token_hash,
         c.creator_user_id,
         c.status::text AS challenge_status,
-        c.result_redacted_at
+        c.result_redacted_at,
+        dsv.voided_at
       FROM notification_outbox o
       LEFT JOIN users u ON u.id = o.recipient_user_id
       LEFT JOIN notification_preferences p ON p.user_id = o.recipient_user_id
       LEFT JOIN challenges c ON c.id = o.challenge_id
+      LEFT JOIN daily_set_voids dsv ON dsv.daily_set_id = c.daily_set_id
       WHERE o.status = 'pending'
         AND o.available_at <= ${now.toISOString()}
       ORDER BY o.occurred_at, o.id
@@ -182,6 +191,16 @@ export async function runNotificationWorker(
     };
 
     for (const row of rows) {
+      if (row.voided_at !== null) {
+        await transaction`
+          UPDATE notification_outbox
+          SET status = 'failed', last_error = 'daily_set_voided'
+          WHERE id = ${row.id}
+        `;
+        counts.skipped += 1;
+        continue;
+      }
+
       if (row.attempt_count >= MAX_ATTEMPTS) {
         await transaction`
           UPDATE notification_outbox

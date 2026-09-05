@@ -14,6 +14,8 @@ const LOCAL_CHALLENGE_TOKEN_SECRET =
   "local-only-challenge-token-secret-change-before-production-2026";
 const LOCAL_NOTIFICATION_TARGET_ENCRYPTION_KEY =
   "bG9jYWwtbm90aWZpY2F0aW9uLWtleS0zMi1ieXRlcyE=";
+export const DEVELOPMENT_METRICS_ACCESS_TOKEN =
+  "local-only-metrics-access-token-do-not-use-in-production";
 const DEFAULT_NOTIFICATION_SEND_URL =
   "https://apps-in-toss-api.toss.im/api-partner/v1/apps-in-toss/messenger/send-message";
 
@@ -125,10 +127,44 @@ const EnvironmentSchema = z.object({
     .string()
     .url()
     .default(DEFAULT_NOTIFICATION_SEND_URL),
+  OPERATIONS_SCHEDULER_ENABLED: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((value) => value === "true"),
+  OPERATIONS_NOTIFICATION_INTERVAL_SECONDS: z.coerce
+    .number()
+    .int()
+    .min(15)
+    .max(300)
+    .default(30),
+  OPERATIONS_CLEANUP_INTERVAL_HOURS: z.coerce
+    .number()
+    .int()
+    .min(1)
+    .max(24)
+    .default(24),
   RATE_LIMIT_ENABLED: z
     .enum(["true", "false"])
     .default("true")
     .transform((value) => value === "true"),
+  RATE_LIMIT_REDIS_URL: z.preprocess(
+    (value) =>
+      typeof value === "string" && value.trim() === "" ? undefined : value,
+    z
+      .string()
+      .trim()
+      .url()
+      .regex(
+        /^rediss?:\/\//,
+        "rate limit Redis URL must use the redis or rediss protocol",
+      )
+      .optional(),
+  ),
+  METRICS_ACCESS_TOKEN: z
+    .string()
+    .trim()
+    .min(32)
+    .default(DEVELOPMENT_METRICS_ACCESS_TOKEN),
   ALLOWED_ORIGINS: z
     .string()
     .default("http://localhost:5173,http://127.0.0.1:5173"),
@@ -165,10 +201,20 @@ export interface AppConfig {
   resultNotificationTemplateSetCode?: string;
   notificationSendUrl: string;
   rateLimitEnabled: boolean;
+  rateLimitRedisUrl?: string;
+  metricsAccessToken?: string;
   allowedOrigins: string[];
 }
 
-export function loadConfig(): AppConfig {
+export interface OperationsSchedulerConfig {
+  operationsSchedulerEnabled: boolean;
+  operationsNotificationIntervalSeconds: number;
+  operationsCleanupIntervalHours: number;
+}
+
+export type RuntimeConfig = AppConfig & OperationsSchedulerConfig;
+
+export function loadConfig(): RuntimeConfig {
   loadLocalEnvironment();
   const values = EnvironmentSchema.parse(process.env);
   const allowedOrigins = values.ALLOWED_ORIGINS.split(",")
@@ -215,6 +261,10 @@ export function loadConfig(): AppConfig {
   }
 
   if (values.APP_ENV !== "development") {
+    if (!values.RATE_LIMIT_REDIS_URL) {
+      throw new Error("Non-development RATE_LIMIT_REDIS_URL is required");
+    }
+
     if (values.ANON_KEY_PEPPER === LOCAL_PEPPER) {
       throw new Error(
         "Non-development ANON_KEY_PEPPER must not use the local default",
@@ -270,6 +320,12 @@ export function loadConfig(): AppConfig {
         "Non-development RESULT_NOTIFICATION_TEMPLATE_SET_CODE is required",
       );
     }
+
+    if (values.METRICS_ACCESS_TOKEN === DEVELOPMENT_METRICS_ACCESS_TOKEN) {
+      throw new Error(
+        "Non-development METRICS_ACCESS_TOKEN is required and must not use the local default",
+      );
+    }
   }
 
   if (values.APP_ENV === "production") {
@@ -317,7 +373,13 @@ export function loadConfig(): AppConfig {
     resultNotificationTemplateSetCode:
       values.RESULT_NOTIFICATION_TEMPLATE_SET_CODE,
     notificationSendUrl: values.NOTIFICATION_SEND_URL,
+    operationsSchedulerEnabled: values.OPERATIONS_SCHEDULER_ENABLED,
+    operationsNotificationIntervalSeconds:
+      values.OPERATIONS_NOTIFICATION_INTERVAL_SECONDS,
+    operationsCleanupIntervalHours: values.OPERATIONS_CLEANUP_INTERVAL_HOURS,
     rateLimitEnabled: values.RATE_LIMIT_ENABLED,
+    rateLimitRedisUrl: values.RATE_LIMIT_REDIS_URL,
+    metricsAccessToken: values.METRICS_ACCESS_TOKEN,
     allowedOrigins,
   };
 }

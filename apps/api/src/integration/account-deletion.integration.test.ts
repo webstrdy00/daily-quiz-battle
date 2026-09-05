@@ -31,6 +31,8 @@ interface TestUser {
   userId: string;
 }
 
+type AvailableDailyStart = Extract<DailyStartResponse, { status: "available" }>;
+
 interface UserLifecycleRow {
   anon_key_fingerprint: string;
   identity_status: "active" | "deleted" | "blocked";
@@ -131,7 +133,7 @@ async function setNickname(userId: string, nickname: string): Promise<void> {
   `;
 }
 
-async function startQuiz(token: string): Promise<DailyStartResponse> {
+async function startQuiz(token: string): Promise<AvailableDailyStart> {
   const response = await harness.app.inject({
     method: "POST",
     url: "/v1/daily/start",
@@ -139,13 +141,15 @@ async function startQuiz(token: string): Promise<DailyStartResponse> {
     payload: {},
   });
   assert.equal(response.statusCode, 200, response.body);
-  return DailyStartResponseSchema.parse(response.json());
+  const start = DailyStartResponseSchema.parse(response.json());
+  assert.equal(start.status, "available");
+  return start as AvailableDailyStart;
 }
 
 async function answerQuiz(
   user: TestUser,
   keyPrefix: string,
-  start: DailyStartResponse,
+  start: AvailableDailyStart,
   expectedScore: number,
 ): Promise<void> {
   for (const [index, question] of start.questions.entries()) {
@@ -186,8 +190,8 @@ async function finishQuiz(
   user: TestUser,
   keyPrefix: string,
   expectedScore: number,
-  existingStart?: DailyStartResponse,
-): Promise<DailyStartResponse> {
+  existingStart?: AvailableDailyStart,
+): Promise<AvailableDailyStart> {
   const start = existingStart ?? (await startQuiz(user.token));
   await answerQuiz(user, keyPrefix, start, expectedScore);
   const completion = await requestCompletion(
@@ -197,6 +201,10 @@ async function finishQuiz(
   );
   assert.equal(completion.statusCode, 200, completion.body);
   const completed = CompleteAttemptResponseSchema.parse(completion.json());
+  assert.equal(completed.status, "completed");
+  if (completed.status !== "completed") {
+    assert.fail("expected a completed daily result");
+  }
   assert.equal(completed.score, expectedScore);
   return {
     ...start,

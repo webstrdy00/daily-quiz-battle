@@ -3,6 +3,7 @@ import { AppError } from "../shared/errors.js";
 import type { AdminAccessTokenService } from "./token.js";
 
 const CONTENT_WRITE_SCOPE = "content:write";
+export type AdminContentScope = "content:write" | "content:void";
 
 export interface AuthenticatedAdminPrincipal {
   actorSubject: string;
@@ -11,6 +12,7 @@ export interface AuthenticatedAdminPrincipal {
 export async function authenticateAdminRequest(
   request: FastifyRequest,
   tokenService: AdminAccessTokenService,
+  requiredScope: AdminContentScope = CONTENT_WRITE_SCOPE,
 ): Promise<AuthenticatedAdminPrincipal> {
   const authorization = request.headers.authorization;
   const match =
@@ -37,7 +39,7 @@ export async function authenticateAdminRequest(
     });
   }
 
-  if (!tokenPrincipal.scopes.includes(CONTENT_WRITE_SCOPE)) {
+  if (!tokenPrincipal.scopes.includes(requiredScope)) {
     throw new AppError({
       statusCode: 403,
       code: "ADMIN_FORBIDDEN",

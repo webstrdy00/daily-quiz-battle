@@ -6,6 +6,7 @@ export const IsoDateTimeSchema = z.string().datetime({ offset: true });
 export const AnswerIndexSchema = z.number().int().min(0).max(3);
 export const QuestionSequenceSchema = z.number().int().min(1).max(5);
 export const DifficultySchema = z.enum(["easy", "medium", "hard"]);
+export const CategorySchema = z.string().trim().toLowerCase().min(1).max(32);
 export const ContentStatusSchema = z.enum([
   "draft",
   "review",
@@ -13,6 +14,7 @@ export const ContentStatusSchema = z.enum([
   "published",
   "retired",
 ]);
+export const DailySetStatusSchema = z.enum(["draft", "published", "retired"]);
 export const IdempotencyKeySchema = z
   .string()
   .min(8)
@@ -86,7 +88,8 @@ export const SavedAnswerSchema = z.object({
   selectedIndex: AnswerIndexSchema,
 });
 
-export const DailyStartResponseSchema = z.object({
+export const DailyAvailableStartResponseSchema = z.object({
+  status: z.literal("available"),
   attempt: z.object({
     id: UuidSchema,
     status: AttemptStatusSchema,
@@ -97,6 +100,17 @@ export const DailyStartResponseSchema = z.object({
   }),
   questions: z.array(PublicQuestionSchema).length(5),
 });
+
+export const DailyVoidProjectionSchema = z.object({
+  status: z.literal("voided"),
+  quizDate: IsoDateSchema,
+  voidedAt: IsoDateTimeSchema,
+});
+
+export const DailyStartResponseSchema = z.discriminatedUnion("status", [
+  DailyAvailableStartResponseSchema,
+  DailyVoidProjectionSchema,
+]);
 
 export const SubmitAnswerRequestSchema = z.object({
   sequence: QuestionSequenceSchema,
@@ -121,7 +135,7 @@ export const QuizReviewItemSchema = z.object({
   explanation: z.string().min(1),
 });
 
-export const CompleteAttemptResponseSchema = z.object({
+export const CompletedAttemptResponseSchema = z.object({
   attemptId: UuidSchema,
   status: z.literal("completed"),
   score: z.number().int().min(0).max(5),
@@ -129,6 +143,15 @@ export const CompleteAttemptResponseSchema = z.object({
   completedAt: IsoDateTimeSchema,
   review: z.array(QuizReviewItemSchema).length(5),
 });
+
+export const VoidedAttemptResponseSchema = DailyVoidProjectionSchema.extend({
+  attemptId: UuidSchema,
+});
+
+export const CompleteAttemptResponseSchema = z.discriminatedUnion("status", [
+  CompletedAttemptResponseSchema,
+  VoidedAttemptResponseSchema,
+]);
 
 // ---------------------------------------------------------------------------
 // Admin content operations
@@ -155,7 +178,7 @@ export const ChoiceOrderSchema = z
 export const AdminCreateQuestionRevisionRequestSchema = z
   .object({
     questionId: UuidSchema.optional(),
-    category: z.string().trim().toLowerCase().min(1).max(32),
+    category: CategorySchema,
     difficulty: DifficultySchema,
     prompt: z.string().trim().min(1).max(500),
     choices: QuestionChoicesSchema,
@@ -255,6 +278,165 @@ export const AdminPublishDailySetResponseSchema = z.object({
   publishedAt: IsoDateTimeSchema,
 });
 
+export const AdminDailySetVoidSchema = z.object({
+  actorSubject: z.string().min(1).max(100),
+  reason: z.string().min(1).max(500),
+  voidedAt: IsoDateTimeSchema,
+});
+
+export const AdminVoidDailySetRequestSchema = z.object({
+  reason: z.string().trim().min(1).max(500),
+});
+
+export const AdminVoidDailySetResponseSchema = z.object({
+  dailySetId: UuidSchema,
+  void: AdminDailySetVoidSchema,
+  replayed: z.boolean(),
+});
+
+export const AdminContentCursorSchema = z
+  .string()
+  .min(1)
+  .max(512)
+  .regex(/^[A-Za-z0-9_-]+$/);
+
+export const AdminListQuestionRevisionsQuerySchema = z
+  .object({
+    status: ContentStatusSchema.optional(),
+    cursor: AdminContentCursorSchema.optional(),
+    limit: z.coerce.number().int().min(1).max(100).default(20),
+  })
+  .strict();
+
+export const AdminQuestionRevisionListItemSchema = z.object({
+  revisionId: UuidSchema,
+  questionId: UuidSchema,
+  revisionNumber: z.number().int().positive(),
+  prompt: z.string().min(1).max(500),
+  choices: QuestionChoicesSchema,
+  correctIndex: AnswerIndexSchema,
+  explanation: z.string().min(1),
+  sourceUrl: z.url(),
+  sourceCheckedAt: IsoDateTimeSchema,
+  category: CategorySchema,
+  difficulty: DifficultySchema,
+  status: ContentStatusSchema,
+  reviewerId: z.string().min(1).max(100),
+  timeSensitive: z.boolean(),
+  validUntil: IsoDateTimeSchema.nullable(),
+  nextReviewAt: IsoDateTimeSchema.nullable(),
+  publishedAt: IsoDateTimeSchema.nullable(),
+  retiredAt: IsoDateTimeSchema.nullable(),
+  createdAt: IsoDateTimeSchema,
+});
+
+export const AdminListQuestionRevisionsResponseSchema = z.object({
+  questionRevisions: z.array(AdminQuestionRevisionListItemSchema),
+  nextCursor: AdminContentCursorSchema.nullable(),
+});
+
+export const AdminListDailySetsQuerySchema = z
+  .object({
+    from: IsoDateSchema,
+    to: IsoDateSchema,
+    status: DailySetStatusSchema.optional(),
+  })
+  .strict()
+  .superRefine((query, context) => {
+    const from = Date.parse(`${query.from}T00:00:00.000Z`);
+    const to = Date.parse(`${query.to}T00:00:00.000Z`);
+    if (from > to) {
+      context.addIssue({
+        code: "custom",
+        path: ["to"],
+        message: "to must be on or after from",
+      });
+      return;
+    }
+
+    const inclusiveDays = (to - from) / 86_400_000 + 1;
+    if (inclusiveDays > 90) {
+      context.addIssue({
+        code: "custom",
+        path: ["to"],
+        message: "date range must not exceed 90 days",
+      });
+    }
+  });
+
+export const AdminDailySetRevisionSummarySchema = z.object({
+  revisionId: UuidSchema,
+  questionId: UuidSchema,
+  revisionNumber: z.number().int().positive(),
+  prompt: z.string().min(1).max(500),
+  category: CategorySchema,
+  difficulty: DifficultySchema,
+  status: ContentStatusSchema,
+});
+
+export const AdminDailySetListItemSchema = z.object({
+  position: QuestionSequenceSchema,
+  choiceOrder: ChoiceOrderSchema,
+  revision: AdminDailySetRevisionSummarySchema,
+});
+
+export const AdminDailySetListEntrySchema = z.object({
+  dailySetId: UuidSchema,
+  quizDate: IsoDateSchema,
+  version: z.number().int().positive(),
+  status: DailySetStatusSchema,
+  publishedAt: IsoDateTimeSchema.nullable(),
+  createdAt: IsoDateTimeSchema,
+  void: AdminDailySetVoidSchema.nullable(),
+  items: z.array(AdminDailySetListItemSchema).length(5),
+});
+
+export const AdminListDailySetsResponseSchema = z.object({
+  dailySets: z.array(AdminDailySetListEntrySchema),
+});
+
+export const AdminAuditActionSchema = z.enum([
+  "question_revision.create",
+  "question_revision.status.update",
+  "daily_set.create",
+  "daily_set.publish",
+  "daily_set.void",
+]);
+
+export const AdminAuditResourceTypeSchema = z.enum([
+  "question_revision",
+  "daily_set",
+]);
+
+export const AdminAuditMetadataSchema = z.object({
+  action: AdminAuditActionSchema.optional(),
+  status: ContentStatusSchema.optional(),
+  category: CategorySchema.optional(),
+  difficulty: DifficultySchema.optional(),
+  reason: z.string().min(1).max(500).optional(),
+});
+
+export const AdminListAuditLogsQuerySchema = z
+  .object({
+    cursor: AdminContentCursorSchema.optional(),
+    limit: z.coerce.number().int().min(1).max(100).default(20),
+  })
+  .strict();
+
+export const AdminAuditLogListItemSchema = z.object({
+  actorSubject: z.string().min(1).max(100),
+  action: AdminAuditActionSchema,
+  resourceType: AdminAuditResourceTypeSchema,
+  resourceId: UuidSchema,
+  metadata: AdminAuditMetadataSchema,
+  createdAt: IsoDateTimeSchema,
+});
+
+export const AdminListAuditLogsResponseSchema = z.object({
+  auditLogs: z.array(AdminAuditLogListItemSchema),
+  nextCursor: AdminContentCursorSchema.nullable(),
+});
+
 // ---------------------------------------------------------------------------
 // Report
 // ---------------------------------------------------------------------------
@@ -314,13 +496,23 @@ export const CreateChallengeResponseSchema = z.object({
   }),
 });
 
-export const ChallengeLandingResponseSchema = z.object({
-  status: ChallengeStatusSchema,
+export const ChallengeVoidProjectionSchema = z.object({
+  status: z.literal("voided"),
   quizDate: IsoDateSchema,
-  expiresAt: IsoDateTimeSchema,
-  creatorNickname: NicknameSchema,
+  voidedAt: IsoDateTimeSchema,
   viewerRole: ChallengeViewerRoleSchema,
 });
+
+export const ChallengeLandingResponseSchema = z.discriminatedUnion("status", [
+  z.object({
+    status: ChallengeStatusSchema,
+    quizDate: IsoDateSchema,
+    expiresAt: IsoDateTimeSchema,
+    creatorNickname: NicknameSchema,
+    viewerRole: ChallengeViewerRoleSchema,
+  }),
+  ChallengeVoidProjectionSchema,
+]);
 
 export const ClaimChallengeResponseSchema = z.object({
   challenge: z.object({
@@ -328,8 +520,13 @@ export const ClaimChallengeResponseSchema = z.object({
     quizDate: IsoDateSchema,
     expiresAt: IsoDateTimeSchema,
   }),
-  daily: DailyStartResponseSchema,
+  daily: DailyAvailableStartResponseSchema,
 });
+
+export const ChallengeResultVoidProjectionSchema =
+  ChallengeVoidProjectionSchema.extend({
+    viewerRole: z.enum(["creator", "opponent"]),
+  });
 
 export const ChallengeResultResponseSchema = z.discriminatedUnion("status", [
   z.object({
@@ -358,11 +555,18 @@ export const ChallengeResultResponseSchema = z.discriminatedUnion("status", [
     viewerRole: z.enum(["creator", "opponent"]),
     me: z.object({ nickname: NicknameSchema, score: ScoreSchema.nullable() }),
   }),
+  ChallengeResultVoidProjectionSchema,
 ]);
 
 export type ChallengeStatus = z.infer<typeof ChallengeStatusSchema>;
 export type ChallengeViewerRole = z.infer<typeof ChallengeViewerRoleSchema>;
 export type ChallengeOutcome = z.infer<typeof ChallengeOutcomeSchema>;
+export type ChallengeVoidProjection = z.infer<
+  typeof ChallengeVoidProjectionSchema
+>;
+export type ChallengeResultVoidProjection = z.infer<
+  typeof ChallengeResultVoidProjectionSchema
+>;
 export type CreateChallengeRequest = z.infer<
   typeof CreateChallengeRequestSchema
 >;
@@ -393,15 +597,25 @@ export type ResultNotificationPreferenceResponse = z.infer<
 export type AttemptStatus = z.infer<typeof AttemptStatusSchema>;
 export type PublicQuestion = z.infer<typeof PublicQuestionSchema>;
 export type SavedAnswer = z.infer<typeof SavedAnswerSchema>;
+export type DailyAvailableStartResponse = z.infer<
+  typeof DailyAvailableStartResponseSchema
+>;
+export type DailyVoidProjection = z.infer<typeof DailyVoidProjectionSchema>;
 export type DailyStartResponse = z.infer<typeof DailyStartResponseSchema>;
 export type SubmitAnswerRequest = z.infer<typeof SubmitAnswerRequestSchema>;
 export type SubmitAnswerResponse = z.infer<typeof SubmitAnswerResponseSchema>;
 export type QuizReviewItem = z.infer<typeof QuizReviewItemSchema>;
+export type CompletedAttemptResponse = z.infer<
+  typeof CompletedAttemptResponseSchema
+>;
+export type VoidedAttemptResponse = z.infer<typeof VoidedAttemptResponseSchema>;
 export type CompleteAttemptResponse = z.infer<
   typeof CompleteAttemptResponseSchema
 >;
 export type Difficulty = z.infer<typeof DifficultySchema>;
+export type Category = z.infer<typeof CategorySchema>;
 export type ContentStatus = z.infer<typeof ContentStatusSchema>;
+export type DailySetStatus = z.infer<typeof DailySetStatusSchema>;
 export type QuestionChoices = z.infer<typeof QuestionChoicesSchema>;
 export type ChoiceOrder = z.infer<typeof ChoiceOrderSchema>;
 export type AdminCreateQuestionRevisionRequest = z.infer<
@@ -427,6 +641,48 @@ export type AdminCreateDailySetDraftResponse = z.infer<
 >;
 export type AdminPublishDailySetResponse = z.infer<
   typeof AdminPublishDailySetResponseSchema
+>;
+export type AdminDailySetVoid = z.infer<typeof AdminDailySetVoidSchema>;
+export type AdminVoidDailySetRequest = z.infer<
+  typeof AdminVoidDailySetRequestSchema
+>;
+export type AdminVoidDailySetResponse = z.infer<
+  typeof AdminVoidDailySetResponseSchema
+>;
+export type AdminContentCursor = z.infer<typeof AdminContentCursorSchema>;
+export type AdminListQuestionRevisionsQuery = z.infer<
+  typeof AdminListQuestionRevisionsQuerySchema
+>;
+export type AdminQuestionRevisionListItem = z.infer<
+  typeof AdminQuestionRevisionListItemSchema
+>;
+export type AdminListQuestionRevisionsResponse = z.infer<
+  typeof AdminListQuestionRevisionsResponseSchema
+>;
+export type AdminListDailySetsQuery = z.infer<
+  typeof AdminListDailySetsQuerySchema
+>;
+export type AdminDailySetRevisionSummary = z.infer<
+  typeof AdminDailySetRevisionSummarySchema
+>;
+export type AdminDailySetListItem = z.infer<typeof AdminDailySetListItemSchema>;
+export type AdminDailySetListEntry = z.infer<
+  typeof AdminDailySetListEntrySchema
+>;
+export type AdminListDailySetsResponse = z.infer<
+  typeof AdminListDailySetsResponseSchema
+>;
+export type AdminAuditAction = z.infer<typeof AdminAuditActionSchema>;
+export type AdminAuditResourceType = z.infer<
+  typeof AdminAuditResourceTypeSchema
+>;
+export type AdminAuditMetadata = z.infer<typeof AdminAuditMetadataSchema>;
+export type AdminListAuditLogsQuery = z.infer<
+  typeof AdminListAuditLogsQuerySchema
+>;
+export type AdminAuditLogListItem = z.infer<typeof AdminAuditLogListItemSchema>;
+export type AdminListAuditLogsResponse = z.infer<
+  typeof AdminListAuditLogsResponseSchema
 >;
 export type ReportReason = z.infer<typeof ReportReasonSchema>;
 export type CreateQuestionReportRequest = z.infer<

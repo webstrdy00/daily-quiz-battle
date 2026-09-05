@@ -58,11 +58,17 @@ interface DailySetItemRow {
 
 interface DailySetRow {
   id: string;
+  quiz_date: string;
+}
+
+interface DailySetVoidRow {
+  voided_at: Date | string;
 }
 
 interface AttemptRow {
   id: string;
   user_id: string;
+  daily_set_id: string;
   status: "started" | "completed" | "abandoned";
   score: number | null;
   quiz_date: string;
@@ -177,6 +183,34 @@ function toIsoDateTime(value: Date | string | null): string {
   return date.toISOString();
 }
 
+async function loadDailySetVoid(
+  transaction: Transaction,
+  dailySetId: string,
+): Promise<DailySetVoidRow | undefined> {
+  const rows = await transaction<DailySetVoidRow[]>`
+    SELECT voided_at
+    FROM daily_set_voids
+    WHERE daily_set_id = ${dailySetId}
+  `;
+  return rows[0];
+}
+
+function dailySetVoidedError(
+  quizDate: string,
+  voidedAt: Date | string,
+): AppError {
+  return new AppError({
+    statusCode: 409,
+    code: "DAILY_SET_VOIDED",
+    message: "운영 검토로 이 날짜의 퀴즈 결과가 무효 처리되었습니다.",
+    retryable: false,
+    details: {
+      quizDate,
+      voidedAt: toIsoDateTime(voidedAt),
+    },
+  });
+}
+
 async function lockActiveUser(
   transaction: Transaction,
   userId: string,
@@ -236,16 +270,18 @@ export async function startOrResumeAttempt(
     const dailySets =
       "quizDate" in setFilter
         ? await transaction<DailySetRow[]>`
-      SELECT ds.id
+      SELECT ds.id, ds.quiz_date::text AS quiz_date
       FROM daily_sets ds
       WHERE ds.quiz_date = ${setFilter.quizDate}
         AND ds.status = 'published'
+      FOR SHARE OF ds
     `
         : await transaction<DailySetRow[]>`
-      SELECT ds.id
+      SELECT ds.id, ds.quiz_date::text AS quiz_date
       FROM daily_sets ds
       WHERE ds.id = ${setFilter.dailySetId}
         AND ds.status = 'published'
+      FOR SHARE OF ds
     `;
     const dailySet = dailySets[0];
     if (dailySet === undefined) {
@@ -257,10 +293,20 @@ export async function startOrResumeAttempt(
       });
     }
 
+    const dailySetVoid = await loadDailySetVoid(transaction, dailySet.id);
+    if (dailySetVoid !== undefined) {
+      return DailyStartResponseSchema.parse({
+        status: "voided",
+        quizDate: dailySet.quiz_date,
+        voidedAt: toIsoDateTime(dailySetVoid.voided_at),
+      });
+    }
+
     let attempts = await transaction<AttemptRow[]>`
       SELECT
         a.id,
         a.user_id,
+        a.daily_set_id,
         a.status::text AS status,
         a.score::int AS score,
         ds.quiz_date::text AS quiz_date,
@@ -340,6 +386,7 @@ export async function startOrResumeAttempt(
         SELECT
           a.id,
           a.user_id,
+          a.daily_set_id,
           a.status::text AS status,
           a.score::int AS score,
           ds.quiz_date::text AS quiz_date,
@@ -374,6 +421,7 @@ export async function startOrResumeAttempt(
         RETURNING
           id,
           user_id,
+          daily_set_id,
           status::text AS status,
           score::int AS score,
           ${attempt.quiz_date}::text AS quiz_date,
@@ -393,6 +441,7 @@ export async function startOrResumeAttempt(
     `;
 
     return DailyStartResponseSchema.parse({
+      status: "available",
       attempt: {
         id: attempt.id,
         status: attempt.status,
@@ -429,6 +478,46 @@ export async function submitAnswer(
 
   const result = await database.client.begin(async (transaction) => {
     await lockActiveUser(transaction, userId);
+
+    const attempts = await transaction<AttemptRow[]>`
+      SELECT
+        a.id,
+        a.user_id,
+        a.daily_set_id,
+        a.status::text AS status,
+        a.score::int AS score,
+        ds.quiz_date::text AS quiz_date,
+        a.completed_at
+      FROM attempts a
+      JOIN daily_sets ds ON ds.id = a.daily_set_id
+      WHERE a.id = ${attemptId}
+      FOR UPDATE OF a
+      FOR SHARE OF ds
+    `;
+    const attempt = attempts[0];
+
+    if (attempt === undefined) {
+      throw new AppError({
+        statusCode: 404,
+        code: "ATTEMPT_NOT_FOUND",
+        message: "퀴즈 진행 정보를 찾을 수 없습니다.",
+      });
+    }
+    if (attempt.user_id !== userId) {
+      throw new AppError({
+        statusCode: 403,
+        code: "FORBIDDEN",
+        message: "이 퀴즈에 답할 권한이 없습니다.",
+      });
+    }
+
+    const dailySetVoid = await loadDailySetVoid(
+      transaction,
+      attempt.daily_set_id,
+    );
+    if (dailySetVoid !== undefined) {
+      throw dailySetVoidedError(attempt.quiz_date, dailySetVoid.voided_at);
+    }
 
     const insertedIdempotency = await transaction`
       INSERT INTO idempotency_records (
@@ -486,35 +575,6 @@ export async function submitAnswer(
       };
     }
 
-    const attempts = await transaction<AttemptRow[]>`
-      SELECT
-        a.id,
-        a.user_id,
-        a.status::text AS status,
-        a.score::int AS score,
-        ds.quiz_date::text AS quiz_date,
-        a.completed_at
-      FROM attempts a
-      JOIN daily_sets ds ON ds.id = a.daily_set_id
-      WHERE a.id = ${attemptId}
-      FOR UPDATE OF a
-    `;
-    const attempt = attempts[0];
-
-    if (attempt === undefined) {
-      throw new AppError({
-        statusCode: 404,
-        code: "ATTEMPT_NOT_FOUND",
-        message: "퀴즈 진행 정보를 찾을 수 없습니다.",
-      });
-    }
-    if (attempt.user_id !== userId) {
-      throw new AppError({
-        statusCode: 403,
-        code: "FORBIDDEN",
-        message: "이 퀴즈에 답할 권한이 없습니다.",
-      });
-    }
     if (attempt.status === "completed") {
       throw new AppError({
         statusCode: 409,
@@ -658,6 +718,53 @@ export async function completeAttempt(
   const result = await database.client.begin(async (transaction) => {
     await lockActiveUser(transaction, userId);
 
+    const attempts = await transaction<AttemptRow[]>`
+      SELECT
+        a.id,
+        a.user_id,
+        a.daily_set_id,
+        a.status::text AS status,
+        a.score::int AS score,
+        ds.quiz_date::text AS quiz_date,
+        a.completed_at
+      FROM attempts a
+      JOIN daily_sets ds ON ds.id = a.daily_set_id
+      WHERE a.id = ${attemptId}
+      FOR UPDATE OF a
+      FOR SHARE OF ds
+    `;
+    const attempt = attempts[0];
+
+    if (attempt === undefined) {
+      throw new AppError({
+        statusCode: 404,
+        code: "ATTEMPT_NOT_FOUND",
+        message: "퀴즈 진행 정보를 찾을 수 없습니다.",
+      });
+    }
+    if (attempt.user_id !== userId) {
+      throw new AppError({
+        statusCode: 403,
+        code: "FORBIDDEN",
+        message: "이 퀴즈를 완료할 권한이 없습니다.",
+      });
+    }
+
+    const dailySetVoid = await loadDailySetVoid(
+      transaction,
+      attempt.daily_set_id,
+    );
+    if (dailySetVoid !== undefined) {
+      return {
+        response: CompleteAttemptResponseSchema.parse({
+          status: "voided",
+          attemptId,
+          quizDate: attempt.quiz_date,
+          voidedAt: toIsoDateTime(dailySetVoid.voided_at),
+        }),
+      };
+    }
+
     const insertedIdempotency = await transaction`
       INSERT INTO idempotency_records (
         user_id,
@@ -706,35 +813,6 @@ export async function completeAttempt(
       };
     }
 
-    const attempts = await transaction<AttemptRow[]>`
-      SELECT
-        a.id,
-        a.user_id,
-        a.status::text AS status,
-        a.score::int AS score,
-        ds.quiz_date::text AS quiz_date,
-        a.completed_at
-      FROM attempts a
-      JOIN daily_sets ds ON ds.id = a.daily_set_id
-      WHERE a.id = ${attemptId}
-      FOR UPDATE OF a
-    `;
-    const attempt = attempts[0];
-
-    if (attempt === undefined) {
-      throw new AppError({
-        statusCode: 404,
-        code: "ATTEMPT_NOT_FOUND",
-        message: "퀴즈 진행 정보를 찾을 수 없습니다.",
-      });
-    }
-    if (attempt.user_id !== userId) {
-      throw new AppError({
-        statusCode: 403,
-        code: "FORBIDDEN",
-        message: "이 퀴즈를 완료할 권한이 없습니다.",
-      });
-    }
     if (attempt.status === "abandoned") {
       throw new AppError({
         statusCode: 409,

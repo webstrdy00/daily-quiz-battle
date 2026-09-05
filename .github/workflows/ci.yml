@@ -2,6 +2,7 @@ name: CI
 
 on:
   pull_request:
+  workflow_dispatch:
   push:
     branches: [main]
 
@@ -30,10 +31,20 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 12
+      redis:
+        image: redis:8.2-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
     env:
       APP_ENV: development
       DATABASE_URL: postgres://daily_quiz:daily_quiz_ci@127.0.0.1:5432/daily_quiz
       TEST_DATABASE_ADMIN_URL: postgres://daily_quiz:daily_quiz_ci@127.0.0.1:5432/postgres
+      TEST_REDIS_URL: redis://127.0.0.1:6379/15
       IDENTITY_VERIFICATION_MODE: mock
       RATE_LIMIT_ENABLED: "false"
     steps:
@@ -60,6 +71,24 @@ jobs:
         run: pnpm test:integration
       - name: Production build
         run: pnpm build
+      - name: Deployment configuration
+        run: |
+          docker compose --profile local-app config --quiet
+          docker compose --profile operations config --quiet
+          docker compose --profile monitoring config --quiet
+          docker build -f apps/api/Dockerfile .
+      - name: Prometheus configuration
+        run: >-
+          docker run --rm --entrypoint promtool
+          -v "${PWD}/ops/monitoring:/etc/prometheus:ro"
+          prom/prometheus:v3.5.0
+          check config /etc/prometheus/prometheus.yml
+      - name: Backup rehearsal script static check
+        run: >-
+          docker run --rm
+          -v "${PWD}:/mnt:ro"
+          koalaman/shellcheck-alpine:v0.10.0
+          shellcheck /mnt/ops/backup-rehearsal.sh
 
   secret-scan:
     runs-on: ubuntu-latest
