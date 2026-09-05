@@ -1,9 +1,7 @@
-import { readFileSync } from "node:fs";
-import { request as httpsRequest } from "node:https";
-import { resolve } from "node:path";
 import { z } from "zod";
 import type { AppConfig } from "../config.js";
 import { AppError } from "../shared/errors.js";
+import { mtlsRequest, readPem } from "../shared/mtls-request.js";
 
 const VerificationResponseSchema = z.discriminatedUnion("resultType", [
   z.object({
@@ -35,13 +33,6 @@ class MockIdentityVerifier implements IdentityVerifier {
   }
 }
 
-function readPem(value: string): string {
-  if (value.includes("-----BEGIN")) {
-    return value.replaceAll("\\n", "\n");
-  }
-  return readFileSync(resolve(value), "utf8");
-}
-
 class MtlsIdentityVerifier implements IdentityVerifier {
   private readonly endpoint: URL;
   private readonly certificate: string;
@@ -65,50 +56,24 @@ class MtlsIdentityVerifier implements IdentityVerifier {
     let responseBody: string;
 
     try {
-      responseBody = await new Promise<string>((resolveResponse, reject) => {
-        const request = httpsRequest(
-          this.endpoint,
-          {
-            method: "POST",
-            cert: this.certificate,
-            key: this.privateKey,
-            ca: this.certificateAuthority,
-            rejectUnauthorized: true,
-            headers: {
-              accept: "application/json",
-              "x-anon-key": anonymousKey,
-            },
-            timeout: 5_000,
-          },
-          (response) => {
-            let body = "";
-            response.setEncoding("utf8");
-            response.on("data", (chunk: string) => {
-              body += chunk;
-              if (body.length > 65_536) {
-                response.destroy(new Error("Identity response is too large"));
-              }
-            });
-            response.on("error", reject);
-            response.on("end", () => {
-              const statusCode = response.statusCode ?? 500;
-              if (statusCode < 200 || statusCode >= 300) {
-                reject(
-                  new Error(`Identity verification returned ${statusCode}`),
-                );
-                return;
-              }
-              resolveResponse(body);
-            });
-          },
-        );
-
-        request.on("timeout", () => {
-          request.destroy(new Error("Identity verification timed out"));
-        });
-        request.on("error", reject);
-        request.end();
+      const response = await mtlsRequest({
+        endpoint: this.endpoint,
+        method: "POST",
+        certificate: this.certificate,
+        privateKey: this.privateKey,
+        certificateAuthority: this.certificateAuthority,
+        headers: {
+          accept: "application/json",
+          "x-anon-key": anonymousKey,
+        },
       });
+
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw new Error(
+          `Identity verification returned ${response.statusCode}`,
+        );
+      }
+      responseBody = response.body;
     } catch (error) {
       throw new AppError({
         statusCode: 503,

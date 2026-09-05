@@ -1,8 +1,8 @@
 # Daily Quiz Battle
 
-Apps in Toss WebView에서 매일 같은 5문제를 풀고 서버 채점 결과와 해설을 확인하는 퀴즈 앱입니다. 현재 **Phase 1: 혼자 오늘 퀴즈 완료** 수직 슬라이스가 로컬에서 구현·검증됐습니다.
+Apps in Toss WebView에서 매일 같은 5문제를 풀고 친구와 결과를 비교하는 퀴즈 앱입니다. 현재 working tree에는 **Phase 1~4의 로컬 기능 수직 슬라이스**(오늘 퀴즈, Challenge, 신고·콘텐츠 운영 API, 계정 삭제·알림 outbox·cleanup)가 구현되어 있습니다.
 
-> 공개 출시 준비가 끝난 상태는 아닙니다. 실제 Apps in Toss mTLS 자격증명, production appName, 클라우드 인프라, 기기 QR E2E, 콘텐츠·개인정보·운영 하드 게이트가 남아 있습니다.
+> 아래 현황과 검증은 2026-09-05 KST의 미커밋 working tree 증거입니다. commit 완료나 공개 출시 준비 완료를 뜻하지 않습니다. 실제 Apps in Toss mTLS identity/알림 발송, 콘솔 appName·알림 템플릿, 클라우드 인프라, 실제 기기 QR·접근성 QA, 콘텐츠·개인정보·운영 하드 게이트가 남아 있습니다.
 
 ## 현재 구현 범위
 
@@ -13,12 +13,20 @@ Apps in Toss WebView에서 매일 같은 5문제를 풀고 서버 채점 결과�
 - 30분 내부 bearer access token(Web 메모리에만 보관)
 - KST 기준 오늘의 published 5문항 조회 및 attempt start/resume
 - 1~5번 순차 답안 저장, 수정 방지, 멱등 replay/conflict 처리
-- 서버 전용 채점, 완료 상태·streak 갱신, 완료 후 정답/해설 공개
+- `choice_order`를 반영한 서버 채점·리뷰, 단조로운 streak 갱신, retired revision 기존 attempt resume
 - 홈, 문제 풀이, 오류/재시도, 결과와 5문항 리뷰 UI
+- Challenge 생성·safe landing·원자 claim·참여자 전용 결과와 win/loss/draw
+- Web deep link token 즉시 URL 제거, 공유/취소, claim/resume, visibility-aware 결과 polling
+- 문제 신고 UI/API, 사용자·사유·시간 bucket dedupe와 최소 정보 저장
+- admin JWT scope 경계, 문제 revision lifecycle, daily set 편성·publish, 최소 audit log
+- 확인 문구가 필요한 계정 삭제, 인증 무효화, 개인 기록 삭제와 과거 Challenge redaction
+- 암호화된 알림 preference, consent-gated outbox, dedupe/retry/terminal worker
+- 만료·보존기간 기반 cleanup job
 - semantic HTML, ARIA live region, safe area, reduced motion, 작은 화면 대응
-- PostgreSQL migration, 제약조건/trigger, 로컬 seed
+- PostgreSQL migration `0001`~`0013`, 제약조건/trigger, 로컬 seed
+- pull request/main용 CI 정적 검사·PostgreSQL 통합 테스트·build와 별도 gitleaks job
 
-아직 구현하지 않은 주요 범위는 친구 challenge 생성·claim·결과, 알림, 운영 CMS, 신고/삭제 lifecycle, 실제 배포 인프라와 출시 운영입니다.
+로컬 구현과 외부 연동 완료는 구분합니다. identity와 notification에는 mTLS adapter가 있지만 실제 자격증명·콘솔 템플릿을 사용한 성공 호출은 확인하지 않았습니다. rate limit은 단일 인스턴스 메모리 store이므로 다중 인스턴스 production 전 shared store가 필요합니다. 운영자가 사용하는 CMS 화면도 아직 없으며 admin content API만 구현되어 있습니다.
 
 ## 아키텍처
 
@@ -27,6 +35,8 @@ Apps in Toss WebView (React)
   └─ HTTPS/JSON + memory bearer token
        └─ Fastify API
             ├─ Apps in Toss user-key verifier (production: mTLS)
+            ├─ admin JWT content API
+            ├─ notification outbox worker / cleanup job
             └─ PostgreSQL 18.6
 ```
 
@@ -116,14 +126,14 @@ volume 삭제는 로컬 DB를 모두 제거하는 파괴적 작업이므로 이 
 
 ## 주요 API 흐름
 
-| Method | Path                                | 설명                                    |
-| ------ | ----------------------------------- | --------------------------------------- |
-| `GET`  | `/health/live`                      | 프로세스 liveness                       |
-| `GET`  | `/health/ready`                     | DB readiness                            |
-| `POST` | `/v1/auth/bootstrap`                | anonymous key 검증 후 access token 발급 |
-| `POST` | `/v1/daily/start`                   | 오늘 attempt 생성 또는 기존 상태 resume |
-| `POST` | `/v1/attempts/{attemptId}/answers`  | 순차 답안 저장; `Idempotency-Key` 필수  |
-| `POST` | `/v1/attempts/{attemptId}/complete` | 서버 채점·완료; `Idempotency-Key` 필수  |
+- Health: `GET /health/live`, `GET /health/ready`
+- Identity: `POST /v1/auth/bootstrap`
+- Daily: `POST /v1/daily/start`, `POST /v1/attempts/{attemptId}/answers`, `POST /v1/attempts/{attemptId}/complete`
+- Challenge: `POST /v1/challenges`, `GET /v1/challenges/{token}`, `POST /v1/challenges/{token}/claim`, `GET /v1/challenges/{token}/result`
+- Report: `POST /v1/reports/questions`
+- Notification preference: `GET|PUT /v1/notifications/result-preference`
+- Account deletion: `DELETE /v1/me`
+- Admin content: `POST|PATCH /v1/admin/content/*`
 
 Web/API는 `packages/contracts`의 Zod schema로 응답을 다시 검증합니다. 같은 멱등 key와 같은 payload는 저장된 응답을 replay하고, 다른 payload 재사용은 `409 IDEMPOTENCY_KEY_REUSED`로 거부합니다.
 
@@ -140,39 +150,25 @@ corepack pnpm typecheck
 corepack pnpm build
 ```
 
-통합 테스트는 Node.js 내장 test runner와 Fastify `inject()`를 사용하며 실제 PostgreSQL에서 다음 7개 시나리오를 직렬 실행합니다.
-
-1. migration/seed 반복 실행과 readiness
-2. start/resume → 답안 5개 → complete, 멱등 replay/conflict
-3. 인증·소유권·순서·revision·미완료 오류와 transaction rollback
-4. 동시 start와 서로 다른 Idempotency-Key의 answer/complete 요청 수렴
-5. KST 자정 set 전환과 다음 날 01:00 grace 경계
-6. 핵심 CHECK constraint와 published/answer 불변성 trigger
-7. daily set lifecycle 보호와 publication/item mutation 직렬화
+통합 테스트는 Node.js 내장 test runner와 Fastify `inject()`를 사용하며 실제 PostgreSQL에서 8개 suite, 47 tests를 직렬 실행합니다. Daily의 날짜·동시성·`choice_order`·streak·retire resume, Challenge의 token·quota·20-way claim·결과·만료·attempt provenance, 신고 dedupe, admin lifecycle/publish/audit, 삭제/redaction race, cleanup, 암호화 알림 preference, outbox worker의 재시도·동의 철회 동시성을 검증합니다.
 
 테스트 DB 관리자 URL은 `.env`의 `TEST_DATABASE_ADMIN_URL`로 지정할 수 있습니다. 지정하지 않으면 로컬 Compose의 `postgres` maintenance DB를 사용합니다. 이 계정에는 `CREATE DATABASE` 권한이 필요합니다. Harness는 매 실행마다 `daily_quiz_it_<32자리 hex>` 이름의 DB만 생성하고, 이름을 다시 검증한 뒤 해당 DB만 `DROP DATABASE ... WITH (FORCE)`로 제거합니다. 앱 DB, schema, Docker volume은 삭제하지 않으며 최종 검증에서 잔여 임시 DB가 0개인지 확인했습니다.
 
 `build`는 contracts, API, Web을 순서대로 빌드하고 `apps/web/daily-quiz-battle.ait`를 생성합니다. `.ait`, `dist`, local env, DB data, `docs/`는 Git에서 제외됩니다.
 
-2026-08-29 로컬 검증 결과:
+2026-09-05 KST working tree 로컬 검증 기록:
 
-- frozen install, format check, lint, typecheck 통과
-- 실제 PostgreSQL 통합 테스트 7/7 통과
-- 빈 임시 DB에 `0001`+`0002`+`0003` migration/seed 멱등 실행과 기존 개발 DB forward migration 통과
+- format check, lint, typecheck, contracts/API/Web build 통과
+- 실제 PostgreSQL 통합 테스트 **47 tests, 47 pass, 0 fail**
+- 빈 임시 DB에 `0001`~`0013` migration/seed 적용과 teardown 통과
 - contracts/API/Web production build와 Apps in Toss `.ait` 패키징 통과
-- API bootstrap → start/resume → 답안 5개 → complete 전체 흐름 통과
-- answer/complete replay, 다른 payload conflict, 실패 idempotency rollback 확인
-- cross-user 권한, 순서/revision 오류, token version 무효화 확인
-- 8-way start는 attempt 1개로 수렴했고, 서로 다른 8개 Idempotency-Key의 answer는 200 1건과 `ANSWER_ALREADY_SUBMITTED` 7건이며 processing record는 0개, 서로 다른 8개 key의 complete는 모두 동일한 200을 반환하고 streak는 한 번만 변경됨을 확인
-- KST 자정과 정확히 01:00 grace deadline의 완료/abandon 상태 확인
-- submitted answer UPDATE/DELETE와 published revision/set item 변경 차단 확인
-- `0003`의 published→draft 차단, non-draft parent 삭제 차단, ordered parent `FOR UPDATE` lock을 통한 publication/item mutation 직렬화 확인
-- semantic follow-up `APPROVED`, High/Medium finding 0건, supplemental real-PostgreSQL probe 통과
-- 브라우저 홈 → 5문제 → 5/5 결과와 다섯 해설 확인
-- 재진입 시 저장된 completed result 복구, 현재 콘솔 오류 0건/API 요청 200 확인
-- 390px viewport에서 가로 overflow 없음 확인
+- Daily full flow와 `choice_order` 채점, 과거 Challenge 지연 완료 시 streak 비회귀, retired revision의 기존 attempt resume/new start 차단 확인
+- Challenge create/claim/result, 20-way claim 1명 수렴, same-set attempt 재사용, win/loss/draw, expiry와 참여자 권한 확인
+- report 최소 저장·dedupe, admin JWT scope/lifecycle/daily publish/audit, 삭제/redaction, cleanup, notification preference/outbox/worker 확인
+- 390×844 브라우저에서 Challenge 양측 무승부 결과, raw token이 제거된 `/challenge` URL, 문항 신고, 알림 preference, 계정 삭제 terminal 화면 확인
+- `corepack pnpm audit` 결과 알려진 취약점 0건. 취약한 transitive `esbuild`는 workspace override로 `0.25.12`에 고정
 
-실제 Toss WebView 기기 QR E2E, real mTLS, 수동 접근성, 전체 DDL constraint 조합과 Challenge 동시 claim 검증은 후속 작업입니다.
+`.github/workflows/ci.yml`은 pull request/main에서 install, format, lint, typecheck, high-severity dependency audit, PostgreSQL integration test, build와 별도 gitleaks job을 실행하도록 구성됐습니다. 현행 미커밋 workflow의 원격 CI 성공 증거는 아직 없으며, 위 결과는 2026-09-05 KST 로컬 실행 증거입니다.
 
 ## 보안·데이터 원칙
 
@@ -183,18 +179,22 @@ corepack pnpm build
 - CORS는 `.env`의 정확한 origin 목록만 허용하며 wildcard를 거부합니다.
 - published question revision과 daily set item은 DB trigger로 변경을 막습니다.
 - attempt/answer/idempotency는 unique/check constraint와 row lock transaction으로 보호합니다.
+- Challenge public token 원문은 DB에 저장하지 않고 hash만 저장하며 deep link 진입 즉시 주소에서 제거합니다.
+- 알림 대상 anonymous key는 application-level 암호화 후 저장하고 철회/삭제 시 제거합니다.
+- 계정 삭제는 token version을 올리고 개인 attempt/answer/report/idempotency/notification 데이터를 삭제하며 과거 Challenge 상대에게 삭제 사용자 점수·nickname을 노출하지 않습니다.
 - 실제 인증서, private key, production anon key/token을 저장소나 `VITE_*` 변수에 넣지 않습니다.
 
 ## Apps in Toss 배포 전 필수 확인
 
 `apps/web/apps-in-toss.config.ts`의 `appName: "daily-quiz-battle"`은 임시값입니다. 콘솔 등록 후 변경할 수 없는 값이므로 다음을 확정하기 전 임시값으로 등록하지 않습니다.
 
-1. production appName과 앱 상세 정보
-2. 실제 mTLS 인증서/키와 Secret 주입 방식
-3. production API origin/CORS
-4. Apps in Toss QR 기기 E2E
-5. 개인정보처리방침, 삭제·보존 정책, 고객지원 책임자
-6. 14+ 검토 콘텐츠와 공개 출시 하드 게이트
+1. production appName, 앱 상세 정보와 알림 template/templateSet code
+2. 실제 mTLS 인증서/키로 identity와 notification send 성공 경로 검증
+3. production API origin/CORS와 다중 인스턴스 shared rate-limit store
+4. 실제 iOS/Android Apps in Toss QR E2E
+5. VoiceOver/TalkBack, keyboard-only, 200% 확대 수동 QA
+6. 150개+ 검수 콘텐츠와 14+ 적합성 증거
+7. production monitoring/alert, backup/restore, 개인정보처리방침·법무·검수
 
 ## 개발 문서와 Git 정책
 

@@ -3,7 +3,9 @@ import { after, before, test } from "node:test";
 import {
   ApiErrorSchema,
   BootstrapResponseSchema,
+  ClaimChallengeResponseSchema,
   CompleteAttemptResponseSchema,
+  CreateChallengeResponseSchema,
   DailyStartResponseSchema,
   SubmitAnswerResponseSchema,
   type DailyStartResponse,
@@ -27,6 +29,9 @@ interface JsonResponse {
 }
 
 const correctSelections = [0, 2, 1, 1, 3] as const;
+const shuffledQuizDate = "2026-08-31";
+const shuffledChoiceOrder = [2, 0, 3, 1] as const;
+const retiredSnapshotQuizDate = "2026-09-01";
 let harness: IntegrationHarness;
 
 before(async () => {
@@ -204,6 +209,16 @@ test("isolated database setup is migrated, seeded, and ready", async () => {
       ["0001_initial.sql", 1],
       ["0002_strengthen_immutability.sql", 1],
       ["0003_lock_daily_set_lifecycle.sql", 1],
+      ["0004_challenges.sql", 1],
+      ["0005_validate_choice_order.sql", 1],
+      ["0006_reports.sql", 1],
+      ["0007_content_operations.sql", 1],
+      ["0008_user_deletion.sql", 1],
+      ["0009_notifications.sql", 1],
+      ["0010_allow_account_answer_deletion.sql", 1],
+      ["0011_harden_content_invariants.sql", 1],
+      ["0012_attempt_challenge_provenance.sql", 1],
+      ["0013_decouple_report_challenge_retention.sql", 1],
     ],
   );
 
@@ -369,6 +384,326 @@ test("full daily flow resumes and replays without exposing answers early", async
       AND response_status = 200
   `;
   assert.equal(idempotency[0]?.count, 6);
+});
+
+test("retired revisions block new starts without invalidating an existing attempt snapshot", async () => {
+  const dailySets = await harness.database.client<{ id: string }[]>`
+    INSERT INTO daily_sets (quiz_date, status)
+    VALUES (${retiredSnapshotQuizDate}, 'draft')
+    RETURNING id
+  `;
+  const dailySetId = dailySets[0]!.id;
+  const revisionIds: string[] = [];
+
+  for (let position = 1; position <= 5; position += 1) {
+    const questions = await harness.database.client<{ id: string }[]>`
+      INSERT INTO questions DEFAULT VALUES
+      RETURNING id
+    `;
+    const revisions = await harness.database.client<{ id: string }[]>`
+      INSERT INTO question_revisions (
+        question_id,
+        revision_number,
+        category,
+        difficulty,
+        prompt,
+        choices,
+        correct_index,
+        explanation,
+        source_url,
+        source_checked_at,
+        reviewer_id,
+        lifecycle_status,
+        published_at
+      )
+      SELECT
+        ${questions[0]!.id},
+        1,
+        qr.category,
+        qr.difficulty,
+        qr.prompt,
+        qr.choices,
+        qr.correct_index,
+        qr.explanation,
+        qr.source_url,
+        qr.source_checked_at,
+        'retired-snapshot-fixture',
+        'published',
+        now()
+      FROM daily_set_items dsi
+      JOIN daily_sets ds ON ds.id = dsi.daily_set_id
+      JOIN question_revisions qr ON qr.id = dsi.question_revision_id
+      WHERE ds.quiz_date = ${PRIMARY_QUIZ_DATE}
+        AND dsi.position = ${position}
+      RETURNING id
+    `;
+    const revisionId = revisions[0]!.id;
+    revisionIds.push(revisionId);
+    await harness.database.client`
+      INSERT INTO daily_set_items (
+        daily_set_id,
+        position,
+        question_revision_id,
+        choice_order
+      )
+      VALUES (
+        ${dailySetId},
+        ${position},
+        ${revisionId},
+        '[0, 1, 2, 3]'::jsonb
+      )
+    `;
+  }
+
+  await harness.database.client`
+    UPDATE daily_sets
+    SET status = 'published', published_at = now()
+    WHERE id = ${dailySetId}
+  `;
+
+  harness.setNow("2026-09-01T03:00:00.000Z");
+  const existingUserToken = await bootstrapUser(
+    "dev-it-retired-snapshot-existing",
+  );
+  const started = await startQuiz(existingUserToken);
+  await submitSuccessfulAnswer(
+    existingUserToken,
+    started.attempt.id,
+    "retired-snapshot-answer-1",
+    started.questions[0]!,
+    correctSelections[0],
+  );
+
+  await harness.database.client`
+    UPDATE question_revisions
+    SET lifecycle_status = 'retired', retired_at = now()
+    WHERE id = ${revisionIds[0]!}
+  `;
+
+  const resumed = await startQuiz(existingUserToken);
+  assert.equal(resumed.attempt.id, started.attempt.id);
+  assert.equal(resumed.attempt.status, "started");
+  assert.equal(resumed.attempt.answeredCount, 1);
+  assert.deepEqual(resumed.questions, started.questions);
+
+  const newUserToken = await bootstrapUser("dev-it-retired-snapshot-new");
+  const blockedStart = await harness.app.inject({
+    method: "POST",
+    url: "/v1/daily/start",
+    headers: authorizationHeaders(newUserToken),
+    payload: {},
+  });
+  expectApiError(blockedStart, 503, "DAILY_SET_NOT_READY");
+
+  for (let index = 1; index < resumed.questions.length; index += 1) {
+    await submitSuccessfulAnswer(
+      existingUserToken,
+      resumed.attempt.id,
+      `retired-snapshot-answer-${index + 1}`,
+      resumed.questions[index]!,
+      correctSelections[index]!,
+    );
+  }
+
+  const completed = await completeQuiz(
+    existingUserToken,
+    resumed.attempt.id,
+    "retired-snapshot-complete",
+  );
+  const completedReplay = await completeQuiz(
+    existingUserToken,
+    resumed.attempt.id,
+    "retired-snapshot-complete",
+  );
+  const completedRecovery = await completeQuiz(
+    existingUserToken,
+    resumed.attempt.id,
+    "retired-snapshot-result-recovery",
+  );
+  assert.equal(completed.statusCode, 200, completed.body);
+  assert.equal(completedReplay.statusCode, 200, completedReplay.body);
+  assert.equal(completedRecovery.statusCode, 200, completedRecovery.body);
+  const completedResult = CompleteAttemptResponseSchema.parse(completed.json());
+  assert.deepEqual(
+    CompleteAttemptResponseSchema.parse(completedReplay.json()),
+    completedResult,
+  );
+  assert.deepEqual(
+    CompleteAttemptResponseSchema.parse(completedRecovery.json()),
+    completedResult,
+  );
+
+  const completedResume = await startQuiz(existingUserToken);
+  assert.equal(completedResume.attempt.id, started.attempt.id);
+  assert.equal(completedResume.attempt.status, "completed");
+  assert.equal(completedResume.attempt.score, 5);
+  assert.deepEqual(completedResume.questions, started.questions);
+});
+
+test("completion scores and reviews answers in displayed choice order", async () => {
+  const dailySets = await harness.database.client<{ id: string }[]>`
+    INSERT INTO daily_sets (quiz_date, status)
+    VALUES (${shuffledQuizDate}, 'draft')
+    RETURNING id
+  `;
+  const dailySetId = dailySets[0]!.id;
+
+  await harness.database.client`
+    INSERT INTO daily_set_items (
+      daily_set_id,
+      position,
+      question_revision_id,
+      choice_order
+    )
+    SELECT
+      ${dailySetId},
+      dsi.position,
+      dsi.question_revision_id,
+      '[2, 0, 3, 1]'::jsonb
+    FROM daily_set_items dsi
+    JOIN daily_sets ds ON ds.id = dsi.daily_set_id
+    WHERE ds.quiz_date = ${PRIMARY_QUIZ_DATE}
+    ORDER BY dsi.position
+  `;
+  await harness.database.client`
+    UPDATE daily_sets
+    SET status = 'published', published_at = now()
+    WHERE id = ${dailySetId}
+  `;
+
+  harness.setNow("2026-08-31T03:00:00.000Z");
+  const token = await bootstrapUser("dev-it-shuffled-choice-order");
+  const start = await startQuiz(token);
+  const displayedCorrectSelections = correctSelections.map((correctIndex) =>
+    shuffledChoiceOrder.indexOf(correctIndex),
+  );
+
+  assert.equal(start.attempt.quizDate, shuffledQuizDate);
+  assert.deepEqual(start.questions[0]?.choices, ["O₂", "H₂O", "NaCl", "CO₂"]);
+
+  for (const [index, question] of start.questions.entries()) {
+    await submitSuccessfulAnswer(
+      token,
+      start.attempt.id,
+      `shuffled-answer-${index + 1}`,
+      question,
+      displayedCorrectSelections[index]!,
+    );
+  }
+
+  const completed = await completeQuiz(
+    token,
+    start.attempt.id,
+    "shuffled-complete-1",
+  );
+  assert.equal(completed.statusCode, 200, completed.body);
+  const result = CompleteAttemptResponseSchema.parse(completed.json());
+
+  assert.equal(result.score, 5);
+  assert.deepEqual(
+    result.review.map((item) => item.selectedIndex),
+    displayedCorrectSelections,
+  );
+  assert.deepEqual(
+    result.review.map((item) => item.correctIndex),
+    displayedCorrectSelections,
+  );
+  assert.ok(result.review.every((item) => item.correct));
+});
+
+test("late historical challenge completion does not regress daily streak state", async () => {
+  harness.setNow(PRIMARY_DAY_NOON);
+  const token = await bootstrapUser("dev-it-monotonic-daily-state");
+  const userId = getTokenUserId(token);
+
+  const creatorToken = await bootstrapUser(
+    "dev-it-monotonic-challenge-creator",
+  );
+  const creator = await startQuiz(creatorToken);
+  await answerAllQuestions(creatorToken, creator, "monotonic-creator-answer");
+  const creatorCompleted = await completeQuiz(
+    creatorToken,
+    creator.attempt.id,
+    "monotonic-creator-complete",
+  );
+  assert.equal(creatorCompleted.statusCode, 200, creatorCompleted.body);
+
+  const challengeCreatedResponse = await harness.app.inject({
+    method: "POST",
+    url: "/v1/challenges",
+    headers: idempotentHeaders(
+      creatorToken,
+      "monotonic-historical-challenge-create",
+    ),
+    payload: { attemptId: creator.attempt.id },
+  });
+  assert.equal(
+    challengeCreatedResponse.statusCode,
+    200,
+    challengeCreatedResponse.body,
+  );
+  const challengeCreated = CreateChallengeResponseSchema.parse(
+    challengeCreatedResponse.json(),
+  );
+
+  harness.setNow("2026-08-30T03:00:00.000Z");
+  const claimedResponse = await harness.app.inject({
+    method: "POST",
+    url: `/v1/challenges/${challengeCreated.challenge.token}/claim`,
+    headers: idempotentHeaders(token, "monotonic-historical-claim"),
+    payload: {},
+  });
+  assert.equal(claimedResponse.statusCode, 200, claimedResponse.body);
+  const historical = ClaimChallengeResponseSchema.parse(
+    claimedResponse.json(),
+  ).daily;
+  assert.equal(historical.attempt.quizDate, PRIMARY_QUIZ_DATE);
+  await answerAllQuestions(token, historical, "monotonic-historical-answer");
+
+  const current = await startQuiz(token);
+  assert.equal(current.attempt.quizDate, NEXT_QUIZ_DATE);
+  await answerAllQuestions(token, current, "monotonic-current-answer");
+  const currentCompleted = await completeQuiz(
+    token,
+    current.attempt.id,
+    "monotonic-current-complete",
+  );
+  assert.equal(currentCompleted.statusCode, 200, currentCompleted.body);
+
+  const stateBeforeHistoricalCompletion = await harness.database.client<
+    { streak_days: number; last_daily_date: string }[]
+  >`
+    SELECT
+      streak_days::int AS streak_days,
+      last_daily_date::text AS last_daily_date
+    FROM users
+    WHERE id = ${userId}
+  `;
+  assert.deepEqual(stateBeforeHistoricalCompletion[0], {
+    streak_days: 1,
+    last_daily_date: NEXT_QUIZ_DATE,
+  });
+
+  const historicalCompleted = await completeQuiz(
+    token,
+    historical.attempt.id,
+    "monotonic-historical-complete",
+  );
+  assert.equal(historicalCompleted.statusCode, 200, historicalCompleted.body);
+
+  const stateAfterHistoricalCompletion = await harness.database.client<
+    { streak_days: number; last_daily_date: string }[]
+  >`
+    SELECT
+      streak_days::int AS streak_days,
+      last_daily_date::text AS last_daily_date
+    FROM users
+    WHERE id = ${userId}
+  `;
+  assert.deepEqual(
+    stateAfterHistoricalCompletion[0],
+    stateBeforeHistoricalCompletion[0],
+  );
 });
 
 test("authentication, ownership, ordering, and failed idempotency roll back", async () => {
@@ -825,6 +1160,28 @@ test("database constraints and immutability triggers reject invalid writes", asy
         )
       `;
   }, /attempt_answers_selected_index_ck/);
+
+  await expectDatabaseFailure(async (transaction) => {
+    const draft = await transaction<{ id: string }[]>`
+        INSERT INTO daily_sets (quiz_date, status)
+        VALUES ('2030-01-03', 'draft')
+        RETURNING id
+      `;
+    await transaction`
+        INSERT INTO daily_set_items (
+          daily_set_id,
+          position,
+          question_revision_id,
+          choice_order
+        )
+        VALUES (
+          ${draft[0]!.id},
+          1,
+          ${start.questions[0]!.revisionId},
+          ${JSON.stringify([0, 0, 1, 2])}::jsonb
+        )
+      `;
+  }, /daily_set_items_choice_order_ck/);
 
   await expectDatabaseFailure(async (transaction) => {
     await transaction`

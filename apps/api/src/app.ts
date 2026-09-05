@@ -1,13 +1,22 @@
 import cors from "@fastify/cors";
 import helmet from "@fastify/helmet";
 import Fastify, { LogController, type FastifyInstance } from "fastify";
+import { registerAccountRoutes } from "./account/routes.js";
+import { registerAdminContentRoutes } from "./admin/content-routes.js";
+import { createAdminAccessTokenService } from "./admin/token.js";
 import { createIdentityVerifier } from "./auth/identity-verifier.js";
 import { registerAuthRoutes } from "./auth/routes.js";
 import { createAccessTokenService } from "./auth/token.js";
 import type { AppConfig } from "./config.js";
+import { registerChallengeRoutes } from "./challenge/routes.js";
+import { createChallengeTokenService } from "./challenge/token.js";
 import { registerDailyRoutes } from "./daily/routes.js";
 import type { Database } from "./db/client.js";
+import { registerNotificationRoutes } from "./notification/routes.js";
+import { createNotificationTargetCrypto } from "./notification/target-crypto.js";
+import { registerReportRoutes } from "./report/routes.js";
 import { AppError, sendError } from "./shared/errors.js";
+import { registerRateLimit } from "./shared/rate-limit.js";
 
 export interface BuildAppOptions {
   config: AppConfig;
@@ -41,6 +50,15 @@ export async function buildApp({
 
   await app.register(cors, {
     credentials: false,
+    methods: ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: [
+      "accept",
+      "authorization",
+      "content-type",
+      "idempotency-key",
+      "x-request-id",
+    ],
+    exposedHeaders: ["x-request-id"],
     origin(origin, callback) {
       if (origin === undefined || config.allowedOrigins.includes(origin)) {
         callback(null, true);
@@ -51,9 +69,17 @@ export async function buildApp({
   });
 
   await app.register(helmet, {
-    contentSecurityPolicy: false,
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'none'"],
+        baseUri: ["'none'"],
+        frameAncestors: ["'none'"],
+      },
+    },
     referrerPolicy: { policy: "no-referrer" },
   });
+
+  await registerRateLimit(app);
 
   app.addHook("onSend", async (request, reply, payload) => {
     reply.header("cache-control", "no-store");
@@ -87,6 +113,19 @@ export async function buildApp({
 
   const identityVerifier = createIdentityVerifier(config);
   const tokenService = createAccessTokenService(config);
+  const adminTokenService = createAdminAccessTokenService(config);
+  const notificationTargetCrypto = createNotificationTargetCrypto({
+    key: config.notificationTargetEncryptionKey,
+    version: config.notificationTargetEncryptionKeyVersion,
+    previous:
+      config.notificationTargetEncryptionKeyPrevious !== undefined &&
+      config.notificationTargetEncryptionKeyVersionPrevious !== undefined
+        ? {
+            key: config.notificationTargetEncryptionKeyPrevious,
+            version: config.notificationTargetEncryptionKeyVersionPrevious,
+          }
+        : undefined,
+  });
 
   registerAuthRoutes(app, {
     config,
@@ -94,7 +133,47 @@ export async function buildApp({
     identityVerifier,
     tokenService,
   });
-  registerDailyRoutes(app, { database, tokenService, clock });
+  registerAccountRoutes(app, {
+    database,
+    tokenService,
+    rateLimitEnabled: config.rateLimitEnabled,
+    clock,
+  });
+  registerAdminContentRoutes(app, {
+    database,
+    tokenService: adminTokenService,
+    clock,
+  });
+  registerDailyRoutes(app, {
+    database,
+    tokenService,
+    rateLimitEnabled: config.rateLimitEnabled,
+    clock,
+  });
+  registerReportRoutes(app, {
+    database,
+    tokenService,
+    rateLimitEnabled: config.rateLimitEnabled,
+    clock,
+  });
+  registerNotificationRoutes(app, {
+    database,
+    tokenService,
+    targetCrypto: notificationTargetCrypto,
+    anonymousKeyPepper: config.anonymousKeyPepper,
+    rateLimitEnabled: config.rateLimitEnabled,
+    clock,
+  });
+  registerChallengeRoutes(app, {
+    database,
+    tokenService,
+    challengeTokens: createChallengeTokenService({
+      secret: config.challengeTokenSecret,
+      previousSecret: config.challengeTokenSecretPrevious,
+    }),
+    rateLimitEnabled: config.rateLimitEnabled,
+    clock,
+  });
 
   app.setNotFoundHandler((request, reply) => {
     sendError(

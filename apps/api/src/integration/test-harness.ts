@@ -19,6 +19,7 @@ export const NEXT_DAY_NOON = new Date("2026-08-30T03:00:00.000Z");
 
 export interface IntegrationHarness {
   app: FastifyInstance;
+  readonly config: Readonly<AppConfig>;
   database: Database;
   databaseName: string;
   databaseUrl: string;
@@ -95,6 +96,19 @@ function createTestConfig(databaseUrl: string): AppConfig {
     accessTokenTtlSeconds: 1800,
     accessTokenIssuer: "daily-quiz-battle-integration-test",
     accessTokenAudience: "daily-quiz-battle-integration-client",
+    adminAccessTokenSecret:
+      "integration-test-admin-access-token-secret-do-not-use-in-production",
+    adminAccessTokenIssuer: "daily-quiz-battle-admin-integration-test",
+    adminAccessTokenAudience: "daily-quiz-battle-content-api-integration-test",
+    challengeTokenSecret:
+      "integration-test-challenge-token-secret-do-not-use-in-production",
+    notificationTargetEncryptionKey: Buffer.alloc(32, 7),
+    notificationTargetEncryptionKeyVersion: 1,
+    resultNotificationTemplateSetCode: "integration-result-template",
+    notificationSendUrl:
+      "https://example.invalid/apps-in-toss/messenger/send-message",
+    // Concurrency tests fire bursts far above the per-user limits.
+    rateLimitEnabled: false,
     allowedOrigins: ["http://localhost:5173"],
   };
 }
@@ -130,6 +144,7 @@ export async function createIntegrationHarness(): Promise<IntegrationHarness> {
     let closed = false;
     return {
       app,
+      config,
       database,
       databaseName,
       databaseUrl,
