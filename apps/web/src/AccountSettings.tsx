@@ -9,6 +9,7 @@ interface AccountSettingsProps {
   } | null;
   headingRef: Ref<HTMLHeadingElement>;
   notificationBusy: boolean;
+  notificationDeliveryAvailable: boolean;
   notificationEnabled: boolean | null;
   notificationError: {
     title: string;
@@ -27,6 +28,7 @@ export function AccountSettings({
   error,
   headingRef,
   notificationBusy,
+  notificationDeliveryAvailable,
   notificationEnabled,
   notificationError,
   onCancel,
@@ -75,16 +77,17 @@ export function AccountSettings({
         <section aria-labelledby="result-notification-title">
           <h2 id="result-notification-title">퀴즈 결과 알림</h2>
           <p>
-            오늘의 퀴즈 결과가 준비되면 토스 알림으로 알려드려요. 알림을 켤 때는
-            토스 동의 화면에서 직접 동의해야 합니다.
+            {notificationDeliveryAvailable
+              ? "오늘의 퀴즈 결과가 준비되면 토스 알림으로 알려드려요. 알림을 켤 때는 토스 동의 화면에서 직접 동의해야 합니다."
+              : "결과 알림은 아직 제공하지 않아요. 기존 알림 동의는 철회할 수 있어요."}
           </p>
           <p aria-live="polite">
             {notificationBusy
               ? "결과 알림 설정을 처리하는 중…"
               : notificationEnabled === true
-                ? "현재 결과 알림이 켜져 있어요."
+                ? "결과 알림 동의가 저장되어 있어요."
                 : notificationEnabled === false
-                  ? "현재 결과 알림이 꺼져 있어요."
+                  ? "현재 결과 알림에 동의하지 않은 상태예요."
                   : "현재 결과 알림 설정을 확인하지 못했어요."}
           </p>
           {notificationError ? (
@@ -104,14 +107,20 @@ export function AccountSettings({
                 ? onReloadNotification
                 : onToggleNotification
             }
-            disabled={notificationControlsDisabled || notificationBusy}
+            disabled={
+              notificationControlsDisabled ||
+              notificationBusy ||
+              (notificationEnabled === false && !notificationDeliveryAvailable)
+            }
           >
             {notificationBusy
               ? "처리 중…"
               : notificationEnabled === true
                 ? "결과 알림 끄기"
                 : notificationEnabled === false
-                  ? "결과 알림 켜기"
+                  ? notificationDeliveryAvailable
+                    ? "결과 알림 켜기"
+                    : "알림 준비 중"
                   : "설정 다시 불러오기"}
           </button>
         </section>

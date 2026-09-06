@@ -596,6 +596,8 @@ function App() {
   const [notificationEnabled, setNotificationEnabled] = useState<
     boolean | null
   >(null);
+  const [notificationDeliveryAvailable, setNotificationDeliveryAvailable] =
+    useState(false);
   const [notificationBusy, setNotificationBusy] = useState(false);
   const [reportPending, setReportPending] = useState(false);
   const [notificationError, setNotificationError] =
@@ -1538,8 +1540,10 @@ function App() {
     try {
       const preference = await getResultNotificationPreference();
       setNotificationEnabled(preference.enabled);
+      setNotificationDeliveryAvailable(preference.deliveryAvailable);
     } catch (error) {
       setNotificationEnabled(null);
+      setNotificationDeliveryAvailable(false);
       setNotificationError(toDisplayError(error));
     } finally {
       setNotificationBusy(false);
@@ -1560,11 +1564,13 @@ function App() {
         .then((preference) => {
           if (active) {
             setNotificationEnabled(preference.enabled);
+            setNotificationDeliveryAvailable(preference.deliveryAvailable);
           }
         })
         .catch((error: unknown) => {
           if (active) {
             setNotificationEnabled(null);
+            setNotificationDeliveryAvailable(false);
             setNotificationError(toDisplayError(error));
           }
         })
@@ -1584,7 +1590,12 @@ function App() {
   }, [screen]);
 
   const handleToggleResultNotification = useCallback(async () => {
-    if (busy || notificationBusy || notificationEnabled === null) {
+    if (
+      busy ||
+      notificationBusy ||
+      notificationEnabled === null ||
+      (!notificationEnabled && !notificationDeliveryAvailable)
+    ) {
       return;
     }
 
@@ -1609,6 +1620,7 @@ function App() {
         throw new Error("서버가 결과 알림 설정 변경을 확인하지 못했습니다.");
       }
       setNotificationEnabled(preference.enabled);
+      setNotificationDeliveryAvailable(preference.deliveryAvailable);
       if (agreementDenied) {
         setNotificationError({
           title: "알림 동의가 완료되지 않았어요",
@@ -1616,6 +1628,7 @@ function App() {
         });
       }
     } catch (error) {
+      setNotificationDeliveryAvailable(false);
       if (!(error instanceof DOMException && error.name === "AbortError")) {
         setNotificationError(toDisplayError(error));
       }
@@ -1623,7 +1636,12 @@ function App() {
       notificationAgreementAbort.current = null;
       setNotificationBusy(false);
     }
-  }, [busy, notificationBusy, notificationEnabled]);
+  }, [
+    busy,
+    notificationBusy,
+    notificationEnabled,
+    notificationDeliveryAvailable,
+  ]);
 
   const handleDeleteAccount = useCallback(async () => {
     if (busy || notificationBusy || reportPending) {
@@ -1649,6 +1667,7 @@ function App() {
       setShareMessage(null);
       setFatalError(null);
       setNotificationEnabled(null);
+      setNotificationDeliveryAvailable(false);
       setNotificationError(null);
       setNotificationBusy(false);
       setRefreshingChallenge(false);
@@ -1827,6 +1846,7 @@ function App() {
         error={actionError}
         headingRef={mainHeading}
         notificationBusy={notificationBusy}
+        notificationDeliveryAvailable={notificationDeliveryAvailable}
         notificationEnabled={notificationEnabled}
         notificationError={notificationError}
         onCancel={() => {

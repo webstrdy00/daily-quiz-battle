@@ -506,6 +506,7 @@ export async function claimChallenge(
   userId: string,
   token: string,
   now = new Date(),
+  notificationDeliveryEnabled = true,
 ): Promise<ClaimChallengeResponse> {
   const tokenHash = tokens.hash(token);
 
@@ -640,6 +641,7 @@ export async function claimChallenge(
       await enqueueChallengeCompletionNotifications(
         transaction,
         completedChallenges.map((challenge) => challenge.id),
+        notificationDeliveryEnabled,
       );
     }
 

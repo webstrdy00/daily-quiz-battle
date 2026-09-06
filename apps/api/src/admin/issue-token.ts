@@ -2,9 +2,14 @@ import { loadConfig } from "../config.js";
 import { createAdminAccessTokenService } from "./token.js";
 
 const USAGE =
-  "Usage: pnpm --filter @daily-quiz-battle/api admin:token -- --subject <value> [--scope content:write,content:void]";
+  "Usage: pnpm --filter @daily-quiz-battle/api admin:token -- --subject <value> [--scope content:write,content:void,reports:read,reports:triage]";
 const CONTROL_CHARACTER_PATTERN = /\p{Cc}/u;
-const ALLOWED_SCOPES = ["content:write", "content:void"] as const;
+const ALLOWED_SCOPES = [
+  "content:write",
+  "content:void",
+  "reports:read",
+  "reports:triage",
+] as const;
 type AllowedScope = (typeof ALLOWED_SCOPES)[number];
 
 interface ParsedArguments {

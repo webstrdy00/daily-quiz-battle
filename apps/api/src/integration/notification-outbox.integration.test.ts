@@ -11,6 +11,7 @@ import {
 } from "@daily-quiz-battle/contracts";
 import { decodeJwt } from "jose";
 import {
+  enqueueChallengeCompletionNotifications,
   runNotificationWorker,
   type NotificationWorkerCounts,
 } from "../notification/outbox.js";
@@ -457,6 +458,36 @@ test("completion enqueue is consent-gated, minimal, deduplicated, and publishabl
       WORKER_AT.toISOString(),
     );
   }
+});
+
+test("notification delivery kill switch suppresses enqueue without changing eligibility", async () => {
+  const completed = await createCompletedChallenge("delivery-kill", {});
+  await harness.database.client`
+    DELETE FROM notification_outbox
+    WHERE challenge_id = ${completed.challengeId}
+  `;
+
+  await harness.database.client.begin((transaction) =>
+    enqueueChallengeCompletionNotifications(
+      transaction,
+      [completed.challengeId],
+      false,
+    ),
+  );
+  assert.equal((await getOutboxRows(completed.challengeId)).length, 0);
+
+  await harness.database.client.begin((transaction) =>
+    enqueueChallengeCompletionNotifications(
+      transaction,
+      [completed.challengeId],
+      true,
+    ),
+  );
+  assert.equal((await getOutboxRows(completed.challengeId)).length, 1);
+  await harness.database.client`
+    DELETE FROM notification_outbox
+    WHERE challenge_id = ${completed.challengeId}
+  `;
 });
 
 test("worker defaults to a batch of fifty and reports exact counts", async () => {

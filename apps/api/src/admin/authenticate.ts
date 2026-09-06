@@ -3,7 +3,8 @@ import { AppError } from "../shared/errors.js";
 import type { AdminAccessTokenService } from "./token.js";
 
 const CONTENT_WRITE_SCOPE = "content:write";
-export type AdminContentScope = "content:write" | "content:void";
+export type AdminScope =
+  "content:write" | "content:void" | "reports:read" | "reports:triage";
 
 export interface AuthenticatedAdminPrincipal {
   actorSubject: string;
@@ -12,7 +13,7 @@ export interface AuthenticatedAdminPrincipal {
 export async function authenticateAdminRequest(
   request: FastifyRequest,
   tokenService: AdminAccessTokenService,
-  requiredScope: AdminContentScope = CONTENT_WRITE_SCOPE,
+  requiredScope: AdminScope = CONTENT_WRITE_SCOPE,
 ): Promise<AuthenticatedAdminPrincipal> {
   const authorization = request.headers.authorization;
   const match =

@@ -9,6 +9,7 @@ import { AppError, parseRequest } from "../shared/errors.js";
 import { fingerprintAnonymousKey } from "../shared/hash.js";
 import { ipKey, rateLimited } from "../shared/rate-limit.js";
 import type { IdentityVerifier } from "./identity-verifier.js";
+import { generateNickname } from "./nickname.js";
 import type { AccessTokenService } from "./token.js";
 
 interface UserRow {
@@ -61,9 +62,10 @@ export function registerAuthRoutes(
         const inserted = await database.client<UserRow[]>`
         INSERT INTO users (
           anon_key_fingerprint,
+          nickname,
           identity_verified_at
         )
-        VALUES (${fingerprint}, now())
+        VALUES (${fingerprint}, ${generateNickname()}, now())
         ON CONFLICT (anon_key_fingerprint) DO NOTHING
         RETURNING id, nickname, identity_status, token_version
       `;

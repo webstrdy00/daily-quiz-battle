@@ -123,6 +123,14 @@ const EnvironmentSchema = z.object({
       typeof value === "string" && value.trim() === "" ? undefined : value,
     z.string().trim().min(1).optional(),
   ),
+  NOTIFICATION_DELIVERY_ENABLED: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((value) => value === "true"),
+  ANALYTICS_PUBLISH_ENABLED: z
+    .enum(["true", "false"])
+    .default("true")
+    .transform((value) => value === "true"),
   NOTIFICATION_SEND_URL: z
     .string()
     .url()
@@ -143,6 +151,22 @@ const EnvironmentSchema = z.object({
     .min(1)
     .max(24)
     .default(24),
+  DAILY_START_ENABLED: z
+    .enum(["true", "false"])
+    .default("true")
+    .transform((value) => value === "true"),
+  DAILY_CONTINUATION_ENABLED: z
+    .enum(["true", "false"])
+    .default("true")
+    .transform((value) => value === "true"),
+  CHALLENGE_CREATE_ENABLED: z
+    .enum(["true", "false"])
+    .default("true")
+    .transform((value) => value === "true"),
+  CHALLENGE_CLAIM_ENABLED: z
+    .enum(["true", "false"])
+    .default("true")
+    .transform((value) => value === "true"),
   RATE_LIMIT_ENABLED: z
     .enum(["true", "false"])
     .default("true")
@@ -200,6 +224,12 @@ export interface AppConfig {
   notificationTargetEncryptionKeyVersionPrevious?: number;
   resultNotificationTemplateSetCode?: string;
   notificationSendUrl: string;
+  notificationDeliveryEnabled?: boolean;
+  analyticsPublishEnabled?: boolean;
+  dailyStartEnabled?: boolean;
+  dailyContinuationEnabled?: boolean;
+  challengeCreateEnabled?: boolean;
+  challengeClaimEnabled?: boolean;
   rateLimitEnabled: boolean;
   rateLimitRedisUrl?: string;
   metricsAccessToken?: string;
@@ -214,6 +244,72 @@ export interface OperationsSchedulerConfig {
 
 export type RuntimeConfig = AppConfig & OperationsSchedulerConfig;
 
+function isLoopbackHostname(hostname: string): boolean {
+  if (hostname === "localhost" || hostname === "::1" || hostname === "[::1]") {
+    return true;
+  }
+
+  const octets = hostname.split(".");
+  return (
+    octets.length === 4 &&
+    octets[0] === "127" &&
+    octets.every(
+      (octet) =>
+        /^\d{1,3}$/.test(octet) && Number(octet) >= 0 && Number(octet) <= 255,
+    )
+  );
+}
+
+function assertSecureUrl(
+  appEnvironment: AppEnvironment,
+  label: string,
+  value: string,
+): void {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error(`${label} must be a valid URL`);
+  }
+
+  if (url.protocol === "https:") {
+    return;
+  }
+
+  if (
+    appEnvironment === "development" &&
+    url.protocol === "http:" &&
+    isLoopbackHostname(url.hostname)
+  ) {
+    return;
+  }
+
+  throw new Error(
+    `${label} must use HTTPS (development permits HTTP loopback only)`,
+  );
+}
+
+export function assertSecureExternalUrls(options: {
+  appEnvironment: AppEnvironment;
+  identityVerifyUrl: string;
+  notificationSendUrl: string;
+  allowedOrigins: string[];
+}): void {
+  assertSecureUrl(
+    options.appEnvironment,
+    "IDENTITY_VERIFY_URL",
+    options.identityVerifyUrl,
+  );
+  assertSecureUrl(
+    options.appEnvironment,
+    "NOTIFICATION_SEND_URL",
+    options.notificationSendUrl,
+  );
+  for (const origin of options.allowedOrigins) {
+    assertSecureUrl(options.appEnvironment, "ALLOWED_ORIGINS", origin);
+  }
+}
+
 export function loadConfig(): RuntimeConfig {
   loadLocalEnvironment();
   const values = EnvironmentSchema.parse(process.env);
@@ -224,6 +320,13 @@ export function loadConfig(): RuntimeConfig {
   if (allowedOrigins.length === 0 || allowedOrigins.includes("*")) {
     throw new Error("ALLOWED_ORIGINS must contain exact origins, not wildcard");
   }
+
+  assertSecureExternalUrls({
+    appEnvironment: values.APP_ENV,
+    identityVerifyUrl: values.IDENTITY_VERIFY_URL,
+    notificationSendUrl: values.NOTIFICATION_SEND_URL,
+    allowedOrigins,
+  });
 
   if (
     values.APP_ENV !== "development" &&
@@ -315,7 +418,10 @@ export function loadConfig(): RuntimeConfig {
       );
     }
 
-    if (!values.RESULT_NOTIFICATION_TEMPLATE_SET_CODE) {
+    if (
+      values.NOTIFICATION_DELIVERY_ENABLED &&
+      !values.RESULT_NOTIFICATION_TEMPLATE_SET_CODE
+    ) {
       throw new Error(
         "Non-development RESULT_NOTIFICATION_TEMPLATE_SET_CODE is required",
       );
@@ -373,10 +479,16 @@ export function loadConfig(): RuntimeConfig {
     resultNotificationTemplateSetCode:
       values.RESULT_NOTIFICATION_TEMPLATE_SET_CODE,
     notificationSendUrl: values.NOTIFICATION_SEND_URL,
+    notificationDeliveryEnabled: values.NOTIFICATION_DELIVERY_ENABLED,
+    analyticsPublishEnabled: values.ANALYTICS_PUBLISH_ENABLED,
     operationsSchedulerEnabled: values.OPERATIONS_SCHEDULER_ENABLED,
     operationsNotificationIntervalSeconds:
       values.OPERATIONS_NOTIFICATION_INTERVAL_SECONDS,
     operationsCleanupIntervalHours: values.OPERATIONS_CLEANUP_INTERVAL_HOURS,
+    dailyStartEnabled: values.DAILY_START_ENABLED,
+    dailyContinuationEnabled: values.DAILY_CONTINUATION_ENABLED,
+    challengeCreateEnabled: values.CHALLENGE_CREATE_ENABLED,
+    challengeClaimEnabled: values.CHALLENGE_CLAIM_ENABLED,
     rateLimitEnabled: values.RATE_LIMIT_ENABLED,
     rateLimitRedisUrl: values.RATE_LIMIT_REDIS_URL,
     metricsAccessToken: values.METRICS_ACCESS_TOKEN,

@@ -8,7 +8,7 @@ import { z } from "zod";
 import { authenticateRequest } from "../auth/authenticate.js";
 import type { AccessTokenService } from "../auth/token.js";
 import type { Database } from "../db/client.js";
-import { parseRequest } from "../shared/errors.js";
+import { AppError, parseRequest } from "../shared/errors.js";
 import {
   ipAndPrincipalKey,
   principalKey,
@@ -28,8 +28,22 @@ export interface ChallengeRouteDependencies {
   database: Database;
   tokenService: AccessTokenService;
   challengeTokens: ChallengeTokenService;
+  challengeCreateEnabled: boolean;
+  challengeClaimEnabled: boolean;
   rateLimitEnabled: boolean;
+  notificationDeliveryEnabled?: boolean;
   clock?: () => Date;
+}
+
+function requireFeatureEnabled(enabled: boolean): void {
+  if (!enabled) {
+    throw new AppError({
+      statusCode: 503,
+      code: "FEATURE_DISABLED",
+      message: "현재 이 기능을 사용할 수 없습니다. 잠시 후 다시 시도해 주세요.",
+      retryable: true,
+    });
+  }
 }
 
 function getIdempotencyKey(request: FastifyRequest): string {
@@ -48,7 +62,10 @@ export function registerChallengeRoutes(
     database,
     tokenService,
     challengeTokens,
+    challengeCreateEnabled,
+    challengeClaimEnabled,
     rateLimitEnabled,
+    notificationDeliveryEnabled = true,
     clock = () => new Date(),
   } = dependencies;
 
@@ -61,6 +78,7 @@ export function registerChallengeRoutes(
         database,
         tokenService,
       );
+      requireFeatureEnabled(challengeCreateEnabled);
       const body = parseRequest(CreateChallengeRequestSchema, request.body);
       const idempotencyKey = getIdempotencyKey(request);
       return createChallenge(
@@ -98,6 +116,7 @@ export function registerChallengeRoutes(
         database,
         tokenService,
       );
+      requireFeatureEnabled(challengeClaimEnabled);
       // Contract requires the header; claim is idempotent per (challenge,
       // user) so only well-formedness is checked.
       getIdempotencyKey(request);
@@ -107,6 +126,7 @@ export function registerChallengeRoutes(
         principal.userId,
         tokenParam(request),
         clock(),
+        notificationDeliveryEnabled,
       );
     },
   );

@@ -710,6 +710,7 @@ export async function completeAttempt(
   attemptId: string,
   idempotencyKey: string,
   now = new Date(),
+  notificationDeliveryEnabled = true,
 ): Promise<CompleteAttemptResponse> {
   const operation = `complete:${attemptId}`;
   const keyHash = sha256(idempotencyKey);
@@ -931,6 +932,7 @@ export async function completeAttempt(
       await enqueueChallengeCompletionNotifications(
         transaction,
         completedChallenges.map((challenge) => challenge.id),
+        notificationDeliveryEnabled,
       );
 
       const previousDate = addDays(attempt.quiz_date, -1);

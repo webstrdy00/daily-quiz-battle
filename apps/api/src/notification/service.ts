@@ -63,6 +63,7 @@ export async function getResultNotificationPreference(
   database: Database,
   userId: string,
   now = new Date(),
+  deliveryAvailable = false,
 ): Promise<ResultNotificationPreferenceResponse> {
   const rows = await database.client<PreferenceRow[]>`
     SELECT result_enabled, updated_at
@@ -73,6 +74,7 @@ export async function getResultNotificationPreference(
 
   return ResultNotificationPreferenceResponseSchema.parse({
     enabled: preference?.result_enabled ?? false,
+    deliveryAvailable,
     updatedAt: toIsoDateTime(preference?.updated_at ?? now),
   });
 }
@@ -84,6 +86,7 @@ export async function updateResultNotificationPreference(
   userId: string,
   preference: UpdateResultNotificationPreferenceRequest,
   now = new Date(),
+  deliveryAvailable = false,
 ): Promise<ResultNotificationPreferenceResponse> {
   return database.client.begin(async (transaction) => {
     const users = await transaction<LockedUserRow[]>`
@@ -168,6 +171,7 @@ export async function updateResultNotificationPreference(
 
     return ResultNotificationPreferenceResponseSchema.parse({
       enabled: savedPreference.result_enabled,
+      deliveryAvailable,
       updatedAt: toIsoDateTime(savedPreference.updated_at),
     });
   });

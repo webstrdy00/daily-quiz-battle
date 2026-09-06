@@ -28,6 +28,77 @@ groups:
           summary: Daily Quiz API 5xx ratio is above 5 percent
           description: The 5xx ratio exceeded 5 percent over 5 minutes with at least 20 requests in that window.
 
+      - alert: DailyQuizIdentityDependencyErrorRatioHigh
+        expr: |
+          (
+            sum(increase(daily_quiz_api_identity_verification_total{job="daily-quiz-api",outcome=~"dependency_error|invalid_response"}[5m]))
+            /
+            sum(increase(daily_quiz_api_identity_verification_total{job="daily-quiz-api"}[5m]))
+          ) > 0.05
+          and
+          sum(increase(daily_quiz_api_identity_verification_total{job="daily-quiz-api"}[5m])) >= 20
+        for: 5m
+        labels:
+          severity: critical
+          service: daily-quiz-api
+        annotations:
+          summary: Identity dependency error ratio is above 5 percent
+          description: Identity dependency or invalid-response outcomes exceeded 5 percent over 5 minutes with at least 20 verification outcomes in that window.
+
+      - alert: DailyQuizIdentityMtlsCertificateExpiresWithin30Days
+        expr: |
+          (
+            daily_quiz_api_identity_mtls_certificate_expiry_timestamp_seconds{job="daily-quiz-api"} - time()
+          ) < 2592000
+          and
+          (
+            daily_quiz_api_identity_mtls_certificate_expiry_timestamp_seconds{job="daily-quiz-api"} - time()
+          ) >= 1209600
+        labels:
+          severity: warning
+          service: daily-quiz-api
+        annotations:
+          summary: Identity mTLS certificate expires within 30 days
+          description: The configured identity mTLS client certificate expires in fewer than 30 days.
+
+      - alert: DailyQuizIdentityMtlsCertificateExpiresWithin14Days
+        expr: |
+          (
+            daily_quiz_api_identity_mtls_certificate_expiry_timestamp_seconds{job="daily-quiz-api"} - time()
+          ) < 1209600
+          and
+          (
+            daily_quiz_api_identity_mtls_certificate_expiry_timestamp_seconds{job="daily-quiz-api"} - time()
+          ) >= 604800
+        labels:
+          severity: critical
+          service: daily-quiz-api
+        annotations:
+          summary: Identity mTLS certificate expires within 14 days
+          description: The configured identity mTLS client certificate expires in fewer than 14 days.
+
+      - alert: DailyQuizIdentityMtlsCertificateExpiresWithin7Days
+        expr: |
+          (
+            daily_quiz_api_identity_mtls_certificate_expiry_timestamp_seconds{job="daily-quiz-api"} - time()
+          ) < 604800
+        labels:
+          severity: critical
+          service: daily-quiz-api
+        annotations:
+          summary: Identity mTLS certificate expires within 7 days
+          description: The configured identity mTLS client certificate expires in fewer than 7 days or has expired.
+
+      - alert: DailyQuizDailySetNotReady
+        expr: |
+          sum(increase(daily_quiz_api_operational_blocks_total{job="daily-quiz-api",reason="daily_set_not_ready"}[5m])) > 0
+        labels:
+          severity: critical
+          service: daily-quiz-api
+        annotations:
+          summary: A request was blocked because the daily set was not ready
+          description: At least one daily request encountered a not-ready daily set during the last 5 minutes.
+
       - alert: DailyQuizApiP95LatencyReleaseStop
         expr: |
           histogram_quantile(

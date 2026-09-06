@@ -15,6 +15,8 @@ import {
 } from "@daily-quiz-battle/contracts";
 import { decodeJwt } from "jose";
 import type postgres from "postgres";
+import { buildApp } from "../app.js";
+import { createDatabase } from "../db/client.js";
 import {
   createIntegrationHarness,
   NEXT_QUIZ_DATE,
@@ -234,6 +236,8 @@ test("isolated database setup is migrated, seeded, and ready", async () => {
       ["0013_decouple_report_challenge_retention.sql", 1],
       ["0014_daily_set_voids.sql", 1],
       ["0015_operation_task_runs.sql", 1],
+      ["0016_question_report_triage.sql", 1],
+      ["0017_fix_report_triage_trigger.sql", 1],
     ],
   );
 
@@ -279,6 +283,280 @@ test("isolated database setup is migrated, seeded, and ready", async () => {
     WHERE lifecycle_status = 'published'
   `;
   assert.equal(revisionCount[0]?.count, 5);
+});
+
+test("bootstrap assigns an allowed anonymous nickname and preserves it on replay", async () => {
+  const anonymousKey = "dev-it-anonymous-nickname";
+  const firstResponse = await harness.app.inject({
+    method: "POST",
+    url: "/v1/auth/bootstrap",
+    payload: { anonymousKey },
+  });
+  assert.equal(firstResponse.statusCode, 200, firstResponse.body);
+  const first = BootstrapResponseSchema.parse(firstResponse.json());
+  assert.match(
+    first.user.nickname,
+    /^(차분한|느긋한|다정한|명랑한)(토끼|수달|참새|고양이)[1-9][0-9]{3}$/,
+  );
+  assert.ok(first.user.nickname.length <= 12);
+
+  const replayResponse = await harness.app.inject({
+    method: "POST",
+    url: "/v1/auth/bootstrap",
+    payload: { anonymousKey },
+  });
+  assert.equal(replayResponse.statusCode, 200, replayResponse.body);
+  const replay = BootstrapResponseSchema.parse(replayResponse.json());
+  assert.equal(replay.user.nickname, first.user.nickname);
+  const userId = getTokenUserId(first.accessToken);
+  assert.equal(getTokenUserId(replay.accessToken), userId);
+  const rows = await harness.database.client<{ nickname: string }[]>`
+    SELECT nickname FROM users WHERE id = ${userId}
+  `;
+  assert.equal(rows[0]?.nickname, first.user.nickname);
+});
+
+test("bootstrap preserves a pre-existing nickname without backfilling it", async () => {
+  const anonymousKey = "dev-it-existing-nickname";
+  const userId = getTokenUserId(await bootstrapUser(anonymousKey));
+  await harness.database.client`
+    UPDATE users SET nickname = '익명 도전자' WHERE id = ${userId}
+  `;
+
+  const response = await harness.app.inject({
+    method: "POST",
+    url: "/v1/auth/bootstrap",
+    payload: { anonymousKey },
+  });
+  assert.equal(response.statusCode, 200, response.body);
+  const replay = BootstrapResponseSchema.parse(response.json());
+  assert.equal(getTokenUserId(replay.accessToken), userId);
+  assert.equal(replay.user.nickname, "익명 도전자");
+  const rows = await harness.database.client<{ nickname: string }[]>`
+    SELECT nickname FROM users WHERE id = ${userId}
+  `;
+  assert.equal(rows[0]?.nickname, "익명 도전자");
+});
+
+test("concurrent bootstrap requests return the same user and stored nickname", async () => {
+  const responses = await Promise.all(
+    Array.from({ length: 8 }, () =>
+      harness.app.inject({
+        method: "POST",
+        url: "/v1/auth/bootstrap",
+        payload: { anonymousKey: "dev-it-concurrent-nickname" },
+      }),
+    ),
+  );
+  const bootstraps = responses.map((response) => {
+    assert.equal(response.statusCode, 200, response.body);
+    return BootstrapResponseSchema.parse(response.json());
+  });
+  const first = bootstraps[0]!;
+  const userId = getTokenUserId(first.accessToken);
+  for (const bootstrap of bootstraps) {
+    assert.equal(getTokenUserId(bootstrap.accessToken), userId);
+    assert.equal(bootstrap.user.nickname, first.user.nickname);
+  }
+  const rows = await harness.database.client<{ nickname: string }[]>`
+    SELECT nickname FROM users WHERE id = ${userId}
+  `;
+  assert.equal(rows[0]?.nickname, first.user.nickname);
+});
+
+test("daily write kill switches separate new starts from attempt draining", async () => {
+  harness.setNow(PRIMARY_DAY_NOON);
+  const blockedStartToken = await bootstrapUser("dev-it-daily-start-disabled");
+  const drainToken = await bootstrapUser("dev-it-daily-start-drain");
+  const drainStart = await startQuiz(drainToken);
+
+  const readWriteRowCounts = async () => {
+    const rows = await harness.database.client<
+      {
+        attempt_count: number;
+        answer_count: number;
+        idempotency_count: number;
+      }[]
+    >`
+      SELECT
+        (SELECT count(*)::int FROM attempts) AS attempt_count,
+        (SELECT count(*)::int FROM attempt_answers) AS answer_count,
+        (SELECT count(*)::int FROM idempotency_records) AS idempotency_count
+    `;
+    return rows[0]!;
+  };
+  const expectDisabled = (response: JsonResponse): void => {
+    expectApiError(response, 503, "FEATURE_DISABLED");
+    assert.equal(ApiErrorSchema.parse(response.json()).retryable, true);
+  };
+  const assertNoWrites = async (
+    expected: Awaited<ReturnType<typeof readWriteRowCounts>>,
+  ): Promise<void> => {
+    assert.deepEqual(await readWriteRowCounts(), expected);
+  };
+
+  const startDisabledConfig = {
+    ...harness.config,
+    dailyStartEnabled: false,
+  };
+  const startDisabledDatabase = createDatabase(startDisabledConfig);
+  let startDisabledApp: Awaited<ReturnType<typeof buildApp>> | undefined;
+  try {
+    startDisabledApp = await buildApp({
+      config: startDisabledConfig,
+      database: startDisabledDatabase,
+      clock: () => new Date(PRIMARY_DAY_NOON),
+    });
+    const countsBeforeBlockedStarts = await readWriteRowCounts();
+
+    const unauthenticatedStart = await startDisabledApp.inject({
+      method: "POST",
+      url: "/v1/daily/start",
+      payload: {},
+    });
+    expectApiError(unauthenticatedStart, 401, "UNAUTHORIZED");
+    await assertNoWrites(countsBeforeBlockedStarts);
+
+    const disabledStart = await startDisabledApp.inject({
+      method: "POST",
+      url: "/v1/daily/start",
+      headers: authorizationHeaders(blockedStartToken),
+      payload: {},
+    });
+    expectDisabled(disabledStart);
+    await assertNoWrites(countsBeforeBlockedStarts);
+
+    for (const [index, question] of drainStart.questions.entries()) {
+      const answerResponse: JsonResponse = await startDisabledApp.inject({
+        method: "POST",
+        url: `/v1/attempts/${drainStart.attempt.id}/answers`,
+        headers: idempotentHeaders(
+          drainToken,
+          `daily-start-disabled-drain-answer-${index + 1}`,
+        ),
+        payload: answerPayload(question, correctSelections[index]!),
+      });
+      assert.equal(answerResponse.statusCode, 200, answerResponse.body);
+      SubmitAnswerResponseSchema.parse(answerResponse.json());
+    }
+    const completed = await startDisabledApp.inject({
+      method: "POST",
+      url: `/v1/attempts/${drainStart.attempt.id}/complete`,
+      headers: idempotentHeaders(
+        drainToken,
+        "daily-start-disabled-drain-complete",
+      ),
+      payload: {},
+    });
+    assert.equal(completed.statusCode, 200, completed.body);
+    assert.equal(parseCompletedAttempt(completed.json()).score, 5);
+    assert.deepEqual(await readWriteRowCounts(), {
+      attempt_count: countsBeforeBlockedStarts.attempt_count,
+      answer_count: countsBeforeBlockedStarts.answer_count + 5,
+      idempotency_count: countsBeforeBlockedStarts.idempotency_count + 6,
+    });
+  } finally {
+    if (startDisabledApp !== undefined) {
+      await startDisabledApp.close();
+    } else {
+      await startDisabledDatabase.close();
+    }
+  }
+
+  const continuationToken = await bootstrapUser(
+    "dev-it-daily-continuation-disabled",
+  );
+  const continuationDisabledConfig = {
+    ...harness.config,
+    dailyContinuationEnabled: false,
+  };
+  const continuationDisabledDatabase = createDatabase(
+    continuationDisabledConfig,
+  );
+  let continuationDisabledApp: Awaited<ReturnType<typeof buildApp>> | undefined;
+  try {
+    continuationDisabledApp = await buildApp({
+      config: continuationDisabledConfig,
+      database: continuationDisabledDatabase,
+      clock: () => new Date(PRIMARY_DAY_NOON),
+    });
+    const countsBeforeAllowedStart = await readWriteRowCounts();
+    const allowedStartResponse = await continuationDisabledApp.inject({
+      method: "POST",
+      url: "/v1/daily/start",
+      headers: authorizationHeaders(continuationToken),
+      payload: {},
+    });
+    assert.equal(
+      allowedStartResponse.statusCode,
+      200,
+      allowedStartResponse.body,
+    );
+    const allowedStart = DailyStartResponseSchema.parse(
+      allowedStartResponse.json(),
+    );
+    if (allowedStart.status !== "available") {
+      assert.fail("daily set must be available in this fixture");
+    }
+    const countsBeforeBlockedContinuations = await readWriteRowCounts();
+    assert.deepEqual(countsBeforeBlockedContinuations, {
+      attempt_count: countsBeforeAllowedStart.attempt_count + 1,
+      answer_count: countsBeforeAllowedStart.answer_count,
+      idempotency_count: countsBeforeAllowedStart.idempotency_count,
+    });
+
+    const unauthenticatedAnswer = await continuationDisabledApp.inject({
+      method: "POST",
+      url: `/v1/attempts/${allowedStart.attempt.id}/answers`,
+      headers: {
+        "idempotency-key": "daily-continuation-disabled-unauth-answer",
+      },
+      payload: answerPayload(allowedStart.questions[0]!, correctSelections[0]),
+    });
+    expectApiError(unauthenticatedAnswer, 401, "UNAUTHORIZED");
+    await assertNoWrites(countsBeforeBlockedContinuations);
+
+    const unauthenticatedComplete = await continuationDisabledApp.inject({
+      method: "POST",
+      url: `/v1/attempts/${allowedStart.attempt.id}/complete`,
+      headers: {
+        "idempotency-key": "daily-continuation-disabled-unauth-complete",
+      },
+      payload: {},
+    });
+    expectApiError(unauthenticatedComplete, 401, "UNAUTHORIZED");
+    await assertNoWrites(countsBeforeBlockedContinuations);
+
+    const disabledAnswer = await continuationDisabledApp.inject({
+      method: "POST",
+      url: `/v1/attempts/${allowedStart.attempt.id}/answers`,
+      headers: idempotentHeaders(
+        continuationToken,
+        "daily-continuation-disabled-answer",
+      ),
+      payload: answerPayload(allowedStart.questions[0]!, correctSelections[0]),
+    });
+    expectDisabled(disabledAnswer);
+    await assertNoWrites(countsBeforeBlockedContinuations);
+
+    const disabledComplete = await continuationDisabledApp.inject({
+      method: "POST",
+      url: `/v1/attempts/${allowedStart.attempt.id}/complete`,
+      headers: idempotentHeaders(
+        continuationToken,
+        "daily-continuation-disabled-complete",
+      ),
+      payload: {},
+    });
+    expectDisabled(disabledComplete);
+    await assertNoWrites(countsBeforeBlockedContinuations);
+  } finally {
+    if (continuationDisabledApp !== undefined) {
+      await continuationDisabledApp.close();
+    } else {
+      await continuationDisabledDatabase.close();
+    }
+  }
 });
 
 test("full daily flow resumes and replays without exposing answers early", async () => {

@@ -44,8 +44,9 @@ export interface NotificationWorkerOptions {
 export async function enqueueChallengeCompletionNotifications(
   transaction: Transaction,
   challengeIds: readonly string[],
+  enabled = true,
 ): Promise<void> {
-  if (challengeIds.length === 0) {
+  if (!enabled || challengeIds.length === 0) {
     return;
   }
 

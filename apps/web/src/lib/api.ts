@@ -11,6 +11,7 @@ import {
   DailyStartResponseSchema,
   DeleteAccountRequestSchema,
   DeleteAccountResponseSchema,
+  OperationalCapabilitiesResponseSchema,
   ResultNotificationPreferenceResponseSchema,
   SubmitAnswerResponseSchema,
   UpdateResultNotificationPreferenceRequestSchema,
@@ -31,7 +32,7 @@ import {
   type SubmitAnswerRequest,
   type SubmitAnswerResponse,
 } from "@daily-quiz-battle/contracts";
-import { getAnonymousKey } from "./platform";
+import { getAnonymousKey, setAnalyticsPublishingEnabled } from "./platform";
 
 const apiBaseUrl = (
   import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:3000"
@@ -230,6 +231,24 @@ export async function bootstrapSession(): Promise<BootstrapResponse> {
     );
     assertActiveSession(epoch);
     accessToken = response.accessToken;
+    setAnalyticsPublishingEnabled(false);
+    try {
+      const capabilities = await fetchJson(
+        "/v1/operational-capabilities",
+        OperationalCapabilitiesResponseSchema,
+        {
+          method: "GET",
+          headers: {
+            authorization: `Bearer ${response.accessToken}`,
+          },
+        },
+        { epoch },
+      );
+      setAnalyticsPublishingEnabled(capabilities.analyticsPublishEnabled);
+    } catch {
+      setAnalyticsPublishingEnabled(false);
+    }
+    assertActiveSession(epoch);
     return response;
   })();
   bootstrapPromise = pending;
@@ -366,6 +385,7 @@ export async function deleteAccount(
     }
     sessionState = "deleted";
     accessToken = null;
+    setAnalyticsPublishingEnabled(false);
     return response;
   } catch (error) {
     const knownRejection =
@@ -380,6 +400,7 @@ export async function deleteAccount(
 
     sessionState = "deletion-uncertain";
     accessToken = null;
+    setAnalyticsPublishingEnabled(false);
     throw new ApiClientError({
       code: "ACCOUNT_DELETION_OUTCOME_UNKNOWN",
       message:

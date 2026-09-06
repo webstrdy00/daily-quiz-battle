@@ -420,14 +420,21 @@ async function runScheduler(): Promise<void> {
       },
     ];
 
-    const notificationTask = createNotificationTask(config);
-    if (notificationTask === undefined) {
+    if (config.notificationDeliveryEnabled === false) {
       writeLog(process.stdout, {
         task: "notification_worker",
-        status: "disabled_unconfigured",
+        status: "disabled_by_flag",
       });
     } else {
-      tasks.push(notificationTask);
+      const notificationTask = createNotificationTask(config);
+      if (notificationTask === undefined) {
+        writeLog(process.stdout, {
+          task: "notification_worker",
+          status: "disabled_unconfigured",
+        });
+      } else {
+        tasks.push(notificationTask);
+      }
     }
 
     await Promise.all(

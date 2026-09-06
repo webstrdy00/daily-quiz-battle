@@ -380,6 +380,10 @@ textarea:hover {
   flex: 1 1 165px;
 }
 
+.report-filter > label {
+  flex: 1 1 180px;
+}
+
 .notice {
   display: grid;
   gap: 0.25rem;
@@ -409,6 +413,11 @@ textarea:hover {
   border: 1px solid #83b99c;
   background: #ecf8f1;
   color: #205f3e;
+}
+
+.success-notice:focus {
+  outline: 3px solid #2f8256;
+  outline-offset: 2px;
 }
 
 .correction-guidance {
@@ -445,13 +454,15 @@ textarea:hover {
 
 .card-list,
 .daily-list,
-.picker-list {
+.picker-list,
+.report-list {
   display: grid;
   gap: 0.75rem;
 }
 
 .revision-card,
-.daily-card {
+.daily-card,
+.report-card {
   border: 1px solid #d0d9e2;
   border-radius: 8px;
   padding: 1rem;
@@ -498,6 +509,26 @@ textarea:hover {
 .status-voided {
   background: #6f2020;
   color: #fff;
+}
+
+.status-report-open {
+  background: #e8edf2;
+  color: #405064;
+}
+
+.status-report-reviewing {
+  background: #fff1c6;
+  color: #705508;
+}
+
+.status-report-resolved {
+  background: #d9f3e3;
+  color: #17663c;
+}
+
+.status-report-dismissed {
+  background: #f5dede;
+  color: #802d2d;
 }
 
 .status-row {
@@ -551,12 +582,44 @@ textarea:hover {
 
 .metadata-grid dd {
   margin: 0;
+  overflow-wrap: anywhere;
   font-size: 0.82rem;
 }
 
 .revision-card .button-row,
+.report-card .button-row,
 .daily-card .danger-button {
   margin-top: 0.9rem;
+}
+
+.report-privacy-warning {
+  display: grid;
+  gap: 0.2rem;
+  border: 1px solid #d2932c;
+  border-radius: 7px;
+  background: #fff7e5;
+  padding: 0.8rem;
+  color: #684208;
+  font-size: 0.84rem;
+}
+
+.report-detail {
+  border-left: 3px solid #8fa8c0;
+  background: #f3f7fa;
+  padding: 0.65rem 0.75rem;
+}
+
+.report-detail strong {
+  display: block;
+  margin-bottom: 0.3rem;
+  color: #43566b;
+  font-size: 0.76rem;
+}
+
+.report-detail p {
+  margin-bottom: 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
 }
 
 .load-more {
@@ -669,7 +732,8 @@ textarea:hover {
 
 .latest-draft,
 .publish-confirm,
-.void-confirm {
+.void-confirm,
+.report-dismiss-confirm {
   border-radius: 8px;
   margin-top: 1rem;
   padding: 1rem;
@@ -687,13 +751,15 @@ textarea:hover {
 }
 
 .publish-confirm,
-.void-confirm {
+.void-confirm,
+.report-dismiss-confirm {
   border: 2px solid #b93636;
   background: #fff5f5;
 }
 
 .publish-confirm p,
-.void-confirm p {
+.void-confirm p,
+.report-dismiss-confirm > p {
   margin-bottom: 0.9rem;
 }
 

@@ -8,7 +8,7 @@ import { z } from "zod";
 import { authenticateRequest } from "../auth/authenticate.js";
 import type { AccessTokenService } from "../auth/token.js";
 import type { Database } from "../db/client.js";
-import { parseRequest } from "../shared/errors.js";
+import { AppError, parseRequest } from "../shared/errors.js";
 import { principalKey, rateLimited } from "../shared/rate-limit.js";
 import { completeAttempt, startDailyQuiz, submitAnswer } from "./service.js";
 
@@ -21,8 +21,22 @@ function getIdempotencyKey(request: FastifyRequest): string {
 export interface DailyRouteDependencies {
   database: Database;
   tokenService: AccessTokenService;
+  dailyStartEnabled: boolean;
+  dailyContinuationEnabled: boolean;
   rateLimitEnabled: boolean;
+  notificationDeliveryEnabled?: boolean;
   clock?: () => Date;
+}
+
+function requireFeatureEnabled(enabled: boolean): void {
+  if (!enabled) {
+    throw new AppError({
+      statusCode: 503,
+      code: "FEATURE_DISABLED",
+      message: "현재 이 기능을 사용할 수 없습니다. 잠시 후 다시 시도해 주세요.",
+      retryable: true,
+    });
+  }
 }
 
 export function registerDailyRoutes(
@@ -32,7 +46,10 @@ export function registerDailyRoutes(
   const {
     database,
     tokenService,
+    dailyStartEnabled,
+    dailyContinuationEnabled,
     rateLimitEnabled,
+    notificationDeliveryEnabled = true,
     clock = () => new Date(),
   } = dependencies;
 
@@ -42,6 +59,7 @@ export function registerDailyRoutes(
       database,
       tokenService,
     );
+    requireFeatureEnabled(dailyStartEnabled);
     return startDailyQuiz(database, principal.userId, clock());
   });
 
@@ -54,6 +72,7 @@ export function registerDailyRoutes(
         database,
         tokenService,
       );
+      requireFeatureEnabled(dailyContinuationEnabled);
       const params = parseRequest(AttemptParamsSchema, request.params);
       const body = parseRequest(SubmitAnswerRequestSchema, request.body);
       const idempotencyKey = getIdempotencyKey(request);
@@ -75,6 +94,7 @@ export function registerDailyRoutes(
       database,
       tokenService,
     );
+    requireFeatureEnabled(dailyContinuationEnabled);
     const params = parseRequest(AttemptParamsSchema, request.params);
     const idempotencyKey = getIdempotencyKey(request);
 
@@ -84,6 +104,7 @@ export function registerDailyRoutes(
       params.attemptId,
       idempotencyKey,
       clock(),
+      notificationDeliveryEnabled,
     );
   });
 }

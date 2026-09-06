@@ -45,6 +45,12 @@ export const BootstrapResponseSchema = z.object({
   }),
 });
 
+export const OperationalCapabilitiesResponseSchema = z
+  .object({
+    analyticsPublishEnabled: z.boolean(),
+  })
+  .strict();
+
 export const DeleteAccountRequestSchema = z.object({
   confirmation: z.literal("DELETE"),
 });
@@ -61,6 +67,7 @@ export const UpdateResultNotificationPreferenceRequestSchema = z.object({
 
 export const ResultNotificationPreferenceResponseSchema = z.object({
   enabled: z.boolean(),
+  deliveryAvailable: z.boolean(),
   updatedAt: IsoDateTimeSchema,
 });
 
@@ -401,12 +408,21 @@ export const AdminAuditActionSchema = z.enum([
   "daily_set.create",
   "daily_set.publish",
   "daily_set.void",
+  "report.status.update",
 ]);
 
 export const AdminAuditResourceTypeSchema = z.enum([
   "question_revision",
   "daily_set",
+  "question_report",
 ]);
+
+const REPORT_STATUS_VALUES = [
+  "open",
+  "reviewing",
+  "resolved",
+  "dismissed",
+] as const;
 
 export const AdminAuditMetadataSchema = z.object({
   action: AdminAuditActionSchema.optional(),
@@ -414,6 +430,8 @@ export const AdminAuditMetadataSchema = z.object({
   category: CategorySchema.optional(),
   difficulty: DifficultySchema.optional(),
   reason: z.string().min(1).max(500).optional(),
+  fromStatus: z.enum(REPORT_STATUS_VALUES).optional(),
+  toStatus: z.enum(REPORT_STATUS_VALUES).optional(),
 });
 
 export const AdminListAuditLogsQuerySchema = z
@@ -448,6 +466,12 @@ export const ReportReasonSchema = z.enum([
   "inappropriate",
   "other",
 ]);
+export const ReportStatusSchema = z.enum(REPORT_STATUS_VALUES);
+export const ReportTriageStatusSchema = z.enum([
+  "reviewing",
+  "resolved",
+  "dismissed",
+]);
 
 export const CreateQuestionReportRequestSchema = z.object({
   questionRevisionId: UuidSchema,
@@ -459,6 +483,101 @@ export const CreateReportResponseSchema = z.object({
   id: UuidSchema,
   deduplicated: z.boolean(),
   createdAt: IsoDateTimeSchema,
+});
+
+export const AdminListReportsQuerySchema = z
+  .object({
+    cursor: AdminContentCursorSchema.optional(),
+    limit: z.coerce.number().int().min(1).max(100).default(20),
+    status: ReportStatusSchema.optional(),
+    reasonCode: ReportReasonSchema.optional(),
+  })
+  .strict();
+
+export const AdminReportListItemSchema = z
+  .object({
+    reportId: UuidSchema,
+    questionRevisionId: UuidSchema.nullable(),
+    challengeId: UuidSchema.nullable(),
+    questionContext: z
+      .object({
+        questionId: UuidSchema,
+        revisionId: UuidSchema,
+        revisionNumber: z.number().int().positive(),
+        prompt: z.string().min(1).max(500),
+        category: CategorySchema,
+        status: ContentStatusSchema,
+      })
+      .nullable(),
+    reasonCode: ReportReasonSchema,
+    detail: z.string().min(1).max(500).nullable(),
+    createdAt: IsoDateTimeSchema,
+    status: ReportStatusSchema,
+    triagedBy: z.string().min(1).max(100).nullable(),
+    triagedAt: IsoDateTimeSchema.nullable(),
+  })
+  .superRefine((report, context) => {
+    if (
+      (report.questionRevisionId === null) ===
+      (report.challengeId === null)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["questionRevisionId"],
+        message: "exactly one report target is required",
+      });
+    }
+
+    if (
+      (report.questionRevisionId === null) !==
+      (report.questionContext === null)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["questionContext"],
+        message: "question context must match the report target",
+      });
+    } else if (
+      report.questionContext !== null &&
+      report.questionContext.revisionId !== report.questionRevisionId
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["questionContext", "revisionId"],
+        message: "question context revision must match the report target",
+      });
+    }
+
+    const hasTriageActor = report.triagedBy !== null;
+    const hasTriageTime = report.triagedAt !== null;
+    if (
+      (report.status === "open" && (hasTriageActor || hasTriageTime)) ||
+      (report.status !== "open" && (!hasTriageActor || !hasTriageTime))
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["triagedBy"],
+        message: "triage fields must match report status",
+      });
+    }
+  });
+
+export const AdminListReportsResponseSchema = z.object({
+  reports: z.array(AdminReportListItemSchema),
+  nextCursor: AdminContentCursorSchema.nullable(),
+});
+
+export const AdminUpdateReportStatusRequestSchema = z
+  .object({
+    status: ReportTriageStatusSchema,
+  })
+  .strict();
+
+export const AdminUpdateReportStatusResponseSchema = z.object({
+  reportId: UuidSchema,
+  status: ReportTriageStatusSchema,
+  triagedBy: z.string().min(1).max(100),
+  triagedAt: IsoDateTimeSchema,
 });
 
 // ---------------------------------------------------------------------------
@@ -586,6 +705,9 @@ export type ChallengeResultResponse = z.infer<
 export type ApiError = z.infer<typeof ApiErrorSchema>;
 export type BootstrapRequest = z.infer<typeof BootstrapRequestSchema>;
 export type BootstrapResponse = z.infer<typeof BootstrapResponseSchema>;
+export type OperationalCapabilitiesResponse = z.infer<
+  typeof OperationalCapabilitiesResponseSchema
+>;
 export type DeleteAccountRequest = z.infer<typeof DeleteAccountRequestSchema>;
 export type DeleteAccountResponse = z.infer<typeof DeleteAccountResponseSchema>;
 export type UpdateResultNotificationPreferenceRequest = z.infer<
@@ -685,7 +807,20 @@ export type AdminListAuditLogsResponse = z.infer<
   typeof AdminListAuditLogsResponseSchema
 >;
 export type ReportReason = z.infer<typeof ReportReasonSchema>;
+export type ReportStatus = z.infer<typeof ReportStatusSchema>;
+export type ReportTriageStatus = z.infer<typeof ReportTriageStatusSchema>;
 export type CreateQuestionReportRequest = z.infer<
   typeof CreateQuestionReportRequestSchema
 >;
 export type CreateReportResponse = z.infer<typeof CreateReportResponseSchema>;
+export type AdminListReportsQuery = z.infer<typeof AdminListReportsQuerySchema>;
+export type AdminReportListItem = z.infer<typeof AdminReportListItemSchema>;
+export type AdminListReportsResponse = z.infer<
+  typeof AdminListReportsResponseSchema
+>;
+export type AdminUpdateReportStatusRequest = z.infer<
+  typeof AdminUpdateReportStatusRequestSchema
+>;
+export type AdminUpdateReportStatusResponse = z.infer<
+  typeof AdminUpdateReportStatusResponseSchema
+>;

@@ -14,6 +14,8 @@ import {
   type DailyAvailableStartResponse,
 } from "@daily-quiz-battle/contracts";
 import { decodeJwt } from "jose";
+import { buildApp } from "../app.js";
+import { createDatabase } from "../db/client.js";
 import {
   createIntegrationHarness,
   PRIMARY_DAY_NOON,
@@ -64,6 +66,13 @@ function expectApiError(
   assert.equal(response.statusCode, statusCode, response.body);
   const error = ApiErrorSchema.parse(response.json());
   assert.equal(error.code, code);
+}
+
+function expectFeatureDisabled(response: JsonResponse): void {
+  assert.equal(response.statusCode, 503, response.body);
+  const error = ApiErrorSchema.parse(response.json());
+  assert.equal(error.code, "FEATURE_DISABLED");
+  assert.equal(error.retryable, true);
 }
 
 function getTokenUserId(token: string): string {
@@ -200,6 +209,315 @@ async function getResult(user: TestUser, token: string) {
 function tamperToken(token: string): string {
   return `${token[0] === "A" ? "B" : "A"}${token.slice(1)}`;
 }
+
+interface MutationRowCounts {
+  challenge_count: number;
+  idempotency_count: number;
+  attempt_count: number;
+}
+
+async function getMutationRowCounts(): Promise<MutationRowCounts> {
+  const [counts] = await harness.database.client<MutationRowCounts[]>`
+    SELECT
+      (SELECT count(*)::int FROM challenges) AS challenge_count,
+      (SELECT count(*)::int FROM idempotency_records) AS idempotency_count,
+      (SELECT count(*)::int FROM attempts) AS attempt_count
+  `;
+  assert.ok(counts);
+  return counts;
+}
+
+test("create kill switch blocks only create and preserves claim and reads", async () => {
+  harness.setNow(PRIMARY_DAY_NOON);
+  const creator = await bootstrapUser("create-disabled-creator");
+  const creatorAttempt = await finishQuiz(
+    creator,
+    "create-disabled-creator",
+    3,
+  );
+  const created = await createChallenge(
+    creator,
+    creatorAttempt.attempt.id,
+    "create-disabled-fixture-create",
+  );
+  const claimant = await bootstrapUser("create-disabled-claimant");
+  const disabledConfig = {
+    ...harness.config,
+    challengeCreateEnabled: false,
+  };
+  assert.equal(disabledConfig.challengeClaimEnabled, undefined);
+  assert.equal(disabledConfig.dailyStartEnabled, undefined);
+  assert.equal(disabledConfig.dailyContinuationEnabled, undefined);
+
+  const disabledDatabase = createDatabase(disabledConfig);
+  let disabledApp: Awaited<ReturnType<typeof buildApp>> | undefined;
+  try {
+    disabledApp = await buildApp({
+      config: disabledConfig,
+      database: disabledDatabase,
+      clock: () => new Date(PRIMARY_DAY_NOON),
+    });
+
+    const dailyStartResponse = await disabledApp.inject({
+      method: "POST",
+      url: "/v1/daily/start",
+      headers: authorizationHeaders(claimant.token),
+      payload: {},
+    });
+    assert.equal(dailyStartResponse.statusCode, 200, dailyStartResponse.body);
+    assert.equal(
+      DailyStartResponseSchema.parse(dailyStartResponse.json()).status,
+      "available",
+    );
+
+    const countsBefore = await getMutationRowCounts();
+
+    const blockedCreate = await disabledApp.inject({
+      method: "POST",
+      url: "/v1/challenges",
+      headers: idempotentHeaders(
+        creator.token,
+        "create-disabled-blocked-create",
+      ),
+      payload: { attemptId: creatorAttempt.attempt.id },
+    });
+    expectFeatureDisabled(blockedCreate);
+
+    const malformedAuthenticatedCreate = await disabledApp.inject({
+      method: "POST",
+      url: "/v1/challenges",
+      headers: authorizationHeaders(creator.token),
+      payload: {},
+    });
+    expectFeatureDisabled(malformedAuthenticatedCreate);
+
+    const unauthenticatedCreate = await disabledApp.inject({
+      method: "POST",
+      url: "/v1/challenges",
+      payload: {},
+    });
+    expectApiError(unauthenticatedCreate, 401, "UNAUTHORIZED");
+
+    const creatorLandingResponse = await disabledApp.inject({
+      method: "GET",
+      url: `/v1/challenges/${created.challenge.token}`,
+      headers: authorizationHeaders(creator.token),
+    });
+    assert.equal(
+      creatorLandingResponse.statusCode,
+      200,
+      creatorLandingResponse.body,
+    );
+    const creatorLanding = ChallengeLandingResponseSchema.parse(
+      creatorLandingResponse.json(),
+    );
+    assert.equal(creatorLanding.status, "open");
+    assert.equal(creatorLanding.viewerRole, "creator");
+    assert.equal(/score/i.test(creatorLandingResponse.body), false);
+
+    const outsiderLandingResponse = await disabledApp.inject({
+      method: "GET",
+      url: `/v1/challenges/${created.challenge.token}`,
+      headers: authorizationHeaders(claimant.token),
+    });
+    assert.equal(
+      outsiderLandingResponse.statusCode,
+      200,
+      outsiderLandingResponse.body,
+    );
+    const outsiderLanding = ChallengeLandingResponseSchema.parse(
+      outsiderLandingResponse.json(),
+    );
+    assert.equal(outsiderLanding.status, "open");
+    assert.equal(outsiderLanding.viewerRole, "none");
+    assert.equal(/score/i.test(outsiderLandingResponse.body), false);
+
+    const resultResponse = await disabledApp.inject({
+      method: "GET",
+      url: `/v1/challenges/${created.challenge.token}/result`,
+      headers: authorizationHeaders(creator.token),
+    });
+    assert.equal(resultResponse.statusCode, 200, resultResponse.body);
+    const result = ChallengeResultResponseSchema.parse(resultResponse.json());
+    assert.equal(result.status, "open");
+    assert.equal(result.viewerRole, "creator");
+    assert.equal(result.me.score, 3);
+    assert.equal(result.opponent.completed, false);
+    assert.deepEqual(Object.keys(result.opponent).sort(), [
+      "completed",
+      "nickname",
+    ]);
+
+    assert.deepEqual(await getMutationRowCounts(), countsBefore);
+
+    const claimResponse = await disabledApp.inject({
+      method: "POST",
+      url: `/v1/challenges/${created.challenge.token}/claim`,
+      headers: idempotentHeaders(claimant.token, "create-disabled-claim"),
+      payload: {},
+    });
+    assert.equal(claimResponse.statusCode, 200, claimResponse.body);
+    const claim = ClaimChallengeResponseSchema.parse(claimResponse.json());
+    assert.equal(claim.challenge.status, "claimed");
+
+    const claimedLandingResponse = await disabledApp.inject({
+      method: "GET",
+      url: `/v1/challenges/${created.challenge.token}`,
+      headers: authorizationHeaders(claimant.token),
+    });
+    assert.equal(
+      claimedLandingResponse.statusCode,
+      200,
+      claimedLandingResponse.body,
+    );
+    const claimedLanding = ChallengeLandingResponseSchema.parse(
+      claimedLandingResponse.json(),
+    );
+    assert.equal(claimedLanding.status, "claimed");
+    assert.equal(claimedLanding.viewerRole, "opponent");
+
+    const claimedResultResponse = await disabledApp.inject({
+      method: "GET",
+      url: `/v1/challenges/${created.challenge.token}/result`,
+      headers: authorizationHeaders(claimant.token),
+    });
+    assert.equal(
+      claimedResultResponse.statusCode,
+      200,
+      claimedResultResponse.body,
+    );
+    const claimedResult = ChallengeResultResponseSchema.parse(
+      claimedResultResponse.json(),
+    );
+    assert.equal(claimedResult.status, "claimed");
+    assert.equal(claimedResult.viewerRole, "opponent");
+  } finally {
+    if (disabledApp !== undefined) {
+      await disabledApp.close();
+    } else {
+      await disabledDatabase.close();
+    }
+  }
+});
+
+test("claim kill switch blocks only claim and preserves create and reads", async () => {
+  harness.setNow(PRIMARY_DAY_NOON);
+  const creator = await bootstrapUser("claim-disabled-creator");
+  const creatorAttempt = await finishQuiz(creator, "claim-disabled-creator", 4);
+  const claimant = await bootstrapUser("claim-disabled-claimant");
+  const disabledConfig = {
+    ...harness.config,
+    challengeClaimEnabled: false,
+  };
+  assert.equal(disabledConfig.challengeCreateEnabled, undefined);
+
+  const disabledDatabase = createDatabase(disabledConfig);
+  let disabledApp: Awaited<ReturnType<typeof buildApp>> | undefined;
+  try {
+    disabledApp = await buildApp({
+      config: disabledConfig,
+      database: disabledDatabase,
+      clock: () => new Date(PRIMARY_DAY_NOON),
+    });
+
+    const createResponse = await disabledApp.inject({
+      method: "POST",
+      url: "/v1/challenges",
+      headers: idempotentHeaders(creator.token, "claim-disabled-create"),
+      payload: { attemptId: creatorAttempt.attempt.id },
+    });
+    assert.equal(createResponse.statusCode, 200, createResponse.body);
+    const created = CreateChallengeResponseSchema.parse(createResponse.json());
+
+    const landingResponse = await disabledApp.inject({
+      method: "GET",
+      url: `/v1/challenges/${created.challenge.token}`,
+      headers: authorizationHeaders(claimant.token),
+    });
+    assert.equal(landingResponse.statusCode, 200, landingResponse.body);
+    const landing = ChallengeLandingResponseSchema.parse(
+      landingResponse.json(),
+    );
+    assert.equal(landing.status, "open");
+    assert.equal(landing.viewerRole, "none");
+    assert.equal(/score/i.test(landingResponse.body), false);
+
+    const resultResponse = await disabledApp.inject({
+      method: "GET",
+      url: `/v1/challenges/${created.challenge.token}/result`,
+      headers: authorizationHeaders(creator.token),
+    });
+    assert.equal(resultResponse.statusCode, 200, resultResponse.body);
+    const result = ChallengeResultResponseSchema.parse(resultResponse.json());
+    assert.equal(result.status, "open");
+    assert.equal(result.viewerRole, "creator");
+    assert.equal(result.me.score, 4);
+    assert.equal(result.opponent.completed, false);
+
+    const countsBefore = await getMutationRowCounts();
+    const blockedClaim = await disabledApp.inject({
+      method: "POST",
+      url: `/v1/challenges/${created.challenge.token}/claim`,
+      headers: idempotentHeaders(claimant.token, "claim-disabled-claim"),
+      payload: {},
+    });
+    expectFeatureDisabled(blockedClaim);
+
+    const malformedAuthenticatedClaim = await disabledApp.inject({
+      method: "POST",
+      url: `/v1/challenges/${created.challenge.token}/claim`,
+      headers: authorizationHeaders(claimant.token),
+      payload: {},
+    });
+    expectFeatureDisabled(malformedAuthenticatedClaim);
+
+    const unauthenticatedClaim = await disabledApp.inject({
+      method: "POST",
+      url: `/v1/challenges/${created.challenge.token}/claim`,
+      payload: {},
+    });
+    expectApiError(unauthenticatedClaim, 401, "UNAUTHORIZED");
+    assert.deepEqual(await getMutationRowCounts(), countsBefore);
+
+    const unchangedLandingResponse = await disabledApp.inject({
+      method: "GET",
+      url: `/v1/challenges/${created.challenge.token}`,
+      headers: authorizationHeaders(creator.token),
+    });
+    assert.equal(
+      unchangedLandingResponse.statusCode,
+      200,
+      unchangedLandingResponse.body,
+    );
+    const unchangedLanding = ChallengeLandingResponseSchema.parse(
+      unchangedLandingResponse.json(),
+    );
+    assert.equal(unchangedLanding.status, "open");
+    assert.equal(unchangedLanding.viewerRole, "creator");
+
+    const unchangedResultResponse = await disabledApp.inject({
+      method: "GET",
+      url: `/v1/challenges/${created.challenge.token}/result`,
+      headers: authorizationHeaders(creator.token),
+    });
+    assert.equal(
+      unchangedResultResponse.statusCode,
+      200,
+      unchangedResultResponse.body,
+    );
+    const unchangedResult = ChallengeResultResponseSchema.parse(
+      unchangedResultResponse.json(),
+    );
+    assert.equal(unchangedResult.status, "open");
+    assert.equal(unchangedResult.viewerRole, "creator");
+  } finally {
+    if (disabledApp !== undefined) {
+      await disabledApp.close();
+    } else {
+      await disabledDatabase.close();
+    }
+  }
+});
 
 test("create authorization, idempotency, and token storage", async () => {
   harness.setNow(PRIMARY_DAY_NOON);

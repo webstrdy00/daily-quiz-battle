@@ -66,6 +66,12 @@ export const notificationOutboxStatus = pgEnum("notification_outbox_status", [
   "published",
   "failed",
 ]);
+export const reportStatus = pgEnum("report_status", [
+  "open",
+  "reviewing",
+  "resolved",
+  "dismissed",
+]);
 
 export const users = pgTable(
   "users",
@@ -558,6 +564,9 @@ export const reports = pgTable(
     challengeId: uuid("challenge_id"),
     reasonCode: varchar("reason_code", { length: 32 }).notNull(),
     detail: text("detail"),
+    status: reportStatus("status").notNull().default("open"),
+    triagedBy: varchar("triaged_by", { length: 100 }),
+    triagedAt: timestamp("triaged_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),
@@ -576,12 +585,17 @@ export const reports = pgTable(
         table.dedupeWindowStart,
       )
       .where(sql`${table.questionRevisionId} is not null`),
-    index("reports_question_revision_created_at_idx")
-      .on(table.questionRevisionId, table.createdAt.desc())
+    index("reports_question_revision_created_at_id_idx")
+      .on(table.questionRevisionId, table.createdAt.desc(), table.id.desc())
       .where(sql`${table.questionRevisionId} is not null`),
     index("reports_challenge_created_at_idx")
       .on(table.challengeId, table.createdAt.desc())
       .where(sql`${table.challengeId} is not null`),
+    index("reports_status_created_at_id_idx").on(
+      table.status,
+      table.createdAt.desc(),
+      table.id.desc(),
+    ),
     check(
       "reports_target_xor_ck",
       sql`num_nonnulls(${table.questionRevisionId}, ${table.challengeId}) = 1`,
@@ -593,6 +607,11 @@ export const reports = pgTable(
     check(
       "reports_detail_length_ck",
       sql`${table.detail} is null or char_length(${table.detail}) between 1 and 500`,
+    ),
+    check(
+      "reports_triage_fields_ck",
+      sql`(${table.status} = 'open' and ${table.triagedBy} is null and ${table.triagedAt} is null)
+        or (${table.status} <> 'open' and ${table.triagedBy} is not null and ${table.triagedAt} is not null)`,
     ),
   ],
 );

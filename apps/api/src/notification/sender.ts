@@ -1,3 +1,4 @@
+import { z } from "zod";
 import type { ChallengeTokenService } from "../challenge/token.js";
 import type { AppConfig } from "../config.js";
 import { AppError } from "../shared/errors.js";
@@ -6,6 +7,22 @@ import type {
   EncryptedNotificationTarget,
   NotificationTargetCrypto,
 } from "./target-crypto.js";
+
+const MAX_RESPONSE_BYTES = 65_536;
+
+const NotificationSuccessSchema = z.object({
+  resultType: z.literal("SUCCESS"),
+  success: z.object({}).passthrough(),
+});
+
+const NotificationFailureSchema = z.object({
+  resultType: z.string().refine((value) => value !== "SUCCESS"),
+  error: z
+    .object({
+      errorCode: z.string(),
+    })
+    .passthrough(),
+});
 
 export interface SendNotificationInput {
   userId: string;
@@ -59,7 +76,7 @@ function invalidChallengeToken(): AppError {
   });
 }
 
-function classifyRequestFailure(error: unknown): AppError {
+export function classifyNotificationRequestFailure(error: unknown): AppError {
   if (error instanceof Error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code?.startsWith("ERR_OSSL_")) {
@@ -80,6 +97,60 @@ function classifyRequestFailure(error: unknown): AppError {
   }
 
   return deliveryUnavailable();
+}
+
+export function interpretNotificationResponse(response: {
+  statusCode: number;
+  body: string;
+}): void {
+  if (
+    response.statusCode === 429 ||
+    (response.statusCode >= 500 && response.statusCode < 600)
+  ) {
+    throw deliveryUnavailable();
+  }
+
+  if (response.statusCode < 200 || response.statusCode >= 300) {
+    throw deliveryRejected();
+  }
+
+  if (Buffer.byteLength(response.body) > MAX_RESPONSE_BYTES) {
+    throw deliveryRejected();
+  }
+
+  let parsedJson: unknown;
+  try {
+    parsedJson = JSON.parse(response.body);
+  } catch {
+    throw deliveryRejected();
+  }
+
+  if (NotificationSuccessSchema.safeParse(parsedJson).success) {
+    return;
+  }
+
+  const failure = NotificationFailureSchema.safeParse(parsedJson);
+  if (!failure.success) {
+    throw deliveryRejected();
+  }
+
+  if (
+    response.statusCode === 200 &&
+    failure.data.resultType === "FAIL" &&
+    failure.data.error.errorCode === "4095"
+  ) {
+    throw deliveryUnavailable();
+  }
+
+  switch (failure.data.error.errorCode) {
+    case "5004":
+    case "4034":
+      throw invalidConfiguration();
+    case "4010":
+      throw invalidTarget();
+    default:
+      throw deliveryRejected();
+  }
 }
 
 class MtlsNotificationSender implements NotificationSender {
@@ -120,7 +191,7 @@ class MtlsNotificationSender implements NotificationSender {
     });
 
     try {
-      const { statusCode } = await mtlsRequest({
+      const response = await mtlsRequest({
         endpoint: this.endpoint,
         method: "POST",
         certificate: this.certificate,
@@ -135,18 +206,12 @@ class MtlsNotificationSender implements NotificationSender {
         body,
       });
 
-      if (statusCode >= 200 && statusCode < 300) {
-        return;
-      }
-      if (statusCode === 429 || (statusCode >= 500 && statusCode < 600)) {
-        throw deliveryUnavailable();
-      }
-      throw deliveryRejected();
+      interpretNotificationResponse(response);
     } catch (error) {
       if (error instanceof AppError) {
         throw error;
       }
-      throw classifyRequestFailure(error);
+      throw classifyNotificationRequestFailure(error);
     }
   }
 }

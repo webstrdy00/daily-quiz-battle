@@ -340,6 +340,9 @@ test("question reports trim detail, minimize stored data, and deduplicate by use
     "question_revision_id",
     "reason_code",
     "reporter_user_id",
+    "status",
+    "triaged_at",
+    "triaged_by",
   ];
   for (const row of rows) {
     assert.deepEqual(Object.keys(row.stored_report).sort(), storedReportKeys);

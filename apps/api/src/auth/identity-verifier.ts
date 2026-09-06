@@ -3,20 +3,79 @@ import type { AppConfig } from "../config.js";
 import { AppError } from "../shared/errors.js";
 import { mtlsRequest, readPem } from "../shared/mtls-request.js";
 
-const VerificationResponseSchema = z.discriminatedUnion("resultType", [
-  z.object({
-    resultType: z.literal("SUCCESS"),
-    success: z.boolean(),
-  }),
-  z.object({
-    resultType: z.literal("FAIL"),
-    error: z
-      .object({
-        code: z.union([z.string(), z.number()]),
-      })
-      .passthrough(),
-  }),
-]);
+const MAX_RESPONSE_BYTES = 65_536;
+
+const VerificationSuccessSchema = z.object({
+  resultType: z.literal("SUCCESS"),
+  success: z.boolean(),
+});
+
+const VerificationFailureSchema = z.object({
+  resultType: z.string().refine((value) => value !== "SUCCESS"),
+  error: z
+    .object({
+      errorCode: z.string(),
+    })
+    .passthrough(),
+});
+
+function dependencyUnavailable(): AppError {
+  return new AppError({
+    statusCode: 503,
+    code: "IDENTITY_DEPENDENCY_UNAVAILABLE",
+    message: "사용자 확인 서비스가 요청을 처리하지 못했습니다.",
+    retryable: true,
+  });
+}
+
+function invalidResponse(): AppError {
+  return new AppError({
+    statusCode: 503,
+    code: "IDENTITY_INVALID_RESPONSE",
+    message: "사용자 확인 응답을 처리할 수 없습니다.",
+    retryable: true,
+  });
+}
+
+export function interpretIdentityVerificationResponse(response: {
+  statusCode: number;
+  body: string;
+}): boolean {
+  if (response.statusCode < 200 || response.statusCode >= 300) {
+    throw dependencyUnavailable();
+  }
+
+  if (Buffer.byteLength(response.body) > MAX_RESPONSE_BYTES) {
+    throw invalidResponse();
+  }
+
+  let parsedJson: unknown;
+  try {
+    parsedJson = JSON.parse(response.body);
+  } catch {
+    throw invalidResponse();
+  }
+
+  const success = VerificationSuccessSchema.safeParse(parsedJson);
+  if (success.success) {
+    return success.data.success;
+  }
+
+  const failure = VerificationFailureSchema.safeParse(parsedJson);
+  if (!failure.success) {
+    throw invalidResponse();
+  }
+
+  if (
+    response.statusCode === 200 &&
+    failure.data.resultType === "FAIL" &&
+    failure.data.error.errorCode === "4010"
+  ) {
+    return false;
+  }
+
+  throw dependencyUnavailable();
+}
 
 export interface IdentityVerifier {
   verify(anonymousKey: string): Promise<boolean>;
@@ -53,10 +112,10 @@ class MtlsIdentityVerifier implements IdentityVerifier {
   }
 
   async verify(anonymousKey: string): Promise<boolean> {
-    let responseBody: string;
+    let response: { statusCode: number; body: string };
 
     try {
-      const response = await mtlsRequest({
+      response = await mtlsRequest({
         endpoint: this.endpoint,
         method: "POST",
         certificate: this.certificate,
@@ -67,62 +126,16 @@ class MtlsIdentityVerifier implements IdentityVerifier {
           "x-anon-key": anonymousKey,
         },
       });
-
-      if (response.statusCode < 200 || response.statusCode >= 300) {
-        throw new Error(
-          `Identity verification returned ${response.statusCode}`,
-        );
-      }
-      responseBody = response.body;
-    } catch (error) {
+    } catch {
       throw new AppError({
         statusCode: 503,
         code: "IDENTITY_DEPENDENCY_UNAVAILABLE",
         message: "사용자 확인 서비스에 일시적으로 연결할 수 없습니다.",
         retryable: true,
-        details: {
-          reason: error instanceof Error ? error.name : "UnknownError",
-        },
       });
     }
 
-    let parsedJson: unknown;
-    try {
-      parsedJson = JSON.parse(responseBody);
-    } catch {
-      throw new AppError({
-        statusCode: 503,
-        code: "IDENTITY_INVALID_RESPONSE",
-        message: "사용자 확인 응답을 처리할 수 없습니다.",
-        retryable: true,
-      });
-    }
-
-    const parsed = VerificationResponseSchema.safeParse(parsedJson);
-    if (!parsed.success) {
-      throw new AppError({
-        statusCode: 503,
-        code: "IDENTITY_INVALID_RESPONSE",
-        message: "사용자 확인 응답을 처리할 수 없습니다.",
-        retryable: true,
-      });
-    }
-
-    if (parsed.data.resultType === "SUCCESS") {
-      return parsed.data.success;
-    }
-
-    const errorCode = String(parsed.data.error.code);
-    if (errorCode === "4010") {
-      return false;
-    }
-
-    throw new AppError({
-      statusCode: 503,
-      code: "IDENTITY_DEPENDENCY_UNAVAILABLE",
-      message: "사용자 확인 서비스가 요청을 처리하지 못했습니다.",
-      retryable: true,
-    });
+    return interpretIdentityVerificationResponse(response);
   }
 }
 

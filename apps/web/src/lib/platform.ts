@@ -8,6 +8,13 @@ import type { ReportReason } from "@daily-quiz-battle/contracts";
 
 const isDevelopment =
   import.meta.env.DEV || import.meta.env.VITE_APP_ENV === "development";
+const analyticsBuildEnabled =
+  import.meta.env.VITE_ANALYTICS_ENABLED !== "false";
+let analyticsOperationallyEnabled = false;
+
+export function setAnalyticsPublishingEnabled(enabled: boolean): void {
+  analyticsOperationallyEnabled = enabled;
+}
 
 export async function getAnonymousKey(): Promise<string> {
   try {
@@ -208,6 +215,10 @@ export async function logAnalyticsEvent(
   name: AnalyticsEventName,
   params: SafeAnalyticsParams = {},
 ): Promise<void> {
+  if (!analyticsBuildEnabled || !analyticsOperationallyEnabled) {
+    return;
+  }
+
   try {
     await Analytics.log({
       log_name: name,

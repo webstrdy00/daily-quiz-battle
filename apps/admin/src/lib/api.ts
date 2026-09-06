@@ -9,9 +9,13 @@ import {
   AdminListDailySetsResponseSchema,
   AdminListQuestionRevisionsQuerySchema,
   AdminListQuestionRevisionsResponseSchema,
+  AdminListReportsQuerySchema,
+  AdminListReportsResponseSchema,
   AdminPublishDailySetResponseSchema,
   AdminUpdateQuestionRevisionStatusRequestSchema,
   AdminUpdateQuestionRevisionStatusResponseSchema,
+  AdminUpdateReportStatusRequestSchema,
+  AdminUpdateReportStatusResponseSchema,
   AdminVoidDailySetRequestSchema,
   AdminVoidDailySetResponseSchema,
   ApiErrorSchema,
@@ -25,12 +29,17 @@ import {
   type AdminListDailySetsQuery,
   type AdminListDailySetsResponse,
   type AdminListQuestionRevisionsResponse,
+  type AdminListReportsResponse,
   type AdminPublishDailySetResponse,
   type AdminUpdateQuestionRevisionStatusRequest,
   type AdminUpdateQuestionRevisionStatusResponse,
+  type AdminUpdateReportStatusRequest,
+  type AdminUpdateReportStatusResponse,
   type AdminVoidDailySetRequest,
   type AdminVoidDailySetResponse,
   type ContentStatus,
+  type ReportReason,
+  type ReportStatus,
 } from "@daily-quiz-battle/contracts";
 
 interface Parser<T> {
@@ -46,6 +55,13 @@ export interface QuestionRevisionQuery {
 export interface AuditLogQuery {
   cursor?: AdminContentCursor;
   limit?: number;
+}
+
+export interface ReportQuery {
+  cursor?: AdminContentCursor;
+  limit?: number;
+  status?: ReportStatus;
+  reasonCode?: ReportReason;
 }
 
 export class ApiClientError extends Error {
@@ -285,6 +301,41 @@ export class AdminApiClient {
       "/v1/admin/content/audit-logs",
       parsed,
       AdminListAuditLogsResponseSchema,
+    );
+  }
+
+  async listReports(
+    query: ReportQuery = {},
+  ): Promise<AdminListReportsResponse> {
+    let parsed: ReturnType<typeof AdminListReportsQuerySchema.parse>;
+    try {
+      parsed = AdminListReportsQuerySchema.parse(query);
+    } catch {
+      throw invalidRequest();
+    }
+    return this.get(
+      "/v1/admin/reports",
+      parsed,
+      AdminListReportsResponseSchema,
+    );
+  }
+
+  async updateReportStatus(
+    reportId: string,
+    input: AdminUpdateReportStatusRequest,
+  ): Promise<AdminUpdateReportStatusResponse> {
+    let id: string;
+    let parsed: AdminUpdateReportStatusRequest;
+    try {
+      id = UuidSchema.parse(reportId);
+      parsed = AdminUpdateReportStatusRequestSchema.parse(input);
+    } catch {
+      throw invalidRequest();
+    }
+    return this.request(
+      `/v1/admin/reports/${encodeURIComponent(id)}/status`,
+      AdminUpdateReportStatusResponseSchema,
+      { method: "PATCH", body: JSON.stringify(parsed) },
     );
   }
 

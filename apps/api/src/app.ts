@@ -3,6 +3,7 @@ import helmet from "@fastify/helmet";
 import Fastify, { LogController, type FastifyInstance } from "fastify";
 import { registerAccountRoutes } from "./account/routes.js";
 import { registerAdminContentRoutes } from "./admin/content-routes.js";
+import { registerAdminReportRoutes } from "./admin/report-routes.js";
 import { createAdminAccessTokenService } from "./admin/token.js";
 import { createIdentityVerifier } from "./auth/identity-verifier.js";
 import { registerAuthRoutes } from "./auth/routes.js";
@@ -15,6 +16,7 @@ import type { Database } from "./db/client.js";
 import { registerNotificationRoutes } from "./notification/routes.js";
 import { createNotificationTargetCrypto } from "./notification/target-crypto.js";
 import { registerObservabilityMetrics } from "./observability/metrics.js";
+import { registerOperationalCapabilitiesRoutes } from "./operations/capabilities-routes.js";
 import { registerReportRoutes } from "./report/routes.js";
 import { AppError, sendError } from "./shared/errors.js";
 import { registerRateLimit } from "./shared/rate-limit.js";
@@ -85,11 +87,12 @@ export async function buildApp({
     requireRedis: config.appEnvironment !== "development",
   });
 
-  registerObservabilityMetrics(app, {
+  const observability = registerObservabilityMetrics(app, {
     appEnvironment: config.appEnvironment,
     database,
     metricsAccessToken:
       config.metricsAccessToken ?? DEVELOPMENT_METRICS_ACCESS_TOKEN,
+    identityMtlsCert: config.identityMtlsCert,
   });
 
   app.addHook("onSend", async (request, reply, payload) => {
@@ -144,6 +147,11 @@ export async function buildApp({
     identityVerifier,
     tokenService,
   });
+  registerOperationalCapabilitiesRoutes(app, {
+    database,
+    tokenService,
+    analyticsPublishEnabled: config.analyticsPublishEnabled ?? true,
+  });
   registerAccountRoutes(app, {
     database,
     tokenService,
@@ -155,15 +163,24 @@ export async function buildApp({
     tokenService: adminTokenService,
     clock,
   });
+  registerAdminReportRoutes(app, {
+    database,
+    tokenService: adminTokenService,
+    clock,
+  });
   registerDailyRoutes(app, {
     database,
     tokenService,
+    dailyStartEnabled: config.dailyStartEnabled ?? true,
+    dailyContinuationEnabled: config.dailyContinuationEnabled ?? true,
+    notificationDeliveryEnabled: config.notificationDeliveryEnabled ?? false,
     rateLimitEnabled: config.rateLimitEnabled,
     clock,
   });
   registerReportRoutes(app, {
     database,
     tokenService,
+    observability,
     rateLimitEnabled: config.rateLimitEnabled,
     clock,
   });
@@ -172,6 +189,7 @@ export async function buildApp({
     tokenService,
     targetCrypto: notificationTargetCrypto,
     anonymousKeyPepper: config.anonymousKeyPepper,
+    notificationDeliveryEnabled: config.notificationDeliveryEnabled ?? false,
     rateLimitEnabled: config.rateLimitEnabled,
     clock,
   });
@@ -182,6 +200,9 @@ export async function buildApp({
       secret: config.challengeTokenSecret,
       previousSecret: config.challengeTokenSecretPrevious,
     }),
+    challengeCreateEnabled: config.challengeCreateEnabled ?? true,
+    challengeClaimEnabled: config.challengeClaimEnabled ?? true,
+    notificationDeliveryEnabled: config.notificationDeliveryEnabled ?? false,
     rateLimitEnabled: config.rateLimitEnabled,
     clock,
   });

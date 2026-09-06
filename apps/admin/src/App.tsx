@@ -5,11 +5,20 @@ import type {
   AdminCreateQuestionRevisionRequest,
   AdminDailySetListEntry,
   AdminQuestionRevisionListItem,
+  AdminReportListItem,
   ChoiceOrder,
   ContentStatus,
   DailySetStatus,
+  ReportReason,
+  ReportStatus,
+  ReportTriageStatus,
 } from "@daily-quiz-battle/contracts";
-import { AdminApiClient, ApiClientError, type AuditLogQuery } from "./lib/api";
+import {
+  AdminApiClient,
+  ApiClientError,
+  type AuditLogQuery,
+  type ReportQuery,
+} from "./lib/api";
 
 interface UiIssue {
   message: string;
@@ -33,6 +42,10 @@ interface CorrectionSource {
   revisionId: string;
   revisionNumber: number;
   prompt: string;
+}
+
+interface PendingReportDismiss {
+  reportId: string;
 }
 
 const CONTENT_STATUSES: readonly ContentStatus[] = [
@@ -63,6 +76,46 @@ const NEXT_STATUSES: Record<ContentStatus, readonly ContentStatus[]> = {
   approved: ["draft", "published"],
   published: ["retired"],
   retired: [],
+};
+
+const REPORT_STATUSES: readonly ReportStatus[] = [
+  "open",
+  "reviewing",
+  "resolved",
+  "dismissed",
+];
+
+const REPORT_REASONS: readonly ReportReason[] = [
+  "incorrect_answer",
+  "ambiguous",
+  "outdated",
+  "inappropriate",
+  "other",
+];
+
+const REPORT_STATUS_LABEL: Record<ReportStatus, string> = {
+  open: "접수",
+  reviewing: "검토 중",
+  resolved: "해결",
+  dismissed: "기각",
+};
+
+const REPORT_REASON_LABEL: Record<ReportReason, string> = {
+  incorrect_answer: "정답 오류",
+  ambiguous: "모호함",
+  outdated: "오래된 정보",
+  inappropriate: "부적절한 내용",
+  other: "기타",
+};
+
+const REPORT_NEXT_STATUSES: Record<
+  ReportStatus,
+  readonly ReportTriageStatus[]
+> = {
+  open: ["reviewing", "resolved", "dismissed"],
+  reviewing: ["resolved", "dismissed"],
+  resolved: [],
+  dismissed: [],
 };
 
 const DEFAULT_CHOICE_ORDER: ChoiceOrder = [0, 1, 2, 3];
@@ -176,6 +229,9 @@ export default function App() {
   const mountedRef = useRef(true);
   const publishConfirmRef = useRef<HTMLButtonElement>(null);
   const voidReasonRef = useRef<HTMLTextAreaElement>(null);
+  const reportDismissCancelRef = useRef<HTMLButtonElement>(null);
+  const reportDismissTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const reportSuccessRef = useRef<HTMLParagraphElement>(null);
   const revisionCreatePanelRef = useRef<HTMLDetailsElement>(null);
   const questionIdInputRef = useRef<HTMLInputElement>(null);
 
@@ -240,6 +296,20 @@ export default function App() {
   const [auditLoading, setAuditLoading] = useState(false);
   const [auditIssue, setAuditIssue] = useState<UiIssue | null>(null);
 
+  const [reports, setReports] = useState<AdminReportListItem[]>([]);
+  const [reportStatus, setReportStatus] = useState<ReportStatus | "">("");
+  const [reportReason, setReportReason] = useState<ReportReason | "">("");
+  const [reportCursor, setReportCursor] = useState<string | null>(null);
+  const [reportLoading, setReportLoading] = useState(false);
+  const [reportIssue, setReportIssue] = useState<UiIssue | null>(null);
+  const [reportActionBusy, setReportActionBusy] = useState<string | null>(null);
+  const [reportActionIssue, setReportActionIssue] = useState<UiIssue | null>(
+    null,
+  );
+  const [reportSuccess, setReportSuccess] = useState("");
+  const [pendingReportDismiss, setPendingReportDismiss] =
+    useState<PendingReportDismiss | null>(null);
+
   useEffect(() => {
     mountedRef.current = true;
     return () => {
@@ -262,6 +332,20 @@ export default function App() {
     }
     voidReasonRef.current?.focus();
   }, [pendingVoid]);
+
+  useEffect(() => {
+    if (pendingReportDismiss === null) {
+      return;
+    }
+    reportDismissCancelRef.current?.focus();
+  }, [pendingReportDismiss]);
+
+  useEffect(() => {
+    if (!reportSuccess) {
+      return;
+    }
+    reportSuccessRef.current?.focus();
+  }, [reportSuccess]);
 
   useEffect(() => {
     if (!revisionCreateOpen || correctionSource === null) {
@@ -299,6 +383,15 @@ export default function App() {
     setVoidActionIssue(null);
     setAuditLogs([]);
     setAuditCursor(null);
+    setReports([]);
+    setReportCursor(null);
+    setReportLoading(false);
+    setReportIssue(null);
+    setReportActionBusy(null);
+    setReportActionIssue(null);
+    setReportSuccess("");
+    setPendingReportDismiss(null);
+    reportDismissTriggerRef.current = null;
   }
 
   function handleFailure(
@@ -352,6 +445,7 @@ export default function App() {
       void loadPublishedRevisions(false, client);
       void loadDailySets(client);
       void loadAuditLogs(false, client);
+      void loadReports(false, client);
     } catch (error) {
       if (clientRef.current === client) {
         client.dispose();
@@ -444,6 +538,13 @@ export default function App() {
     setRevisionCreateOpen(true);
     setRevisionActionIssue(null);
     setRevisionSuccess("");
+  }
+
+  function startReportCorrection(report: AdminReportListItem): void {
+    if (report.questionContext === null) {
+      return;
+    }
+    startCorrection(report.questionContext);
   }
 
   async function createRevision(
@@ -715,6 +816,102 @@ export default function App() {
     }
   }
 
+  async function loadReports(
+    append: boolean,
+    client = clientRef.current,
+  ): Promise<void> {
+    if (client === null) return;
+    setReportLoading(true);
+    setReportIssue(null);
+    const query: ReportQuery = {
+      ...(reportStatus ? { status: reportStatus } : {}),
+      ...(reportReason ? { reasonCode: reportReason } : {}),
+      ...(append && reportCursor ? { cursor: reportCursor } : {}),
+      limit: 20,
+    };
+    try {
+      const response = await client.listReports(query);
+      if (clientRef.current !== client) return;
+      setReports((current) =>
+        append
+          ? [
+              ...current,
+              ...response.reports.filter(
+                (report) =>
+                  !current.some(
+                    (existing) => existing.reportId === report.reportId,
+                  ),
+              ),
+            ]
+          : response.reports,
+      );
+      setReportCursor(response.nextCursor);
+    } catch (error) {
+      handleFailure(error, client, setReportIssue);
+    } finally {
+      if (clientRef.current === client) setReportLoading(false);
+    }
+  }
+
+  function closeReportDismissConfirmation(restoreFocus: boolean): void {
+    const trigger = reportDismissTriggerRef.current;
+    setPendingReportDismiss(null);
+    setReportActionIssue(null);
+    reportDismissTriggerRef.current = null;
+    if (restoreFocus && trigger) {
+      window.requestAnimationFrame(() => trigger.focus());
+    }
+  }
+
+  async function transitionReport(
+    report: AdminReportListItem,
+    status: ReportTriageStatus,
+  ): Promise<void> {
+    if (!REPORT_NEXT_STATUSES[report.status].includes(status)) {
+      return;
+    }
+    const client = clientRef.current;
+    if (client === null) return;
+    setReportActionBusy(report.reportId);
+    setReportActionIssue(null);
+    setReportSuccess("");
+    try {
+      const response = await client.updateReportStatus(report.reportId, {
+        status,
+      });
+      if (clientRef.current !== client) return;
+      setReports((current) =>
+        current.flatMap((item) => {
+          if (item.reportId !== response.reportId) {
+            return [item];
+          }
+          if (reportStatus && reportStatus !== response.status) {
+            return [];
+          }
+          return [
+            {
+              ...item,
+              status: response.status,
+              triagedBy: response.triagedBy,
+              triagedAt: response.triagedAt,
+            },
+          ];
+        }),
+      );
+      setReportSuccess(
+        `신고 상태를 ${REPORT_STATUS_LABEL[response.status]}(으)로 변경했습니다.`,
+      );
+      if (status === "dismissed") {
+        closeReportDismissConfirmation(false);
+      }
+      void loadReports(false, client);
+    } catch (error) {
+      handleFailure(error, client, setReportActionIssue);
+    } finally {
+      if (clientRef.current === client) setReportActionBusy(null);
+    }
+  }
+
   if (!connected) {
     return (
       <main className="login-shell">
@@ -727,8 +924,9 @@ export default function App() {
           </div>
           <p className="muted">
             content:write 권한과 결과 무효 처리 시 content:void 권한이 있는 15분
-            admin JWT를 사용합니다. 토큰은 이 화면의 메모리에만 유지되며
-            저장소나 쿠키에 기록하지 않습니다.
+            admin JWT를 사용합니다. 신고 처리에는 reports:read와 reports:triage
+            권한이 필요합니다. 토큰은 이 화면의 메모리에만 유지되며 저장소나
+            쿠키에 기록하지 않습니다.
           </p>
           {loginIssue ? <ErrorNotice issue={loginIssue} /> : null}
           <form
@@ -790,6 +988,7 @@ export default function App() {
       <nav className="section-nav" aria-label="CMS 영역">
         <a href="#question-revisions">문제 리비전</a>
         <a href="#daily-sets">데일리 세트</a>
+        <a href="#reports">신고 처리</a>
         <a href="#audit-logs">감사 로그</a>
       </nav>
 
@@ -1552,6 +1751,361 @@ export default function App() {
             <p className="notice success-notice" role="status">
               {dailySuccess}
             </p>
+          ) : null}
+        </section>
+
+        <section id="reports" className="panel" aria-labelledby="reports-title">
+          <div className="section-heading">
+            <div>
+              <p className="eyebrow">Safety queue</p>
+              <h2 id="reports-title">신고 처리</h2>
+            </div>
+            <button
+              type="button"
+              className="secondary-button"
+              disabled={
+                reportLoading ||
+                reportActionBusy !== null ||
+                pendingReportDismiss !== null
+              }
+              onClick={() => {
+                closeReportDismissConfirmation(false);
+                setReportActionIssue(null);
+                setReportSuccess("");
+                void loadReports(false);
+              }}
+            >
+              새로고침
+            </button>
+          </div>
+
+          <aside className="report-privacy-warning" role="note">
+            <strong>개인정보 주의</strong>
+            <span>
+              신고 상세 내용에는 신고자가 자발적으로 입력한 개인정보가 포함될 수
+              있습니다. 콘솔, 저장소, 분석 도구 또는 외부 문서에 복사하지
+              마세요.
+            </span>
+          </aside>
+
+          <form
+            className="filter-bar report-filter"
+            onSubmit={(event) => {
+              event.preventDefault();
+              closeReportDismissConfirmation(false);
+              setReportActionIssue(null);
+              setReportSuccess("");
+              void loadReports(false);
+            }}
+          >
+            <label>
+              상태
+              <select
+                value={reportStatus}
+                disabled={
+                  reportLoading ||
+                  reportActionBusy !== null ||
+                  pendingReportDismiss !== null
+                }
+                onChange={(event) =>
+                  setReportStatus(
+                    event.currentTarget.value as ReportStatus | "",
+                  )
+                }
+              >
+                <option value="">전체</option>
+                {REPORT_STATUSES.map((status) => (
+                  <option key={status} value={status}>
+                    {REPORT_STATUS_LABEL[status]}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              사유
+              <select
+                value={reportReason}
+                disabled={
+                  reportLoading ||
+                  reportActionBusy !== null ||
+                  pendingReportDismiss !== null
+                }
+                onChange={(event) =>
+                  setReportReason(
+                    event.currentTarget.value as ReportReason | "",
+                  )
+                }
+              >
+                <option value="">전체</option>
+                {REPORT_REASONS.map((reason) => (
+                  <option key={reason} value={reason}>
+                    {REPORT_REASON_LABEL[reason]}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <button
+              className="secondary-button"
+              type="submit"
+              disabled={
+                reportLoading ||
+                reportActionBusy !== null ||
+                pendingReportDismiss !== null
+              }
+            >
+              신고 조회
+            </button>
+          </form>
+
+          {reportIssue ? (
+            <ErrorNotice
+              issue={reportIssue}
+              onRetry={() => void loadReports(false)}
+            />
+          ) : null}
+          {reportActionIssue && !pendingReportDismiss ? (
+            <ErrorNotice issue={reportActionIssue} />
+          ) : null}
+          {reportSuccess ? (
+            <p
+              className="notice success-notice"
+              role="status"
+              tabIndex={-1}
+              ref={reportSuccessRef}
+            >
+              {reportSuccess}
+            </p>
+          ) : null}
+          {reportLoading && reports.length === 0 ? (
+            <Loading label="신고 queue 조회 중…" />
+          ) : null}
+          {!reportLoading && !reportIssue && reports.length === 0 ? (
+            <p className="empty-state">조건에 맞는 신고가 없습니다.</p>
+          ) : null}
+
+          <div className="report-list" aria-busy={reportLoading}>
+            {reports.map((report) => (
+              <article className="report-card" key={report.reportId}>
+                <div className="card-title-row">
+                  <div>
+                    <p className="eyebrow">신고 사유</p>
+                    <h3>{REPORT_REASON_LABEL[report.reasonCode]}</h3>
+                  </div>
+                  <span className={`status status-report-${report.status}`}>
+                    {REPORT_STATUS_LABEL[report.status]}
+                  </span>
+                </div>
+                <dl className="metadata-grid">
+                  <div>
+                    <dt>접수 일시</dt>
+                    <dd>{formatDateTime(report.createdAt)}</dd>
+                  </div>
+                  <div>
+                    <dt>
+                      {report.questionRevisionId
+                        ? "Question Revision ID"
+                        : "Challenge ID"}
+                    </dt>
+                    <dd>
+                      <code>
+                        {report.questionRevisionId ?? report.challengeId}
+                      </code>
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>처리 작업자</dt>
+                    <dd>{report.triagedBy ?? "—"}</dd>
+                  </div>
+                  <div>
+                    <dt>처리 일시</dt>
+                    <dd>{formatDateTime(report.triagedAt)}</dd>
+                  </div>
+                </dl>
+                {report.questionContext ? (
+                  <section
+                    className="report-detail"
+                    aria-label="신고 문항 맥락"
+                  >
+                    <div className="card-title-row">
+                      <div>
+                        <strong>신고 문항</strong>
+                        <h4>{report.questionContext.prompt}</h4>
+                      </div>
+                      <span
+                        className={`status status-${report.questionContext.status}`}
+                      >
+                        {STATUS_LABEL[report.questionContext.status]}
+                      </span>
+                    </div>
+                    <dl className="metadata-grid">
+                      <div>
+                        <dt>Question ID</dt>
+                        <dd>
+                          <code>{report.questionContext.questionId}</code>
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>Revision ID</dt>
+                        <dd>
+                          <code>{report.questionContext.revisionId}</code>
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>리비전 번호</dt>
+                        <dd>r{report.questionContext.revisionNumber}</dd>
+                      </div>
+                      <div>
+                        <dt>카테고리</dt>
+                        <dd>{report.questionContext.category}</dd>
+                      </div>
+                      <div>
+                        <dt>콘텐츠 상태</dt>
+                        <dd>{STATUS_LABEL[report.questionContext.status]}</dd>
+                      </div>
+                    </dl>
+                    <p className="muted">
+                      수정 초안은 같은 Question ID의 draft로 생성한 뒤 검토 중,
+                      승인됨, 게시됨 lifecycle을 거칩니다. 기존 게시 리비전의
+                      폐기는 문제 리비전 영역에서만 처리합니다.
+                    </p>
+                    <button
+                      type="button"
+                      className="secondary-button correction-button"
+                      disabled={
+                        revisionActionBusy !== null ||
+                        pendingReportDismiss !== null
+                      }
+                      onClick={() => startReportCorrection(report)}
+                      aria-label={`리비전 ${report.questionContext.revisionNumber}의 수정 초안 만들기`}
+                    >
+                      수정 초안 만들기
+                    </button>
+                  </section>
+                ) : (
+                  <p className="muted">
+                    챌린지 대상 신고에는 연결된 문항 맥락이 없습니다.
+                  </p>
+                )}
+                <div className="report-detail">
+                  <strong>상세 내용</strong>
+                  <p>{report.detail ?? "입력된 상세 내용이 없습니다."}</p>
+                </div>
+                {REPORT_NEXT_STATUSES[report.status].length > 0 ? (
+                  <div className="button-row" aria-label="신고 상태 변경">
+                    {REPORT_NEXT_STATUSES[report.status].map((status) =>
+                      status === "dismissed" ? (
+                        <button
+                          key={status}
+                          type="button"
+                          className="danger-button"
+                          disabled={
+                            reportLoading ||
+                            reportActionBusy !== null ||
+                            pendingReportDismiss !== null
+                          }
+                          onClick={(event) => {
+                            reportDismissTriggerRef.current =
+                              event.currentTarget;
+                            setReportActionIssue(null);
+                            setReportSuccess("");
+                            setPendingReportDismiss({
+                              reportId: report.reportId,
+                            });
+                          }}
+                        >
+                          기각
+                        </button>
+                      ) : (
+                        <button
+                          key={status}
+                          type="button"
+                          className="secondary-button"
+                          disabled={
+                            reportLoading ||
+                            reportActionBusy !== null ||
+                            pendingReportDismiss !== null
+                          }
+                          onClick={() => void transitionReport(report, status)}
+                        >
+                          {reportActionBusy === report.reportId
+                            ? "변경 중…"
+                            : `${REPORT_STATUS_LABEL[status]}(으)로 변경`}
+                        </button>
+                      ),
+                    )}
+                  </div>
+                ) : null}
+              </article>
+            ))}
+          </div>
+
+          {pendingReportDismiss ? (
+            <div
+              className="report-dismiss-confirm"
+              role="alertdialog"
+              aria-labelledby="report-dismiss-title"
+              aria-describedby="report-dismiss-description"
+              onKeyDown={(event) => {
+                if (event.key === "Escape" && reportActionBusy === null) {
+                  event.preventDefault();
+                  closeReportDismissConfirmation(true);
+                }
+              }}
+            >
+              <h3 id="report-dismiss-title">신고를 기각하시겠습니까?</h3>
+              <p id="report-dismiss-description">
+                기각 상태로 변경하면 다시 검토 중이나 해결 상태로 되돌릴 수
+                없습니다. 신고 내용과 대상을 다시 확인하세요.
+              </p>
+              {reportActionIssue ? (
+                <ErrorNotice issue={reportActionIssue} />
+              ) : null}
+              <div className="button-row">
+                <button
+                  ref={reportDismissCancelRef}
+                  type="button"
+                  className="secondary-button"
+                  disabled={reportActionBusy !== null}
+                  onClick={() => closeReportDismissConfirmation(true)}
+                >
+                  취소
+                </button>
+                <button
+                  type="button"
+                  className="danger-button"
+                  disabled={reportActionBusy !== null}
+                  onClick={() => {
+                    const report = reports.find(
+                      (item) => item.reportId === pendingReportDismiss.reportId,
+                    );
+                    if (report) {
+                      void transitionReport(report, "dismissed");
+                    } else {
+                      closeReportDismissConfirmation(false);
+                    }
+                  }}
+                >
+                  {reportActionBusy === pendingReportDismiss.reportId
+                    ? "기각 처리 중…"
+                    : "확인하고 기각"}
+                </button>
+              </div>
+            </div>
+          ) : null}
+
+          {reportCursor ? (
+            <button
+              type="button"
+              className="secondary-button load-more"
+              disabled={
+                reportLoading ||
+                reportActionBusy !== null ||
+                pendingReportDismiss !== null
+              }
+              onClick={() => void loadReports(true)}
+            >
+              {reportLoading ? "불러오는 중…" : "신고 더 불러오기"}
+            </button>
           ) : null}
         </section>
 

@@ -3,6 +3,7 @@ import type { FastifyInstance } from "fastify";
 import { authenticateRequest } from "../auth/authenticate.js";
 import type { AccessTokenService } from "../auth/token.js";
 import type { Database } from "../db/client.js";
+import type { ObservabilityRecorder } from "../observability/metrics.js";
 import { parseRequest } from "../shared/errors.js";
 import { principalKey, rateLimited } from "../shared/rate-limit.js";
 import { createQuestionReport } from "./service.js";
@@ -10,6 +11,7 @@ import { createQuestionReport } from "./service.js";
 export interface ReportRouteDependencies {
   database: Database;
   tokenService: AccessTokenService;
+  observability: ObservabilityRecorder;
   rateLimitEnabled: boolean;
   clock?: () => Date;
 }
@@ -21,6 +23,7 @@ export function registerReportRoutes(
   const {
     database,
     tokenService,
+    observability,
     rateLimitEnabled,
     clock = () => new Date(),
   } = dependencies;
@@ -38,7 +41,17 @@ export function registerReportRoutes(
         CreateQuestionReportRequestSchema,
         request.body,
       );
-      return createQuestionReport(database, principal.userId, body, clock());
+      const response = await createQuestionReport(
+        database,
+        principal.userId,
+        body,
+        clock(),
+      );
+      observability.recordQuestionReport(
+        body.reasonCode,
+        response.deduplicated ? "deduplicated" : "new",
+      );
+      return response;
     },
   );
 }

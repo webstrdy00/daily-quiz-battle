@@ -105,6 +105,7 @@ function createTestConfig(databaseUrl: string): AppConfig {
     notificationTargetEncryptionKey: Buffer.alloc(32, 7),
     notificationTargetEncryptionKeyVersion: 1,
     resultNotificationTemplateSetCode: "integration-result-template",
+    notificationDeliveryEnabled: true,
     notificationSendUrl:
       "https://example.invalid/apps-in-toss/messenger/send-message",
     // Concurrency tests fire bursts far above the per-user limits.

@@ -2,7 +2,7 @@
 
 Apps in Toss WebView에서 매일 같은 5문제를 풀고 친구와 결과를 비교하는 퀴즈 앱입니다. 현재 working tree에는 **Phase 1~4의 로컬 기능 수직 슬라이스**(오늘 퀴즈, Challenge, 신고·콘텐츠 운영 API, 계정 삭제·알림 outbox·cleanup)가 구현되어 있습니다.
 
-> 아래 현황과 검증은 2026-09-05 KST의 미커밋 working tree 증거입니다. commit 완료나 공개 출시 준비 완료를 뜻하지 않습니다. 실제 Apps in Toss mTLS identity/알림 발송, 콘솔 appName·알림 템플릿, 클라우드 인프라, 실제 기기 QR·접근성 QA, 콘텐츠·개인정보·운영 하드 게이트가 남아 있습니다.
+> 기준 commit은 `72dd2da`이며, 아래 신규 신고 triage·kill switch·외부 API 계약 보강은 2026-09-05 KST의 미커밋 working tree 증거입니다. 공개 출시 준비 완료를 뜻하지 않습니다. 실제 Apps in Toss mTLS identity/알림 발송, 콘솔 appName·알림 템플릿, 클라우드 인프라, 실제 기기 QR·접근성 QA, 콘텐츠·개인정보·운영 하드 게이트가 남아 있습니다.
 
 ## 현재 구현 범위
 
@@ -18,13 +18,16 @@ Apps in Toss WebView에서 매일 같은 5문제를 풀고 친구와 결과를 �
 - Challenge 생성·safe landing·원자 claim·참여자 전용 결과와 win/loss/draw
 - Web deep link token 즉시 URL 제거, 공유/취소, claim/resume, visibility-aware 결과 polling
 - 문제 신고 UI/API, 사용자·사유·시간 bucket dedupe와 최소 정보 저장
+- 신고 queue 조회·상태 triage·문항 correction 연결과 전용 admin scope
 - 독립 CMS의 memory-only admin JWT, revision lifecycle, daily set 편성·publish·void/correction, 최소 audit log
 - 확인 문구가 필요한 계정 삭제, 인증 무효화, 개인 기록 삭제와 과거 Challenge redaction
 - 암호화된 알림 preference, consent-gated outbox, dedupe/retry/terminal worker
 - advisory lock 기반 operations scheduler, 만료·보존기간 cleanup, 실행 ledger
 - Redis 공유 rate limit, 보호된 Prometheus metrics, local alert/dashboard profile
+- Daily/Challenge drain-aware write, notification delivery, Analytics publish kill switch
+- Apps in Toss HTTP 200 business envelope 및 `errorCode` 계약 검증
 - semantic HTML, ARIA live region, safe area, reduced motion, 작은 화면 대응
-- PostgreSQL migration `0001`~`0015`, 제약조건/trigger, 로컬 seed
+- PostgreSQL migration `0001`~`0017`, 제약조건/trigger, 로컬 seed
 - pull request/main용 CI 정적 검사·PostgreSQL 통합 테스트·build와 별도 gitleaks job
 
 로컬 구현과 외부 연동 완료는 구분합니다. identity와 notification에는 mTLS adapter가 있지만 실제 자격증명·콘솔 템플릿을 사용한 성공 호출은 확인하지 않았습니다. development는 in-memory rate limit fallback을 허용하지만 staging/production은 Redis URL이 없으면 시작하지 않습니다. CMS는 별도 Vite bundle로 구현됐지만 production IAM/SSO와 배포 공급자는 아직 정해지지 않았습니다.
@@ -272,7 +275,7 @@ corepack pnpm typecheck
 corepack pnpm build
 ```
 
-통합 테스트는 Node.js 내장 test runner와 Fastify `inject()`를 사용하며 실제 PostgreSQL에서 10개 suite, 57 tests를 직렬 실행합니다. Daily의 날짜·동시성·`choice_order`·streak·retire/void, Challenge의 token·quota·20-way claim·결과·만료·attempt provenance·void privacy, 신고 dedupe, admin lifecycle/publish/audit/correction, 삭제/redaction race, cleanup, 암호화 알림 preference, outbox worker, 보호된 metrics와 실제 Redis 다중 인스턴스 rate limit을 검증합니다.
+테스트는 Node.js 내장 runner와 Fastify `inject()`로 14개 파일, 97 tests를 직렬 실행합니다. 실제 PostgreSQL·Redis 통합 검증과 외부 연결 없는 adapter/CLI 검증을 포함합니다. Daily의 날짜·동시성·`choice_order`·streak·retire/void와 drain switch, Challenge의 token·quota·20-way claim·결과·만료·attempt provenance·void privacy와 create/claim switch, 신고 제출·triage·scope·audit, Apps in Toss 응답 envelope, Analytics capability, 삭제/redaction race, cleanup, 암호화 알림 preference, outbox worker, 보호된 metrics와 실제 Redis 다중 인스턴스 rate limit을 검증합니다.
 
 테스트 DB 관리자 URL은 `.env`의 `TEST_DATABASE_ADMIN_URL`로 지정할 수 있습니다. 지정하지 않으면 로컬 Compose의 `postgres` maintenance DB를 사용합니다. 이 계정에는 `CREATE DATABASE` 권한이 필요합니다. Harness는 매 실행마다 `daily_quiz_it_<32자리 hex>` 이름의 DB만 생성하고, 이름을 다시 검증한 뒤 해당 DB만 `DROP DATABASE ... WITH (FORCE)`로 제거합니다. 앱 DB, schema, Docker volume은 삭제하지 않으며 최종 검증에서 잔여 임시 DB가 0개인지 확인했습니다.
 
@@ -281,18 +284,28 @@ corepack pnpm build
 2026-09-05 KST working tree 로컬 검증 기록:
 
 - format check, lint, typecheck, contracts/API/Web/Admin build 통과
-- 실제 PostgreSQL·Redis 통합 테스트 **57 tests, 57 pass, 0 fail**
-- 빈 임시 DB에 `0001`~`0015` migration/seed 적용과 teardown 통과
+- 실제 PostgreSQL·Redis 통합 테스트 **87 tests, 87 pass, 0 fail**
+- 빈 임시 DB에 `0001`~`0017` migration/seed 적용과 teardown 통과
 - contracts/API/Web/Admin production build와 Apps in Toss `.ait` 패키징 통과
 - Daily full flow와 `choice_order` 채점, 과거 Challenge 지연 완료 시 streak 비회귀, retired revision의 기존 attempt resume/new start 차단 확인
 - Challenge create/claim/result, 20-way claim 1명 수렴, same-set attempt 재사용, win/loss/draw, expiry와 참여자 권한 확인
-- report 최소 저장·dedupe, admin JWT scope/lifecycle/daily publish/void/audit, 삭제/redaction, cleanup scheduler ledger, notification preference/outbox/worker 확인
+- report 최소 저장·dedupe·queue/triage, admin scope/lifecycle/daily publish/void/audit, Apps in Toss business envelope, split kill switch, 삭제/redaction, cleanup scheduler ledger, notification preference/outbox/worker 확인
 - 390×844 브라우저에서 Challenge 양측 무승부 결과와 raw token 제거를 확인했고, 320×640/200%에서 void 결과 privacy·reflow·focus, CMS memory-only 인증·void/correction focus를 실제 Chromium으로 확인
 - Web과 CMS의 WCAG 2 A/AA axe 검사에서 제품 DOM serious/critical 위반 0건 확인(AIT development overlay 제외)
-- local Prometheus target `up`, 8개 alert rule load, Grafana health, migration 15개 backup/restore rehearsal과 잔여 restore DB 0개 확인
+- local Prometheus target `up`, 13개 alert rule과 확장 dashboard 검증, migration 17개 backup/restore rehearsal 약 2초 및 잔여 restore DB 0개 확인
 - `corepack pnpm audit` 결과 알려진 취약점 0건. 취약한 transitive `esbuild`는 workspace override로 `0.25.12`에 고정
 
-`.github/workflows/ci.yml`은 pull request/main 및 수동 실행에서 install, format, lint, typecheck, high-severity dependency audit, PostgreSQL·Redis integration test, build, Docker/Compose·Prometheus·backup script 정적 검사와 별도 gitleaks job을 실행하도록 구성됐습니다. 현행 미커밋 workflow의 원격 CI 성공 증거는 아직 없으며, 위 결과는 2026-09-05 KST 로컬 실행 증거입니다.
+2026-09-06 KST 승인안 후속 검증:
+
+- 전체 회귀 **97 tests, 97 pass, 0 fail, 0 skip**.
+- 신규 자동 별명의 허용 형식, 기존 사용자 재접속·동시 bootstrap 안정성 확인.
+- 출시 알림 기본 off, 단독 CLI 조기 종료, enabled template/identity 검증 유지 확인.
+- 발송 off에서도 저장 동의는 보존하고 활성화는 거부하며 철회 시 암호문을 제거하는 API 검증.
+- 격리 DB에 연결한 실제 Chromium에서 미제공 안내와 disabled 켜기 버튼 확인.
+- 320×640 화면·200% 글자 설정에서 가로 overflow 0, 계정 설정 제품 DOM axe A/AA 위반 0.
+  삭제 확인 문구에서 발견한 대비 결함은 공통 danger 색상을 어둡게 바꾸고 재검증했다.
+
+`.github/workflows/ci.yml`은 pull request/main 및 수동 실행에서 install, format, lint, typecheck, high-severity dependency audit, PostgreSQL·Redis integration test, build, Docker/Compose·Prometheus·backup script 정적 검사와 별도 gitleaks job을 실행하도록 commit `72dd2da`에 구성됐습니다. 후속 working tree와 같은 SHA의 원격 CI 성공 증거는 아직 없으며, 위 결과는 각 날짜에 수행한 로컬 실행 증거입니다.
 
 ## 보안·데이터 원칙
 
@@ -310,7 +323,7 @@ corepack pnpm build
 
 ## Apps in Toss 배포 전 필수 확인
 
-`apps/web/apps-in-toss.config.ts`의 `appName: "daily-quiz-battle"`은 임시값입니다. 콘솔 등록 후 변경할 수 없는 값이므로 다음을 확정하기 전 임시값으로 등록하지 않습니다.
+`apps/web/apps-in-toss.config.ts`의 `appName: "daily-quiz-battle"`을 유지하기로 결정했습니다. Web bundle과 알림 deep link가 같은 값을 사용합니다. 콘솔에서 이름 가용성과 실제 등록 결과를 확인한 증거는 아직 없습니다.
 
 1. production appName, 앱 상세 정보와 알림 template/templateSet code
 2. 실제 mTLS 인증서/키로 identity와 notification send 성공 경로 검증
@@ -319,6 +332,34 @@ corepack pnpm build
 5. VoiceOver/TalkBack, keyboard-only, 200% 확대 수동 QA
 6. 150개+ 검수 콘텐츠와 14+ 적합성 증거
 7. production monitoring/alert, backup/restore, 개인정보처리방침·법무·검수
+
+### 승인된 출시 기준과 외부 실행 경계
+
+2026-09-06 권장안 승인 기준입니다. 아래 선택은 실제 인프라 구성이나 법무 승인을 뜻하지 않습니다.
+
+| 항목      | 선택                                       | 구현·외부 게이트                                                                                                       |
+| --------- | ------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------- |
+| 앱 식별자 | `daily-quiz-battle` 유지                   | 콘솔 가용성·등록 확인 필요                                                                                             |
+| 닉네임    | 서버가 비식별 별명 자동 생성               | 신규 사용자에만 적용; 기존 사용자·Challenge snapshot 보존                                                              |
+| 알림      | 첫 공개 버전 off                           | `NOTIFICATION_DELIVERY_ENABLED=false`; SDK 동의/신규 enqueue/모든 CLI·scheduler 발송 차단, 기존 동의 철회 허용         |
+| Cloud     | AWS Seoul (`ap-northeast-2`) managed stack | PostgreSQL·Redis·Secret Manager·private network, API/scheduler 분리; AWS 계정·예산·도메인·DPA 확인 전 리소스 생성 없음 |
+| CMS 인증  | reverse proxy OIDC/SSO + short admin JWT   | IdP issuer/client·운영자 그룹·callback domain 필요; 현재 CLI JWT는 로컬용                                              |
+| 복구 목표 | RPO 1시간 / RTO 4시간                      | 운영 목표이며 현재 보장 아님; PITR·격리 복구·page 수신 및 책임자 증거 필요                                             |
+| 콘텐츠    | 30일분 150개 + 예비 약 15개                | 출처·권리·검수자·14+ 적합성 확인 필요; 생성 초안을 검수 재고로 계산하지 않음                                           |
+| CI        | PR에서 실행                                | 현재 변경은 미커밋; 해당 변경의 커밋·push 후 PR 및 같은 SHA의 CI 성공 확인 필요                                        |
+
+보존기간의 **검토 기준**은 attempts/answers 90일, report detail 30일,
+report metadata 180일, published outbox 30일, failed outbox 90일,
+admin audit/void reason 180일, deleted-user tombstone 90일,
+Challenge detail 30일 redaction/90일 purge입니다.
+이는 법무 승인 전 기준안이며 이 선택만으로 실제 삭제 cleanup을 활성화하지 않습니다.
+참조 무결성·삭제 계정 재등록 방지·불변 audit/void 정책과의 충돌도 함께 검토해야 합니다.
+기존 cleanup 보존 정책은 변경하지 않았습니다.
+
+알림 off 상태에서는 preference의 `enabled`가 저장된 동의,
+`deliveryAvailable`이 현재 제공 여부를 나타냅니다. 동의가 남아 있어도 발송하지 않으며
+사용자가 철회할 수 있습니다. 재활성화는 승인 template·실제 mTLS·실기기 검증 후
+환경변수를 명시적으로 true로 바꾸고 API와 worker를 재시작하는 방식입니다.
 
 ## 개발 문서와 Git 정책
 
