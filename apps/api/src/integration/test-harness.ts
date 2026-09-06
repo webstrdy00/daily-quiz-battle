@@ -87,6 +87,7 @@ function createTestConfig(databaseUrl: string): AppConfig {
     apiPort: 3000,
     logLevel: "silent",
     databaseUrl,
+    databasePoolMax: 5,
     identityVerificationMode: "mock",
     identityVerifyUrl: "https://example.invalid/test-identity",
     anonymousKeyPepper:

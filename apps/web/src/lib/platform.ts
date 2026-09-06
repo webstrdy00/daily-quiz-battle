@@ -189,7 +189,7 @@ export async function shareChallenge(
 ): Promise<ChallengeShareOutcome> {
   try {
     const link = await Share.createLink({
-      path: `intoss://daily-quiz-battle/challenge/${token}`,
+      path: `intoss://daily-quiz-battle-anlee/challenge/${token}`,
     });
     await Share.sendMessage({
       message: `오늘의 상식대결에 도전해 보세요!\n${link}`,

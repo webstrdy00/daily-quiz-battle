@@ -60,6 +60,8 @@ const EnvironmentSchema = z.object({
     .enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"])
     .default("info"),
   DATABASE_URL: z.string().url().default(LOCAL_DATABASE_URL),
+  // Two scheduler session locks must leave a connection available for task work.
+  DATABASE_POOL_MAX: z.coerce.number().int().min(3).max(20).default(5),
   IDENTITY_VERIFICATION_MODE: z.enum(["mock", "mtls"]).default("mock"),
   IDENTITY_VERIFY_URL: z
     .string()
@@ -203,6 +205,7 @@ export interface AppConfig {
   apiPort: number;
   logLevel: "fatal" | "error" | "warn" | "info" | "debug" | "trace" | "silent";
   databaseUrl: string;
+  databasePoolMax: number;
   identityVerificationMode: IdentityVerificationMode;
   identityVerifyUrl: string;
   identityMtlsCert?: string;
@@ -446,6 +449,7 @@ export function loadConfig(): RuntimeConfig {
     apiPort: values.API_PORT,
     logLevel: values.LOG_LEVEL,
     databaseUrl: values.DATABASE_URL,
+    databasePoolMax: values.DATABASE_POOL_MAX,
     identityVerificationMode: values.IDENTITY_VERIFICATION_MODE,
     identityVerifyUrl: values.IDENTITY_VERIFY_URL,
     identityMtlsCert: values.IDENTITY_MTLS_CERT,

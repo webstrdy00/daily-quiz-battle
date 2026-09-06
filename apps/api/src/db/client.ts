@@ -13,7 +13,7 @@ export interface Database {
 
 export function createDatabase(config: AppConfig): Database {
   const client = postgres(config.databaseUrl, {
-    max: config.appEnvironment === "development" ? 5 : 20,
+    max: config.databasePoolMax,
     idle_timeout: 20,
     connect_timeout: 10,
     prepare: false,

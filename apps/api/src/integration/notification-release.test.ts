@@ -11,6 +11,7 @@ const workerPath = fileURLToPath(
   new URL("../notification/run-worker.ts", import.meta.url),
 );
 const configUrl = new URL("../config.ts", import.meta.url).href;
+const databaseClientUrl = new URL("../db/client.ts", import.meta.url).href;
 const childTimeout = 10_000;
 const testTimeout = 30_000;
 
@@ -110,6 +111,81 @@ function assertChild(
   assert.equal(child.stderr, "");
   assert.equal(child.stdout, `${JSON.stringify(output)}\n`);
 }
+
+function databaseProbe(): string[] {
+  return [
+    "--input-type=module",
+    "--eval",
+    `
+      const { loadConfig } = await import(${JSON.stringify(configUrl)});
+      const { createDatabase } = await import(${JSON.stringify(databaseClientUrl)});
+      let database;
+      try {
+        const config = loadConfig();
+        database = createDatabase(config);
+        process.stdout.write(JSON.stringify({
+          databasePoolMax: config.databasePoolMax,
+          max: database.client.options.max,
+          ssl: database.client.options.ssl,
+        }) + "\\n");
+      } catch (error) {
+        process.stdout.write(JSON.stringify({
+          invalidDatabasePoolMax: Array.isArray(error?.issues) &&
+            error.issues.length > 0 &&
+            error.issues.every((issue) =>
+              issue.path.length === 1 && issue.path[0] === "DATABASE_POOL_MAX"),
+        }) + "\\n");
+        process.exitCode = 1;
+      } finally {
+        await database?.close();
+      }
+    `,
+  ];
+}
+
+for (const poolMax of [3, 20]) {
+  test(
+    `database pool accepts boundary ${poolMax} in the actual client`,
+    { timeout: testTimeout },
+    () => {
+      assertChild(
+        runChild(databaseProbe(), { DATABASE_POOL_MAX: String(poolMax) }),
+        0,
+        { databasePoolMax: poolMax, max: poolMax, ssl: false },
+      );
+    },
+  );
+}
+
+for (const poolMax of ["2", "21", "3.5", "not-a-number"]) {
+  test(
+    `database pool rejects invalid value ${poolMax}`,
+    { timeout: testTimeout },
+    () => {
+      assertChild(
+        runChild(databaseProbe(), { DATABASE_POOL_MAX: poolMax }),
+        1,
+        { invalidDatabasePoolMax: true },
+      );
+    },
+  );
+}
+
+test(
+  "remote database verify-full SSL mode reaches the client without connecting",
+  { timeout: testTimeout },
+  () => {
+    assertChild(
+      runChild(databaseProbe(), {
+        DATABASE_URL:
+          "postgres://fixture:fixture@database.example.invalid/fixture?sslmode=verify-full",
+        DATABASE_POOL_MAX: "3",
+      }),
+      0,
+      { databasePoolMax: 3, max: 3, ssl: "verify-full" },
+    );
+  },
+);
 
 test(
   "notification delivery defaults off in every environment",

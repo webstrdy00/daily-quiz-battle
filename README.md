@@ -208,6 +208,66 @@ docker compose --profile operations stop operations
 
 staging/production에서는 올바른 interval 설정과 함께 `OPERATIONS_SCHEDULER_ENABLED=true`를 명시해야 scheduler가 시작됩니다. production은 이 development Compose profile이 아니라 별도 외부 orchestrator에서 `node apps/api/dist/operations/scheduler.js`를 API와 분리해 실행해야 합니다. Advisory lock은 replica 중복 실행만 막으며 배포, restart/health monitoring, alerting, secret·mTLS certificate 주입, Apps in Toss template 설정을 제공하지 않습니다. 현재 저장소에는 cloud 공급자 설정이나 실제 template/certificate가 없으므로 production scheduler 실행 또는 실제 알림 발송 완료를 검증한 상태가 아닙니다.
 
+### Scale-to-zero 배포 준비
+
+Cloud Run처럼 요청이 없으면 중지되는 API 안에서 상시 scheduler를 실행하면 안 됩니다.
+예약 container job에는 아래의 단일 실행 명령을 사용합니다. 실제 cloud job이나 trigger를
+생성한 상태는 아니며, 주기·재시도·IAM·비용 한도는 배포 시 별도로 구성해야 합니다.
+
+```powershell
+corepack pnpm --filter @daily-quiz-battle/api operations:once
+# 빌드된 API image의 job command
+node apps/api/dist/operations/scheduler.js --once
+```
+
+`--once`는 활성 task를 순차적으로 한 번 실행하고 DB를 닫습니다. 중복 lock은 건너뛰며,
+task·ledger·인프라 실패나 실행 중 종료 신호는 nonzero exit로 재시도 대상이 됩니다.
+staging/production은 이 모드도 `OPERATIONS_SCHEDULER_ENABLED=true`가 필요합니다.
+알림은 `NOTIFICATION_DELIVERY_ENABLED=false`를 유지해도 cleanup은 실행됩니다.
+
+- `DATABASE_POOL_MAX`는 기본 5, 허용 범위 3~20입니다. 상시 scheduler의 두 lock session과
+  실제 task query가 경쟁하므로 3 미만은 허용하지 않습니다. API replica와 job을 합산해
+  provider의 연결 한도 및 migration/admin 여유를 확보해야 합니다.
+- operations는 PostgreSQL **direct 또는 session pooler**를 사용합니다. Transaction
+  pooler는 session advisory lock을 보장하지 않으며 `prepare:false`만으로 해결되지 않습니다.
+- 외부 PostgreSQL URL에는 `sslmode=verify-full`을 사용하고, 필요한 CA를 신뢰 저장소에
+  제공해야 합니다. 현재 postgres.js의 `sslmode=require`는 인증서를 검증하지 않습니다.
+  외부 Redis는 REST URL이 아니라 native `rediss://` URL을 사용합니다.
+- Cloud Run은 container port 3000과 `API_PORT=3000`, `API_HOST=0.0.0.0`을 맞춥니다.
+  플랫폼의 `PORT`만 설정하면 현재 API 설정에 반영되지 않습니다.
+- readiness와 보호된 metrics는 DB를 조회합니다. Scale-to-zero DB에 로컬의 15초 scrape를
+  그대로 적용하지 말고, process liveness와 실제 dependency 점검 주기를 구분해야 합니다.
+- 실제 mTLS/secret 주입, 정확한 CORS, Supabase Data API를 통한 무권한 접근 차단,
+  외부 backup/restore 및 토스 실기기 검증은 여전히 출시 게이트입니다.
+  무료 한도나 예산 알림은 무제한 사용 또는 초과 과금 차단을 보장하지 않습니다.
+
+단일 실행 배포 준비의 로컬 검증: focused CLI/DB 설정 **23/23**, 전체 PostgreSQL·Redis
+회귀 **114/114** 통과. lint/typecheck/전체 build/format check와 Docker image build를
+통과했고, 빌드된 image의 `--once`를 격리 DB에서 실행해 cleanup 성공 ledger와 종료를
+확인했습니다. 임시 테스트 DB는 0개이며 실제 managed DB TLS/mTLS·cloud 배포 증거는 아닙니다.
+
+### Netlify Free 배포 구성
+
+루트 `netlify.toml`은 API Functions와 별도 운영자 CMS를 빌드합니다. 사용자용
+Apps in Toss Web은 이 publish 대상이 아니며 기존 `.ait` 배포 절차를 유지합니다.
+CMS는 동일 origin의 API를 사용합니다. `/v1/*`, `/health/*`, `/internal/metrics`는
+API function으로 연결되고 기존 인증·CORS·metrics token 검증을 유지합니다.
+
+- Netlify 환경 변수에 `APP_ENV=production`, 실제 인증 mTLS, 독립적인 production
+  secret, 검증된 PostgreSQL TLS URL, native `rediss://` URL과 정확한 CORS origin을
+  설정합니다. 루트 `.env`를 업로드하거나 secret을 `VITE_*`에 넣지 않습니다.
+- API는 `DATABASE_URL`, 예약 작업은 별도 `OPERATIONS_DATABASE_URL`을 사용합니다.
+  후자는 `sslmode=verify-full`인 direct/session 연결이어야 합니다.
+- 예약 function은 매일 UTC 00:00(KST 09:00)에 단일 실행합니다.
+  `OPERATIONS_SCHEDULER_ENABLED=true`가 필요하며 출시 전에는
+  `NOTIFICATION_DELIVERY_ENABLED=false`를 유지합니다. 이 일일 실행은 30초 간격의
+  알림 worker를 대체하지 않습니다.
+- 배포 전에 migration과 콘텐츠 준비, Supabase Data API 무권한 접근 차단,
+  실제 DB/Redis TLS 연결, 예약 작업의 플랫폼 실행 시간 제한과 실패 감시,
+  무료 한도 소진 시 동작을 검증해야 합니다.
+
+이 설정 파일과 로컬 테스트는 실제 Netlify 배포·운영 검증의 증거가 아닙니다.
+
 ### Local monitoring
 
 공급자 선택 전 metrics scrape, alert rule, dashboard를 로컬에서 확인하는 opt-in `monitoring` profile입니다. 다음 명령은 Grafana의 dependency인 Prometheus와 API, migration, Redis, PostgreSQL을 함께 시작하지만 operations scheduler는 시작하지 않습니다.
@@ -275,11 +335,11 @@ corepack pnpm typecheck
 corepack pnpm build
 ```
 
-테스트는 Node.js 내장 runner와 Fastify `inject()`로 14개 파일, 97 tests를 직렬 실행합니다. 실제 PostgreSQL·Redis 통합 검증과 외부 연결 없는 adapter/CLI 검증을 포함합니다. Daily의 날짜·동시성·`choice_order`·streak·retire/void와 drain switch, Challenge의 token·quota·20-way claim·결과·만료·attempt provenance·void privacy와 create/claim switch, 신고 제출·triage·scope·audit, Apps in Toss 응답 envelope, Analytics capability, 삭제/redaction race, cleanup, 암호화 알림 preference, outbox worker, 보호된 metrics와 실제 Redis 다중 인스턴스 rate limit을 검증합니다.
+테스트는 Node.js 내장 runner와 Fastify `inject()`로 직렬 실행합니다. 실제 PostgreSQL·Redis 통합 검증과 외부 연결 없는 adapter/CLI 검증을 포함합니다. Daily의 날짜·동시성·`choice_order`·streak·retire/void와 drain switch, Challenge의 token·quota·20-way claim·결과·만료·attempt provenance·void privacy와 create/claim switch, 신고 제출·triage·scope·audit, Apps in Toss 응답 envelope, Analytics capability, 삭제/redaction race, cleanup, 암호화 알림 preference, outbox worker, 보호된 metrics와 실제 Redis 다중 인스턴스 rate limit을 검증합니다. 예약 작업의 단일 실행·중복 lock·실패 exit와 DB pool 설정도 회귀 검증 대상입니다.
 
 테스트 DB 관리자 URL은 `.env`의 `TEST_DATABASE_ADMIN_URL`로 지정할 수 있습니다. 지정하지 않으면 로컬 Compose의 `postgres` maintenance DB를 사용합니다. 이 계정에는 `CREATE DATABASE` 권한이 필요합니다. Harness는 매 실행마다 `daily_quiz_it_<32자리 hex>` 이름의 DB만 생성하고, 이름을 다시 검증한 뒤 해당 DB만 `DROP DATABASE ... WITH (FORCE)`로 제거합니다. 앱 DB, schema, Docker volume은 삭제하지 않으며 최종 검증에서 잔여 임시 DB가 0개인지 확인했습니다.
 
-`build`는 contracts, API, Web, Admin CMS를 순서대로 빌드하고 `apps/web/daily-quiz-battle.ait`를 생성합니다. `.ait`, `dist`, local env, DB data, `docs/`는 Git에서 제외됩니다.
+`build`는 contracts, API, Web, Admin CMS를 순서대로 빌드하고 `apps/web/daily-quiz-battle-anlee.ait`를 생성합니다. `.ait`, `dist`, local env, DB data, `docs/`는 Git에서 제외됩니다.
 
 2026-09-05 KST working tree 로컬 검증 기록:
 
@@ -323,7 +383,10 @@ corepack pnpm build
 
 ## Apps in Toss 배포 전 필수 확인
 
-`apps/web/apps-in-toss.config.ts`의 `appName: "daily-quiz-battle"`을 유지하기로 결정했습니다. Web bundle과 알림 deep link가 같은 값을 사용합니다. 콘솔에서 이름 가용성과 실제 등록 결과를 확인한 증거는 아직 없습니다.
+2026-09-06 앱인토스 콘솔에 `오늘의 상식대결` 게임 앱 초안을 생성했습니다.
+기존 `daily-quiz-battle`은 이미 사용 중이어서 `daily-quiz-battle-anlee`로 등록했습니다.
+Web bundle과 공유·알림 deep link가 등록된 식별자를 사용합니다. 앱 상세 정보 검토,
+게임 등급정보와 출시 승인은 아직 완료되지 않았습니다.
 
 1. production appName, 앱 상세 정보와 알림 template/templateSet code
 2. 실제 mTLS 인증서/키로 identity와 notification send 성공 경로 검증
@@ -339,7 +402,7 @@ corepack pnpm build
 
 | 항목      | 선택                                       | 구현·외부 게이트                                                                                                       |
 | --------- | ------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------- |
-| 앱 식별자 | `daily-quiz-battle` 유지                   | 콘솔 가용성·등록 확인 필요                                                                                             |
+| 앱 식별자 | `daily-quiz-battle-anlee`                  | 콘솔 앱 초안 생성 확인; 상세 정보·등급정보·출시 검토 필요                                                              |
 | 닉네임    | 서버가 비식별 별명 자동 생성               | 신규 사용자에만 적용; 기존 사용자·Challenge snapshot 보존                                                              |
 | 알림      | 첫 공개 버전 off                           | `NOTIFICATION_DELIVERY_ENABLED=false`; SDK 동의/신규 enqueue/모든 CLI·scheduler 발송 차단, 기존 동의 철회 허용         |
 | Cloud     | AWS Seoul (`ap-northeast-2`) managed stack | PostgreSQL·Redis·Secret Manager·private network, API/scheduler 분리; AWS 계정·예산·도메인·DPA 확인 전 리소스 생성 없음 |

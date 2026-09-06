@@ -10,6 +10,7 @@ x-local-api-environment: &local-api-environment
   API_PORT: "3000"
   LOG_LEVEL: info
   DATABASE_URL: postgres://daily_quiz:daily_quiz_local@postgres:5432/daily_quiz
+  DATABASE_POOL_MAX: "${DATABASE_POOL_MAX:-5}"
   IDENTITY_VERIFICATION_MODE: mock
   ANON_KEY_PEPPER: local-only-anon-key-pepper-change-before-production-2026
   ACCESS_TOKEN_SECRET: local-only-access-token-secret-change-before-production-2026

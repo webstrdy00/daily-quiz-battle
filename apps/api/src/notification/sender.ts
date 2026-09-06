@@ -184,7 +184,7 @@ class MtlsNotificationSender implements NotificationSender {
     if (challengeToken === null) {
       throw invalidChallengeToken();
     }
-    const challengeLink = `intoss://daily-quiz-battle/challenge/${challengeToken}`;
+    const challengeLink = `intoss://daily-quiz-battle-anlee/challenge/${challengeToken}`;
     const body = JSON.stringify({
       templateSetCode: this.templateSetCode,
       context: { challengeLink },

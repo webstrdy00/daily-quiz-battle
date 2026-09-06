@@ -1,0 +1,11 @@
+[build]
+  command = "pnpm --filter @daily-quiz-battle/contracts build && pnpm --filter @daily-quiz-battle/api build && pnpm --filter @daily-quiz-battle/admin build"
+  publish = "apps/admin/dist"
+  functions = "apps/api/src/netlify"
+
+[build.environment]
+  NODE_VERSION = "24"
+  VITE_ADMIN_API_BASE_URL = "/"
+
+[functions]
+  node_bundler = "esbuild"

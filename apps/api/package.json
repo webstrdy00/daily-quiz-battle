@@ -10,11 +10,12 @@
     "start": "node dist/server.js",
     "lint": "oxlint src drizzle.config.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "pnpm --filter @daily-quiz-battle/contracts build && node --env-file-if-exists=../../.env --import tsx --test --test-concurrency=1 src/integration/apps-in-toss-adapters.test.ts src/integration/notification-release.test.ts src/integration/operational-capabilities.integration.test.ts src/integration/daily.integration.test.ts src/integration/challenge.integration.test.ts src/integration/report.integration.test.ts src/integration/admin-report.integration.test.ts src/integration/admin-content.integration.test.ts src/integration/account-deletion.integration.test.ts src/integration/cleanup.integration.test.ts src/integration/notification-preference.integration.test.ts src/integration/notification-outbox.integration.test.ts src/integration/observability.integration.test.ts src/integration/rate-limit.integration.test.ts",
+    "test": "pnpm --filter @daily-quiz-battle/contracts build && node --env-file-if-exists=../../.env --import tsx --test --test-concurrency=1 src/integration/netlify-api.integration.test.ts src/integration/apps-in-toss-adapters.test.ts src/integration/notification-release.test.ts src/integration/operations-once.integration.test.ts src/integration/operational-capabilities.integration.test.ts src/integration/daily.integration.test.ts src/integration/challenge.integration.test.ts src/integration/report.integration.test.ts src/integration/admin-report.integration.test.ts src/integration/admin-content.integration.test.ts src/integration/account-deletion.integration.test.ts src/integration/cleanup.integration.test.ts src/integration/notification-preference.integration.test.ts src/integration/notification-outbox.integration.test.ts src/integration/observability.integration.test.ts src/integration/rate-limit.integration.test.ts",
     "admin:token": "tsx src/admin/issue-token.ts",
     "maintenance:cleanup": "tsx src/maintenance/run-cleanup.ts",
     "notification:work": "tsx src/notification/run-worker.ts",
     "operations:schedule": "tsx src/operations/scheduler.ts",
+    "operations:once": "tsx src/operations/scheduler.ts --once",
     "db:migrate": "tsx src/db/migrate.ts",
     "db:seed": "tsx src/db/seed.ts",
     "db:generate": "drizzle-kit generate"
@@ -33,6 +34,7 @@
     "zod": "4.5.2"
   },
   "devDependencies": {
+    "@netlify/functions": "6.0.0",
     "@types/node": "24.13.3",
     "drizzle-kit": "0.31.10",
     "oxlint": "1.80.0",
