@@ -1,3 +1,5 @@
+import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import postgres from "postgres";
 import { loadConfig } from "../config.js";
 import { getKstDate } from "../shared/time.js";
@@ -72,10 +74,21 @@ const questions: SeedQuestion[] = [
   },
 ];
 
-async function seed(): Promise<void> {
-  const config = loadConfig();
-  const sql = postgres(config.databaseUrl, { max: 1, prepare: false });
-  const quizDate = getKstDate();
+type SeedLogger = (message: string) => void;
+
+export interface SeedOptions {
+  now?: Date;
+  log?: SeedLogger;
+}
+
+export async function seedDatabase(
+  databaseUrl: string,
+  options: SeedOptions = {},
+): Promise<string> {
+  const now = options.now ?? new Date();
+  const log = options.log ?? console.log;
+  const sql = postgres(databaseUrl, { max: 1, prepare: false });
+  const quizDate = getKstDate(now);
 
   try {
     await sql.begin(async (transaction) => {
@@ -141,7 +154,7 @@ async function seed(): Promise<void> {
       } else {
         dailySetId = existingSet[0].id;
         if (existingSet[0].status === "published") {
-          console.log(`Daily set already published for ${quizDate}`);
+          log(`Daily set already published for ${quizDate}`);
           return;
         }
       }
@@ -170,11 +183,23 @@ async function seed(): Promise<void> {
         WHERE id = ${dailySetId} AND status = 'draft'
       `;
 
-      console.log(`Seeded daily set for ${quizDate}`);
+      log(`Seeded daily set for ${quizDate}`);
     });
   } finally {
     await sql.end({ timeout: 5 });
   }
+
+  return quizDate;
 }
 
-await seed();
+function isMainModule(): boolean {
+  const entryPath = process.argv[1];
+  return (
+    entryPath !== undefined &&
+    import.meta.url === pathToFileURL(resolve(entryPath)).href
+  );
+}
+
+if (isMainModule()) {
+  await seedDatabase(loadConfig().databaseUrl);
+}

@@ -189,7 +189,8 @@
   transform: scale(0.99);
 }
 
-.primary-button:disabled {
+.primary-button:disabled,
+.secondary-button:disabled {
   cursor: not-allowed;
   box-shadow: none;
   opacity: 0.45;
@@ -214,7 +215,8 @@
 
 .loading-card,
 .error-card,
-.finishing-card {
+.finishing-card,
+.deleted-card {
   margin-top: min(24vh, 180px);
   padding: 42px 28px;
   text-align: center;
@@ -226,7 +228,8 @@
 
 .loading-card h1,
 .error-card h1,
-.finishing-card h1 {
+.finishing-card h1,
+.deleted-card h1 {
   font-size: clamp(25px, 7vw, 34px);
 }
 
@@ -280,6 +283,16 @@
 .error-card .primary-button,
 .finishing-card .primary-button {
   margin-top: 28px;
+}
+
+.button-stack {
+  display: grid;
+  gap: 10px;
+  margin-top: 28px;
+}
+
+.button-stack .primary-button {
+  margin-top: 0;
 }
 
 .request-id {
@@ -595,6 +608,124 @@ fieldset {
   line-height: 1.55;
 }
 
+.question-report-trigger {
+  min-height: 44px;
+  padding: 8px 0;
+  margin-top: 8px;
+  border: 0;
+  color: var(--text-tertiary);
+  background: transparent;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 700;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.question-report-form {
+  padding-top: 16px;
+  margin-top: 12px;
+  border-top: 1px solid var(--line);
+}
+
+.question-report-form legend {
+  padding: 0;
+  color: var(--text-primary);
+  font-size: 14px;
+  font-weight: 800;
+}
+
+.question-report-reasons {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.question-report-reasons label {
+  display: flex;
+  min-height: 36px;
+  align-items: center;
+  gap: 9px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 14px;
+}
+
+.question-report-reasons input {
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  accent-color: var(--primary);
+}
+
+.question-report-detail {
+  display: block;
+  margin-top: 16px;
+  color: var(--text-primary);
+  font-size: 14px;
+  font-weight: 800;
+}
+
+.question-report-detail span,
+.question-report-count {
+  color: var(--text-tertiary);
+  font-weight: 500;
+}
+
+.question-report-form textarea {
+  width: 100%;
+  padding: 12px;
+  margin-top: 8px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  color: var(--text-primary);
+  background: white;
+  font: inherit;
+  line-height: 1.5;
+  resize: vertical;
+}
+
+.question-report-form textarea:focus {
+  border-color: var(--primary);
+  outline: 2px solid var(--primary-soft);
+}
+
+.question-report-count {
+  display: block;
+  margin-top: 4px;
+  text-align: right;
+  font-size: 12px;
+}
+
+.question-report-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.question-report-actions .primary-button,
+.question-report-actions .secondary-button {
+  min-height: 48px;
+  padding: 10px 12px;
+}
+
+.question-report-status {
+  margin: 12px 0 0;
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.question-report-status-error {
+  color: var(--danger);
+}
+
+.question-report-status-success {
+  color: var(--success);
+  font-weight: 700;
+}
+
 .next-step-card {
   display: flex;
   padding: 22px;
@@ -609,6 +740,240 @@ fieldset {
 }
 
 .next-step-card .secondary-button {
+  margin-top: 12px;
+}
+
+.challenge-shell {
+  display: grid;
+  align-content: start;
+}
+
+.voided-shell {
+  display: grid;
+  align-content: start;
+}
+
+.voided-card {
+  margin-top: min(12vh, 96px);
+  padding: 38px 28px 28px;
+  text-align: center;
+}
+
+.voided-card h1 {
+  font-size: clamp(26px, 7vw, 36px);
+}
+
+.voided-card .primary-button {
+  margin-top: 24px;
+}
+
+.voided-icon {
+  color: var(--text-secondary);
+  background: var(--line);
+}
+
+.challenge-shell .hero-card {
+  margin-top: min(10vh, 72px);
+}
+
+.challenge-shell .hero-card .primary-button,
+.challenge-status-card .primary-button {
+  margin-top: 24px;
+}
+
+.challenge-shell .hero-card .secondary-button,
+.challenge-status-card .secondary-button {
+  margin-top: 10px;
+}
+
+.challenge-summary {
+  display: flex;
+  margin: 28px 0 0;
+  padding: 16px 18px;
+  align-items: center;
+  justify-content: space-between;
+  border-radius: 16px;
+  color: var(--text-secondary);
+  background: #f9fafb;
+  font-size: 14px;
+}
+
+.challenge-summary strong {
+  color: var(--text-primary);
+}
+
+.challenge-status-card {
+  margin-top: min(12vh, 96px);
+  padding: 38px 28px 28px;
+  text-align: center;
+}
+
+.challenge-status-card h1 {
+  font-size: clamp(26px, 7vw, 36px);
+}
+
+.challenge-clock,
+.challenge-result-icon {
+  color: var(--primary);
+  background: var(--primary-soft);
+}
+
+.versus-row {
+  display: grid;
+  margin: 28px 0 20px;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  gap: 14px;
+  align-items: center;
+}
+
+.versus-row div {
+  display: flex;
+  min-width: 0;
+  padding: 18px 10px;
+  flex-direction: column;
+  gap: 7px;
+  border-radius: 18px;
+  background: #f9fafb;
+}
+
+.versus-row strong {
+  color: var(--primary);
+  font-size: 34px;
+}
+
+.versus-row span {
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.versus-row b {
+  color: var(--text-tertiary);
+  font-size: 13px;
+}
+
+.versus-complete div {
+  background: var(--primary-soft);
+}
+
+.challenge-live-status {
+  min-height: 22px;
+  margin: 14px 0 0;
+  color: var(--text-secondary);
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+.text-button {
+  width: 100%;
+  min-height: 44px;
+  margin-top: 8px;
+  border: 0;
+  color: var(--text-secondary);
+  background: transparent;
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.text-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.settings-shell {
+  display: grid;
+  align-content: start;
+}
+
+.settings-card {
+  margin-top: min(10vh, 72px);
+  padding: 38px 28px 28px;
+}
+
+.settings-card h1 {
+  font-size: clamp(28px, 8vw, 38px);
+}
+
+.delete-form,
+.delete-confirmation {
+  padding: 22px 0 4px;
+}
+
+.delete-form h2,
+.delete-confirmation h2 {
+  margin: 0;
+  color: var(--text-primary);
+  font-size: 21px;
+  letter-spacing: -0.025em;
+}
+
+.delete-form p,
+.delete-confirmation p {
+  margin: 12px 0 22px;
+  color: var(--text-secondary);
+  line-height: 1.65;
+  word-break: keep-all;
+}
+
+.delete-form label {
+  display: block;
+  color: var(--text-secondary);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.delete-form label strong {
+  color: var(--danger);
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+.delete-form input {
+  width: 100%;
+  min-height: 52px;
+  padding: 12px 14px;
+  margin-top: 9px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  color: var(--text-primary);
+  background: white;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+.delete-form input:focus {
+  border-color: var(--danger);
+  outline: 3px solid rgba(229, 72, 77, 0.18);
+}
+
+.danger-button {
+  width: 100%;
+  min-height: 56px;
+  padding: 14px 20px;
+  margin-top: 20px;
+  border: 0;
+  border-radius: 17px;
+  color: white;
+  background: var(--danger);
+  cursor: pointer;
+  font-weight: 800;
+}
+
+.danger-button:hover:not(:disabled) {
+  background: #c9363b;
+}
+
+.danger-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.delete-confirmation .secondary-button {
+  margin-top: 10px;
+}
+
+.settings-cancel {
   margin-top: 12px;
 }
 
@@ -640,5 +1005,13 @@ fieldset {
 
   .quiz-preview span {
     font-size: 11px;
+  }
+
+  .challenge-status-card {
+    padding: 32px 20px 24px;
+  }
+
+  .settings-card {
+    padding: 32px 20px 24px;
   }
 }

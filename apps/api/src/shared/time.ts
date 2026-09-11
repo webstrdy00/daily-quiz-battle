@@ -37,3 +37,14 @@ export function isPastDailyCompletionDeadline(
 ): boolean {
   return now >= getDailyCompletionDeadline(quizDate);
 }
+
+/**
+ * ADR-0002/0003: challenge expiry is the earlier of created+48h and
+ * 00:00 KST two days after the creation date (KST).
+ */
+export function getChallengeExpiry(createdAt: Date): Date {
+  const plus48h = new Date(createdAt.getTime() + 48 * 60 * 60 * 1000);
+  const dayAfterNext = addDays(getKstDate(createdAt), 2);
+  const kstBoundary = new Date(`${dayAfterNext}T00:00:00+09:00`);
+  return plus48h < kstBoundary ? plus48h : kstBoundary;
+}

@@ -1,0 +1,169 @@
+groups:
+  - name: daily-quiz-api
+    rules:
+      - alert: DailyQuizApiTargetDown
+        expr: up{job="daily-quiz-api"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          service: daily-quiz-api
+        annotations:
+          summary: Daily Quiz API metrics target is down
+          description: Prometheus has been unable to scrape the API metrics endpoint for 2 minutes.
+
+      - alert: DailyQuizApiHigh5xxRatio
+        expr: |
+          (
+            sum(increase(daily_quiz_api_http_requests_total{job="daily-quiz-api",status_class="5xx"}[5m]))
+            /
+            sum(increase(daily_quiz_api_http_requests_total{job="daily-quiz-api"}[5m]))
+          ) > 0.05
+          and
+          sum(increase(daily_quiz_api_http_requests_total{job="daily-quiz-api"}[5m])) >= 20
+        for: 5m
+        labels:
+          severity: critical
+          service: daily-quiz-api
+        annotations:
+          summary: Daily Quiz API 5xx ratio is above 5 percent
+          description: The 5xx ratio exceeded 5 percent over 5 minutes with at least 20 requests in that window.
+
+      - alert: DailyQuizIdentityDependencyErrorRatioHigh
+        expr: |
+          (
+            sum(increase(daily_quiz_api_identity_verification_total{job="daily-quiz-api",outcome=~"dependency_error|invalid_response"}[5m]))
+            /
+            sum(increase(daily_quiz_api_identity_verification_total{job="daily-quiz-api"}[5m]))
+          ) > 0.05
+          and
+          sum(increase(daily_quiz_api_identity_verification_total{job="daily-quiz-api"}[5m])) >= 20
+        for: 5m
+        labels:
+          severity: critical
+          service: daily-quiz-api
+        annotations:
+          summary: Identity dependency error ratio is above 5 percent
+          description: Identity dependency or invalid-response outcomes exceeded 5 percent over 5 minutes with at least 20 verification outcomes in that window.
+
+      - alert: DailyQuizIdentityMtlsCertificateExpiresWithin30Days
+        expr: |
+          (
+            daily_quiz_api_identity_mtls_certificate_expiry_timestamp_seconds{job="daily-quiz-api"} - time()
+          ) < 2592000
+          and
+          (
+            daily_quiz_api_identity_mtls_certificate_expiry_timestamp_seconds{job="daily-quiz-api"} - time()
+          ) >= 1209600
+        labels:
+          severity: warning
+          service: daily-quiz-api
+        annotations:
+          summary: Identity mTLS certificate expires within 30 days
+          description: The configured identity mTLS client certificate expires in fewer than 30 days.
+
+      - alert: DailyQuizIdentityMtlsCertificateExpiresWithin14Days
+        expr: |
+          (
+            daily_quiz_api_identity_mtls_certificate_expiry_timestamp_seconds{job="daily-quiz-api"} - time()
+          ) < 1209600
+          and
+          (
+            daily_quiz_api_identity_mtls_certificate_expiry_timestamp_seconds{job="daily-quiz-api"} - time()
+          ) >= 604800
+        labels:
+          severity: critical
+          service: daily-quiz-api
+        annotations:
+          summary: Identity mTLS certificate expires within 14 days
+          description: The configured identity mTLS client certificate expires in fewer than 14 days.
+
+      - alert: DailyQuizIdentityMtlsCertificateExpiresWithin7Days
+        expr: |
+          (
+            daily_quiz_api_identity_mtls_certificate_expiry_timestamp_seconds{job="daily-quiz-api"} - time()
+          ) < 604800
+        labels:
+          severity: critical
+          service: daily-quiz-api
+        annotations:
+          summary: Identity mTLS certificate expires within 7 days
+          description: The configured identity mTLS client certificate expires in fewer than 7 days or has expired.
+
+      - alert: DailyQuizDailySetNotReady
+        expr: |
+          sum(increase(daily_quiz_api_operational_blocks_total{job="daily-quiz-api",reason="daily_set_not_ready"}[5m])) > 0
+        labels:
+          severity: critical
+          service: daily-quiz-api
+        annotations:
+          summary: A request was blocked because the daily set was not ready
+          description: At least one daily request encountered a not-ready daily set during the last 5 minutes.
+
+      - alert: DailyQuizApiP95LatencyReleaseStop
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (
+              rate(daily_quiz_api_http_request_duration_seconds_bucket{job="daily-quiz-api"}[5m])
+            )
+          ) > 1
+        for: 10m
+        labels:
+          severity: critical
+          service: daily-quiz-api
+          release_gate: stop
+        annotations:
+          summary: Daily Quiz API p95 latency crossed the release-stop threshold
+          description: The 5-minute p95 request latency has remained above 1 second for 10 minutes.
+
+      - alert: DailyQuizNotificationOutboxPendingHigh
+        expr: daily_quiz_api_notification_outbox_pending{job="daily-quiz-api"} > 100
+        for: 10m
+        labels:
+          severity: warning
+          service: daily-quiz-api
+        annotations:
+          summary: Notification outbox pending backlog is high
+          description: More than 100 notification rows have remained pending for 10 minutes.
+
+      - alert: DailyQuizNotificationOutboxOldestPendingTooOld
+        expr: daily_quiz_api_notification_outbox_oldest_pending_age_seconds{job="daily-quiz-api"} > 300
+        for: 5m
+        labels:
+          severity: critical
+          service: daily-quiz-api
+        annotations:
+          summary: Oldest pending notification is too old
+          description: The oldest pending notification has remained older than 5 minutes for 5 minutes.
+
+      - alert: DailyQuizNotificationOutboxFailedIncreased
+        expr: delta(daily_quiz_api_notification_outbox_failed{job="daily-quiz-api"}[15m]) > 0
+        labels:
+          severity: warning
+          service: daily-quiz-api
+        annotations:
+          summary: Notification outbox failed count increased
+          description: The current failed notification row count increased during the last 15 minutes.
+
+      - alert: DailyQuizCleanupLastSuccessTooOld
+        expr: |
+          daily_quiz_api_operation_task_last_success_age_seconds{job="daily-quiz-api",task="cleanup"} >= 93600
+          or
+          absent(daily_quiz_api_operation_task_last_success_age_seconds{job="daily-quiz-api",task="cleanup"})
+        for: 10m
+        labels:
+          severity: critical
+          service: daily-quiz-api
+        annotations:
+          summary: Cleanup has not succeeded within 26 hours
+          description: The cleanup ledger is missing or its last successful run is at least 26 hours old.
+
+      - alert: DailyQuizOperationTaskConsecutiveFailures
+        expr: daily_quiz_api_operation_task_consecutive_failures{job="daily-quiz-api"} > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: daily-quiz-api
+        annotations:
+          summary: An operation task is repeatedly failing
+          description: An allowlisted operation task has reported consecutive failures for 5 minutes.

@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  pull_request:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:18.6
+        env:
+          POSTGRES_USER: daily_quiz
+          POSTGRES_PASSWORD: daily_quiz_ci
+          POSTGRES_DB: daily_quiz
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U daily_quiz -d daily_quiz"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+      redis:
+        image: redis:8.2-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      APP_ENV: development
+      DATABASE_URL: postgres://daily_quiz:daily_quiz_ci@127.0.0.1:5432/daily_quiz
+      TEST_DATABASE_ADMIN_URL: postgres://daily_quiz:daily_quiz_ci@127.0.0.1:5432/postgres
+      TEST_REDIS_URL: redis://127.0.0.1:6379/15
+      IDENTITY_VERIFICATION_MODE: mock
+      RATE_LIMIT_ENABLED: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.24.0
+          run_install: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      - name: Format
+        run: pnpm format:check
+      - name: Lint
+        run: pnpm lint
+      - name: Typecheck
+        run: pnpm typecheck
+      - name: Dependency audit
+        run: pnpm audit --audit-level high
+      - name: PostgreSQL integration tests
+        run: pnpm test:integration
+      - name: Production build
+        run: pnpm build
+      - name: Deployment configuration
+        run: |
+          docker compose --profile local-app config --quiet
+          docker compose --profile operations config --quiet
+          docker compose --profile monitoring config --quiet
+          docker build -f apps/api/Dockerfile .
+      - name: Prometheus configuration
+        run: >-
+          docker run --rm --entrypoint promtool
+          -v "${PWD}/ops/monitoring:/etc/prometheus:ro"
+          prom/prometheus:v3.5.0
+          check config /etc/prometheus/prometheus.yml
+      - name: Backup rehearsal script static check
+        run: >-
+          docker run --rm
+          -v "${PWD}:/mnt:ro"
+          koalaman/shellcheck-alpine:v0.10.0
+          shellcheck /mnt/ops/backup-rehearsal.sh
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

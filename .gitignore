@@ -1,6 +1,7 @@
 # Private planning and development references
 # This repository intentionally keeps the entire docs tree out of Git.
 /docs/
+/assets
 
 # Dependencies and package-manager state
 node_modules/
@@ -62,7 +63,8 @@ pnpm-debug.log*
 Thumbs.db
 Desktop.ini
 
-# IDE state
+# IDE and agent tooling state
+.gjc/
 .idea/
 .vscode/*
 !.vscode/extensions.json

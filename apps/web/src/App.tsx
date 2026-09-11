@@ -1,19 +1,77 @@
 import {
+  type ChallengeLandingResponse,
+  type ChallengeResultResponse,
   type CompleteAttemptResponse,
   type DailyStartResponse,
   type PublicQuestion,
 } from "@daily-quiz-battle/contracts";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  type Ref,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import {
   ApiClientError,
+  claimChallenge,
   completeAttempt,
+  createChallenge,
   createIdempotencyKey,
+  deleteAccount,
+  getChallengeLanding,
+  getChallengeResult,
+  getResultNotificationPreference,
+  isDailySetVoidedError,
   startDailyQuiz,
   submitAnswer,
+  updateResultNotificationPreference,
 } from "./lib/api";
+import {
+  ChallengeIssueScreen,
+  ChallengeLandingScreen,
+  ChallengeResultScreen,
+  ChallengeWaitingScreen,
+  VoidedResultScreen,
+  type ChallengeIssueKind,
+} from "./ChallengeScreens";
+import { AccountSettings } from "./AccountSettings";
+import { QuestionReport } from "./QuestionReport";
+import {
+  logAnalyticsEvent,
+  requestResultNotificationAgreement,
+  shareChallenge,
+} from "./lib/platform";
 import "./App.css";
 
-type Screen = "loading" | "home" | "quiz" | "result" | "error";
+type Screen =
+  | "loading"
+  | "home"
+  | "quiz"
+  | "result"
+  | "settings"
+  | "deleted"
+  | "error"
+  | "challenge-landing"
+  | "challenge-waiting"
+  | "challenge-result"
+  | "challenge-issue"
+  | "voided";
+
+type AvailableDaily = Extract<DailyStartResponse, { status: "available" }>;
+type CompletedResult = Extract<
+  CompleteAttemptResponse,
+  { status: "completed" }
+>;
+type ActiveChallengeLanding = Exclude<
+  ChallengeLandingResponse,
+  { status: "voided" }
+>;
+type ActiveChallengeResult = Exclude<
+  ChallengeResultResponse,
+  { status: "voided" }
+>;
 
 interface DisplayError {
   title: string;
@@ -26,6 +84,41 @@ interface PendingAnswer {
   sequence: number;
   revisionId: string;
   selectedIndex: number;
+}
+
+const challengePathPattern = /^\/challenge\/([A-Za-z0-9_-]{43})\/?$/;
+let capturedInitialChallengeToken: string | null | undefined;
+
+function takeInitialChallengeToken(): string | null {
+  if (capturedInitialChallengeToken !== undefined) {
+    return capturedInitialChallengeToken;
+  }
+
+  const match = challengePathPattern.exec(window.location.pathname);
+  capturedInitialChallengeToken = match?.[1] ?? null;
+  if (capturedInitialChallengeToken !== null) {
+    window.history.replaceState(null, "", "/challenge");
+  }
+  return capturedInitialChallengeToken;
+}
+
+function challengeIssueFromError(error: unknown): ChallengeIssueKind | null {
+  if (!(error instanceof ApiClientError)) {
+    return null;
+  }
+  if (error.code === "SELF_CLAIM_FORBIDDEN") {
+    return "self";
+  }
+  if (error.code === "ALREADY_CLAIMED") {
+    return "already-claimed";
+  }
+  if (error.code === "CHALLENGE_NOT_FOUND") {
+    return "not-found";
+  }
+  if (error.code === "ATTEMPT_ABANDONED") {
+    return "expired";
+  }
+  return null;
 }
 
 function toDisplayError(error: unknown): DisplayError {
@@ -45,18 +138,36 @@ function toDisplayError(error: unknown): DisplayError {
   };
 }
 
-function LoadingScreen() {
+function assertNever(value: never): never {
+  throw new Error(`처리할 수 없는 응답 상태입니다: ${JSON.stringify(value)}`);
+}
+
+function LoadingScreen({
+  headingRef,
+  challenge,
+}: {
+  headingRef: Ref<HTMLHeadingElement>;
+  challenge: boolean;
+}) {
   return (
     <main className="app-shell" aria-busy="true">
       <section className="card loading-card" aria-labelledby="loading-title">
         <div className="brand-mark" aria-hidden="true">
           Q
         </div>
-        <h1 id="loading-title">오늘의 퀴즈를 준비하고 있어요</h1>
+        <h1 id="loading-title" ref={headingRef} tabIndex={-1}>
+          {challenge
+            ? "도전장을 확인하고 있어요"
+            : "오늘의 퀴즈를 준비하고 있어요"}
+        </h1>
         <div className="loading-bar" aria-hidden="true">
           <span />
         </div>
-        <p>서버에서 같은 5문제를 안전하게 불러오는 중이에요.</p>
+        <p aria-live="polite">
+          {challenge
+            ? "참여 가능한 도전인지 안전하게 확인하는 중이에요."
+            : "서버에서 같은 5문제를 안전하게 불러오는 중이에요."}
+        </p>
       </section>
     </main>
   );
@@ -66,10 +177,12 @@ function ErrorPanel({
   error,
   onRetry,
   busy,
+  headingRef,
 }: {
   error: DisplayError;
   onRetry: () => void;
   busy: boolean;
+  headingRef: Ref<HTMLHeadingElement>;
 }) {
   return (
     <main className="app-shell">
@@ -77,7 +190,9 @@ function ErrorPanel({
         <span className="status-icon status-icon-error" aria-hidden="true">
           !
         </span>
-        <h1>{error.title}</h1>
+        <h1 ref={headingRef} tabIndex={-1}>
+          {error.title}
+        </h1>
         <p>{error.message}</p>
         {error.requestId ? (
           <p className="request-id">문의 코드: {error.requestId}</p>
@@ -93,9 +208,13 @@ function ErrorPanel({
 function HomeScreen({
   daily,
   onStart,
+  onSettings,
+  headingRef,
 }: {
-  daily: DailyStartResponse;
+  daily: AvailableDaily;
   onStart: () => void;
+  onSettings: () => void;
+  headingRef: Ref<HTMLHeadingElement>;
 }) {
   const answeredCount = daily.attempt.answeredCount;
   const isResume = answeredCount > 0;
@@ -114,7 +233,9 @@ function HomeScreen({
 
       <section className="hero-card" aria-labelledby="home-title">
         <p className="eyebrow">DAILY QUIZ · 5 QUESTIONS</p>
-        <h1 id="home-title">오늘 5문제, 얼마나 맞힐까요?</h1>
+        <h1 id="home-title" ref={headingRef} tabIndex={-1}>
+          오늘 5문제, 얼마나 맞힐까요?
+        </h1>
         <p className="hero-copy">
           모두에게 같은 문제가 제공돼요. 1~2분이면 오늘의 상식 점수를 확인할 수
           있어요.
@@ -145,6 +266,9 @@ function HomeScreen({
         <button className="primary-button hero-button" onClick={onStart}>
           {isResume ? "이어서 풀기" : "오늘 퀴즈 시작"}
         </button>
+        <button className="text-button" onClick={onSettings}>
+          계정 설정
+        </button>
         <p className="trust-copy">
           제출한 답은 바꿀 수 없으며 점수는 서버가 계산해요.
         </p>
@@ -161,14 +285,16 @@ function QuizScreen({
   onComplete,
   busy,
   actionError,
+  headingRef,
 }: {
-  daily: DailyStartResponse;
+  daily: AvailableDaily;
   selectedIndex: number | null;
   onSelect: (index: number) => void;
   onSubmit: () => void;
   onComplete: () => void;
   busy: boolean;
   actionError: DisplayError | null;
+  headingRef: Ref<HTMLHeadingElement>;
 }) {
   const answeredCount = daily.attempt.answeredCount;
   const question: PublicQuestion | undefined = daily.questions[answeredCount];
@@ -180,7 +306,9 @@ function QuizScreen({
           <span className="status-icon status-icon-success" aria-hidden="true">
             ✓
           </span>
-          <h1>5문제를 모두 저장했어요</h1>
+          <h1 ref={headingRef} tabIndex={-1}>
+            5문제를 모두 저장했어요
+          </h1>
           <p>서버에서 정답을 확인하고 점수를 계산할게요.</p>
           {actionError ? (
             <div className="inline-error" role="alert">
@@ -214,7 +342,7 @@ function QuizScreen({
 
       <section className="question-card" aria-labelledby="question-title">
         <p className="category-label">오늘의 상식</p>
-        <h1 id="question-title" tabIndex={-1}>
+        <h1 id="question-title" ref={headingRef} tabIndex={-1}>
           {question.prompt}
         </h1>
 
@@ -279,11 +407,34 @@ function ResultScreen({
   daily,
   result,
   onRestart,
+  onSettings,
+  onShare,
+  onChallengeStatus,
+  challengeCreated,
+  busy,
+  actionError,
+  shareMessage,
+  reportPending,
+  onReportPendingChange,
+  headingRef,
 }: {
-  daily: DailyStartResponse;
-  result: CompleteAttemptResponse;
+  daily: AvailableDaily;
+  result: CompletedResult;
   onRestart: () => void;
+  onSettings: () => void;
+  onShare: () => void;
+  onChallengeStatus: () => void;
+  challengeCreated: boolean;
+  busy: boolean;
+  actionError: DisplayError | null;
+  shareMessage: string | null;
+  reportPending: boolean;
+  onReportPendingChange: (pending: boolean) => void;
+  headingRef: Ref<HTMLHeadingElement>;
 }) {
+  const [openReportSequence, setOpenReportSequence] = useState<number | null>(
+    null,
+  );
   const resultLabel =
     result.score === 5
       ? "완벽해요! 오늘의 상식 챔피언"
@@ -295,7 +446,9 @@ function ResultScreen({
     <main className="app-shell result-shell">
       <section className="result-hero" aria-labelledby="result-title">
         <p className="eyebrow">TODAY&apos;S RESULT</p>
-        <h1 id="result-title">오늘 퀴즈 완료!</h1>
+        <h1 id="result-title" ref={headingRef} tabIndex={-1}>
+          오늘 퀴즈 완료!
+        </h1>
         <div
           className="score-circle"
           aria-label={`5문제 중 ${result.score}문제 정답`}
@@ -348,6 +501,16 @@ function ResultScreen({
                   ) : null}
                 </dl>
                 <p className="explanation">{item.explanation}</p>
+                {question ? (
+                  <QuestionReport
+                    sequence={item.sequence}
+                    questionRevisionId={question.revisionId}
+                    open={openReportSequence === item.sequence}
+                    onOpen={() => setOpenReportSequence(item.sequence)}
+                    onClose={() => setOpenReportSequence(null)}
+                    onPendingChange={onReportPendingChange}
+                  />
+                ) : null}
               </li>
             );
           })}
@@ -355,10 +518,52 @@ function ResultScreen({
       </section>
 
       <section className="next-step-card">
-        <strong>친구 대결은 다음 개발 단계에서 연결돼요.</strong>
-        <span>지금은 오늘 점수와 서버 저장·복구 흐름까지 완성됐습니다.</span>
-        <button className="secondary-button" onClick={onRestart}>
+        <strong>친구와 오늘 점수로 대결해 보세요.</strong>
+        <span>도전장을 받은 친구는 같은 날짜의 같은 5문제를 풀게 돼요.</span>
+        {actionError ? (
+          <div className="inline-error" role="alert">
+            <strong>{actionError.title}</strong>
+            <span>{actionError.message}</span>
+          </div>
+        ) : null}
+        {shareMessage ? (
+          <p className="challenge-live-status" aria-live="polite">
+            {shareMessage}
+          </p>
+        ) : null}
+        <button
+          className="primary-button"
+          onClick={onShare}
+          disabled={busy || reportPending}
+        >
+          {busy
+            ? "도전장을 준비하는 중…"
+            : challengeCreated
+              ? "도전장 다시 공유"
+              : "친구에게 도전장 보내기"}
+        </button>
+        {challengeCreated ? (
+          <button
+            className="secondary-button"
+            onClick={onChallengeStatus}
+            disabled={busy || reportPending}
+          >
+            대결 현황 보기
+          </button>
+        ) : null}
+        <button
+          className="text-button"
+          onClick={onRestart}
+          disabled={busy || reportPending}
+        >
           저장된 결과 다시 불러오기
+        </button>
+        <button
+          className="text-button"
+          onClick={onSettings}
+          disabled={busy || reportPending}
+        >
+          계정 설정
         </button>
       </section>
     </main>
@@ -367,25 +572,151 @@ function ResultScreen({
 
 function App() {
   const [screen, setScreen] = useState<Screen>("loading");
-  const [daily, setDaily] = useState<DailyStartResponse | null>(null);
-  const [result, setResult] = useState<CompleteAttemptResponse | null>(null);
+  const [daily, setDaily] = useState<AvailableDaily | null>(null);
+  const [result, setResult] = useState<CompletedResult | null>(null);
+  const [challengeToken, setChallengeToken] = useState<string | null>(
+    takeInitialChallengeToken,
+  );
+  const [challengeLanding, setChallengeLanding] =
+    useState<ActiveChallengeLanding | null>(null);
+  const [challengeResult, setChallengeResult] =
+    useState<ActiveChallengeResult | null>(null);
+  const [challengeRole, setChallengeRole] = useState<
+    "creator" | "opponent" | null
+  >(null);
+  const [challengeIssue, setChallengeIssue] =
+    useState<ChallengeIssueKind>("not-found");
   const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
   const [busy, setBusy] = useState(false);
+  const [refreshingChallenge, setRefreshingChallenge] = useState(false);
+  const [pollingPaused, setPollingPaused] = useState(document.hidden);
+  const [shareMessage, setShareMessage] = useState<string | null>(null);
   const [fatalError, setFatalError] = useState<DisplayError | null>(null);
   const [actionError, setActionError] = useState<DisplayError | null>(null);
-  const initialized = useRef(false);
+  const [notificationEnabled, setNotificationEnabled] = useState<
+    boolean | null
+  >(null);
+  const [notificationDeliveryAvailable, setNotificationDeliveryAvailable] =
+    useState(false);
+  const [notificationBusy, setNotificationBusy] = useState(false);
+  const [reportPending, setReportPending] = useState(false);
+  const [notificationError, setNotificationError] =
+    useState<DisplayError | null>(null);
+  const [settingsReturnScreen, setSettingsReturnScreen] = useState<
+    "home" | "result"
+  >("home");
+  const accountDeleted = useRef(false);
+  const initialChallengeToken = useRef(challengeToken);
+  const initializationGeneration = useRef(0);
+  const initializationAbort = useRef<AbortController | null>(null);
   const pendingAnswer = useRef<PendingAnswer | null>(null);
   const pendingCompleteKey = useRef<string | null>(null);
+  const pendingChallengeCreateKey = useRef<string | null>(null);
+  const pendingClaimKey = useRef<string | null>(null);
+  const notificationAgreementAbort = useRef<AbortController | null>(null);
+  const loggedDailyCompletions = useRef(new Set<string>());
+  const loggedChallengeCompletion = useRef(false);
+  const completionAnalyticsBlocked = useRef(false);
+  const mainHeading = useRef<HTMLHeadingElement>(null);
+  const lastFocusedHeading = useRef<string | null>(null);
 
-  const initialize = useCallback(async () => {
+  const showVoidedResult = useCallback(() => {
+    initializationAbort.current?.abort();
+    initializationAbort.current = null;
+    initializationGeneration.current += 1;
+    completionAnalyticsBlocked.current = true;
+    setDaily(null);
+    setResult(null);
+    setChallengeToken(null);
+    setChallengeLanding(null);
+    setChallengeResult(null);
+    setChallengeRole(null);
+    setSelectedIndex(null);
+    setShareMessage(null);
+    setFatalError(null);
+    setActionError(null);
+    setReportPending(false);
+    setRefreshingChallenge(false);
+    setPollingPaused(true);
+    pendingAnswer.current = null;
+    pendingCompleteKey.current = null;
+    pendingChallengeCreateKey.current = null;
+    pendingClaimKey.current = null;
+    setBusy(false);
+    setScreen("voided");
+  }, []);
+
+  const showChallengeResult = useCallback(
+    (loadedResult: ChallengeResultResponse) => {
+      switch (loadedResult.status) {
+        case "voided":
+          showVoidedResult();
+          return;
+        case "completed":
+          setChallengeResult(loadedResult);
+          setChallengeRole(loadedResult.viewerRole);
+          if (
+            !completionAnalyticsBlocked.current &&
+            !loggedChallengeCompletion.current
+          ) {
+            loggedChallengeCompletion.current = true;
+            void logAnalyticsEvent("complete_challenge", {
+              role: loadedResult.viewerRole,
+              outcome: loadedResult.outcome,
+            });
+          }
+          setScreen("challenge-result");
+          return;
+        case "redacted":
+          setChallengeResult(loadedResult);
+          setChallengeRole(loadedResult.viewerRole);
+          setScreen("challenge-result");
+          return;
+        case "open":
+        case "claimed":
+          setChallengeResult(loadedResult);
+          setChallengeRole(loadedResult.viewerRole);
+          setPollingPaused(document.hidden);
+          setScreen("challenge-waiting");
+          return;
+        default:
+          assertNever(loadedResult);
+      }
+    },
+    [showVoidedResult],
+  );
+
+  const initializeDaily = useCallback(async () => {
+    initializationAbort.current?.abort();
+    const controller = new AbortController();
+    initializationAbort.current = controller;
+    const generation = ++initializationGeneration.current;
+    const isCurrent = () =>
+      !controller.signal.aborted &&
+      initializationGeneration.current === generation &&
+      !accountDeleted.current;
+
     setBusy(true);
     setScreen("loading");
     setFatalError(null);
     setActionError(null);
 
     try {
-      const loadedDaily = await startDailyQuiz();
-      setDaily(loadedDaily);
+      const loadedDaily = await startDailyQuiz(controller.signal);
+      if (!isCurrent()) {
+        return;
+      }
+      switch (loadedDaily.status) {
+        case "voided":
+          showVoidedResult();
+          return;
+        case "available":
+          completionAnalyticsBlocked.current = false;
+          setDaily(loadedDaily);
+          break;
+        default:
+          assertNever(loadedDaily);
+      }
       setSelectedIndex(null);
 
       if (loadedDaily.attempt.status === "abandoned") {
@@ -398,32 +729,194 @@ function App() {
         const loadedResult = await completeAttempt(
           loadedDaily.attempt.id,
           createIdempotencyKey("complete-resume"),
+          controller.signal,
         );
-        setResult(loadedResult);
-        setScreen("result");
+        if (!isCurrent()) {
+          return;
+        }
+        switch (loadedResult.status) {
+          case "voided":
+            showVoidedResult();
+            return;
+          case "completed":
+            setResult(loadedResult);
+            setScreen("result");
+            break;
+          default:
+            assertNever(loadedResult);
+        }
       } else {
         setResult(null);
         setScreen("home");
       }
     } catch (error) {
+      if (!isCurrent()) {
+        return;
+      }
+      if (isDailySetVoidedError(error)) {
+        showVoidedResult();
+        return;
+      }
       setFatalError(toDisplayError(error));
       setScreen("error");
     } finally {
-      setBusy(false);
+      if (isCurrent()) {
+        initializationAbort.current = null;
+        setBusy(false);
+      }
     }
-  }, []);
+  }, [showVoidedResult]);
+
+  const initializeChallenge = useCallback(
+    async (token: string) => {
+      initializationAbort.current?.abort();
+      const controller = new AbortController();
+      initializationAbort.current = controller;
+      const generation = ++initializationGeneration.current;
+      const isCurrent = () =>
+        !controller.signal.aborted &&
+        initializationGeneration.current === generation &&
+        !accountDeleted.current;
+
+      setBusy(true);
+      setScreen("loading");
+      setFatalError(null);
+      setActionError(null);
+
+      try {
+        const landing = await getChallengeLanding(token, controller.signal);
+        if (!isCurrent()) {
+          return;
+        }
+        switch (landing.status) {
+          case "voided":
+            showVoidedResult();
+            return;
+          case "expired":
+            setChallengeLanding(landing);
+            setChallengeIssue("expired");
+            setScreen("challenge-issue");
+            return;
+          case "open":
+          case "claimed":
+          case "completed":
+            completionAnalyticsBlocked.current = false;
+            setChallengeLanding(landing);
+            break;
+          default:
+            assertNever(landing);
+        }
+        if (landing.viewerRole === "none") {
+          if (landing.status === "open") {
+            setScreen("challenge-landing");
+          } else {
+            setChallengeIssue("already-claimed");
+            setScreen("challenge-issue");
+          }
+          return;
+        }
+
+        setChallengeRole(landing.viewerRole);
+        if (landing.viewerRole === "opponent" && landing.status === "claimed") {
+          const resumed = await claimChallenge(
+            token,
+            createIdempotencyKey("claim-resume"),
+            controller.signal,
+          );
+          if (!isCurrent()) {
+            return;
+          }
+          setDaily(resumed.daily);
+          setResult(null);
+          setSelectedIndex(null);
+          if (resumed.daily.attempt.status !== "completed") {
+            setScreen("quiz");
+            return;
+          }
+        }
+        const loadedResult = await getChallengeResult(token, controller.signal);
+        if (!isCurrent()) {
+          return;
+        }
+        showChallengeResult(loadedResult);
+      } catch (error) {
+        if (!isCurrent()) {
+          return;
+        }
+        if (isDailySetVoidedError(error)) {
+          showVoidedResult();
+          return;
+        }
+        const issue = challengeIssueFromError(error);
+        if (issue !== null) {
+          setChallengeIssue(issue);
+          setScreen("challenge-issue");
+        } else {
+          setFatalError(toDisplayError(error));
+          setScreen("error");
+        }
+      } finally {
+        if (isCurrent()) {
+          initializationAbort.current = null;
+          setBusy(false);
+        }
+      }
+    },
+    [showChallengeResult, showVoidedResult],
+  );
 
   useEffect(() => {
-    if (initialized.current) {
-      return;
-    }
-    initialized.current = true;
-    void initialize();
-  }, [initialize]);
+    const token = initialChallengeToken.current;
+    const timer = window.setTimeout(() => {
+      if (token === null) {
+        void initializeDaily();
+      } else {
+        void initializeChallenge(token);
+      }
+    }, 0);
+    return () => {
+      window.clearTimeout(timer);
+      initializationAbort.current?.abort();
+      initializationAbort.current = null;
+      initializationGeneration.current += 1;
+    };
+  }, [initializeChallenge, initializeDaily]);
 
   const currentQuestion = useMemo(
     () => daily?.questions[daily.attempt.answeredCount],
     [daily],
+  );
+  const headingFocusKey =
+    screen === "quiz"
+      ? `quiz:${daily?.attempt.id ?? "unknown"}:${currentQuestion?.revisionId ?? "complete"}`
+      : screen === "challenge-waiting"
+        ? "challenge-waiting"
+        : screen;
+
+  useEffect(() => {
+    if (
+      lastFocusedHeading.current === headingFocusKey ||
+      mainHeading.current === null
+    ) {
+      return;
+    }
+
+    mainHeading.current.focus();
+    lastFocusedHeading.current = headingFocusKey;
+  }, [headingFocusKey]);
+
+  const recordDailyCompletion = useCallback(
+    (attemptId: string, source: "solo" | "challenge") => {
+      if (
+        completionAnalyticsBlocked.current ||
+        loggedDailyCompletions.current.has(attemptId)
+      ) {
+        return;
+      }
+      loggedDailyCompletions.current.add(attemptId);
+      void logAnalyticsEvent("complete_daily_quiz", { source });
+    },
+    [],
   );
 
   const handleComplete = useCallback(async () => {
@@ -441,6 +934,18 @@ function App() {
         pendingCompleteKey.current,
       );
       pendingCompleteKey.current = null;
+      switch (completed.status) {
+        case "voided":
+          showVoidedResult();
+          return;
+        case "completed":
+          break;
+        default:
+          assertNever(completed);
+      }
+      if (completionAnalyticsBlocked.current) {
+        return;
+      }
       setResult(completed);
       setDaily((current) =>
         current === null
@@ -454,14 +959,42 @@ function App() {
               },
             },
       );
-      setScreen("result");
+      if (challengeToken !== null && challengeRole === "opponent") {
+        try {
+          showChallengeResult(await getChallengeResult(challengeToken));
+          recordDailyCompletion(daily.attempt.id, "challenge");
+        } catch (challengeError) {
+          if (isDailySetVoidedError(challengeError)) {
+            showVoidedResult();
+            return;
+          }
+          recordDailyCompletion(daily.attempt.id, "challenge");
+          setActionError(toDisplayError(challengeError));
+          setChallengeResult(null);
+          setScreen("challenge-waiting");
+        }
+      } else {
+        recordDailyCompletion(daily.attempt.id, "solo");
+        setScreen("result");
+      }
     } catch (error) {
+      if (isDailySetVoidedError(error)) {
+        showVoidedResult();
+        return;
+      }
       setActionError(toDisplayError(error));
       setScreen("quiz");
     } finally {
       setBusy(false);
     }
-  }, [daily]);
+  }, [
+    challengeRole,
+    challengeToken,
+    daily,
+    recordDailyCompletion,
+    showChallengeResult,
+    showVoidedResult,
+  ]);
 
   const handleSubmit = useCallback(async () => {
     if (
@@ -489,6 +1022,11 @@ function App() {
             selectedIndex,
           };
     pendingAnswer.current = pending;
+    if (existing === pending) {
+      void logAnalyticsEvent("answer_retry", {
+        source: challengeRole === "opponent" ? "challenge" : "solo",
+      });
+    }
 
     try {
       const saved = await submitAnswer(
@@ -500,6 +1038,9 @@ function App() {
         },
         pending.key,
       );
+      if (completionAnalyticsBlocked.current) {
+        return;
+      }
       pendingAnswer.current = null;
       setSelectedIndex(null);
 
@@ -530,23 +1071,738 @@ function App() {
         }, 0);
       }
     } catch (error) {
-      const displayError = toDisplayError(error);
-      setActionError(displayError);
+      if (isDailySetVoidedError(error)) {
+        showVoidedResult();
+        return;
+      }
       if (
         error instanceof ApiClientError &&
-        ["ANSWER_ALREADY_SUBMITTED", "ANSWER_OUT_OF_ORDER"].includes(error.code)
+        (error.code === "ANSWER_ALREADY_SUBMITTED" ||
+          error.code === "ANSWER_OUT_OF_ORDER")
       ) {
         pendingAnswer.current = null;
+
+        try {
+          const loadedDaily =
+            challengeToken !== null && challengeRole === "opponent"
+              ? (
+                  await claimChallenge(
+                    challengeToken,
+                    createIdempotencyKey("claim-recovery"),
+                  )
+                ).daily
+              : await startDailyQuiz();
+          switch (loadedDaily.status) {
+            case "voided":
+              showVoidedResult();
+              return;
+            case "available":
+              setDaily(loadedDaily);
+              break;
+            default:
+              assertNever(loadedDaily);
+          }
+          setSelectedIndex(null);
+          setResult(null);
+          setActionError(null);
+
+          if (loadedDaily.attempt.status === "abandoned") {
+            setFatalError(
+              toDisplayError(
+                new Error(
+                  "오늘 퀴즈의 완료 가능 시간이 지났어요. 새 퀴즈를 기다려 주세요.",
+                ),
+              ),
+            );
+            setScreen("error");
+            return;
+          }
+
+          if (
+            loadedDaily.attempt.status === "completed" ||
+            loadedDaily.attempt.answeredCount === loadedDaily.questions.length
+          ) {
+            pendingCompleteKey.current ??=
+              createIdempotencyKey("complete-recovery");
+            const completed = await completeAttempt(
+              loadedDaily.attempt.id,
+              pendingCompleteKey.current,
+            );
+            pendingCompleteKey.current = null;
+            switch (completed.status) {
+              case "voided":
+                showVoidedResult();
+                return;
+              case "completed":
+                break;
+              default:
+                assertNever(completed);
+            }
+            if (completionAnalyticsBlocked.current) {
+              return;
+            }
+            setDaily({
+              ...loadedDaily,
+              attempt: {
+                ...loadedDaily.attempt,
+                status: "completed",
+                score: completed.score,
+              },
+            });
+            setResult(completed);
+            if (challengeToken !== null && challengeRole === "opponent") {
+              try {
+                showChallengeResult(await getChallengeResult(challengeToken));
+                recordDailyCompletion(loadedDaily.attempt.id, "challenge");
+              } catch (challengeError) {
+                if (isDailySetVoidedError(challengeError)) {
+                  showVoidedResult();
+                  return;
+                }
+                recordDailyCompletion(loadedDaily.attempt.id, "challenge");
+                throw challengeError;
+              }
+            } else {
+              recordDailyCompletion(loadedDaily.attempt.id, "solo");
+              setScreen("result");
+            }
+          } else {
+            setScreen(
+              challengeRole === "opponent"
+                ? "quiz"
+                : loadedDaily.attempt.answeredCount === 0
+                  ? "home"
+                  : "quiz",
+            );
+          }
+        } catch (recoveryError) {
+          if (isDailySetVoidedError(recoveryError)) {
+            showVoidedResult();
+            return;
+          }
+          setActionError(toDisplayError(recoveryError));
+          setScreen("quiz");
+        }
+      } else {
+        setActionError(toDisplayError(error));
       }
     } finally {
       setBusy(false);
     }
-  }, [currentQuestion, daily, handleComplete, selectedIndex]);
+  }, [
+    challengeRole,
+    challengeToken,
+    currentQuestion,
+    daily,
+    handleComplete,
+    recordDailyCompletion,
+    selectedIndex,
+    showChallengeResult,
+    showVoidedResult,
+  ]);
+
+  const handleClaim = useCallback(async () => {
+    if (challengeToken === null) {
+      return;
+    }
+
+    setBusy(true);
+    setActionError(null);
+    pendingClaimKey.current ??= createIdempotencyKey("claim");
+
+    try {
+      const claimed = await claimChallenge(
+        challengeToken,
+        pendingClaimKey.current,
+      );
+      if (completionAnalyticsBlocked.current) {
+        return;
+      }
+      pendingClaimKey.current = null;
+      setDaily(claimed.daily);
+      setResult(null);
+      setSelectedIndex(null);
+      setChallengeRole("opponent");
+      void logAnalyticsEvent("claim_challenge", { role: "opponent" });
+
+      if (
+        claimed.challenge.status === "completed" ||
+        claimed.daily.attempt.status === "completed"
+      ) {
+        showChallengeResult(await getChallengeResult(challengeToken));
+      } else {
+        setScreen("quiz");
+      }
+    } catch (error) {
+      if (isDailySetVoidedError(error)) {
+        showVoidedResult();
+        return;
+      }
+      const issue = challengeIssueFromError(error);
+      if (issue !== null) {
+        pendingClaimKey.current = null;
+        void logAnalyticsEvent("claim_conflict", {
+          reason: error instanceof ApiClientError ? error.code : "unknown",
+        });
+        setChallengeIssue(issue);
+        setScreen("challenge-issue");
+      } else {
+        setActionError(toDisplayError(error));
+      }
+    } finally {
+      setBusy(false);
+    }
+  }, [challengeToken, showChallengeResult, showVoidedResult]);
+
+  const handleShareChallenge = useCallback(async () => {
+    if (challengeToken === null && (daily === null || result === null)) {
+      return;
+    }
+
+    const returnScreen = screen;
+    setBusy(true);
+    setActionError(null);
+    setShareMessage(null);
+    void logAnalyticsEvent("click_share_challenge", { role: "creator" });
+
+    try {
+      let token = challengeToken;
+      if (token === null) {
+        if (daily === null) {
+          return;
+        }
+        pendingChallengeCreateKey.current ??=
+          createIdempotencyKey("create-challenge");
+        const created = await createChallenge(
+          { attemptId: daily.attempt.id },
+          pendingChallengeCreateKey.current,
+        );
+        if (completionAnalyticsBlocked.current) {
+          return;
+        }
+        pendingChallengeCreateKey.current = null;
+        token = created.challenge.token;
+        setChallengeToken(token);
+        setChallengeRole("creator");
+        setChallengeResult(null);
+        loggedChallengeCompletion.current = false;
+      }
+
+      const outcome = await shareChallenge(token);
+      if (completionAnalyticsBlocked.current) {
+        return;
+      }
+      if (outcome === "cancelled") {
+        setShareMessage("공유를 취소했어요. 만든 도전장은 그대로 유지돼요.");
+        void logAnalyticsEvent("share_challenge_cancelled", {
+          role: "creator",
+        });
+        setScreen(returnScreen);
+      } else {
+        setShareMessage("도전장을 공유했어요.");
+        void logAnalyticsEvent("share_challenge", { role: "creator" });
+        setScreen("challenge-waiting");
+      }
+    } catch (error) {
+      if (isDailySetVoidedError(error)) {
+        showVoidedResult();
+        return;
+      }
+      setActionError(toDisplayError(error));
+      setScreen(returnScreen);
+    } finally {
+      setBusy(false);
+    }
+  }, [challengeToken, daily, result, screen, showVoidedResult]);
+
+  const refreshChallengeResult = useCallback(async () => {
+    if (challengeToken === null) {
+      return;
+    }
+
+    setRefreshingChallenge(true);
+    setActionError(null);
+    try {
+      showChallengeResult(await getChallengeResult(challengeToken));
+    } catch (error) {
+      if (isDailySetVoidedError(error)) {
+        showVoidedResult();
+        return;
+      }
+      const issue = challengeIssueFromError(error);
+      if (issue !== null) {
+        setChallengeIssue(issue);
+        setScreen("challenge-issue");
+      } else {
+        setActionError(toDisplayError(error));
+      }
+    } finally {
+      setRefreshingChallenge(false);
+    }
+  }, [challengeToken, showChallengeResult, showVoidedResult]);
+
+  useEffect(() => {
+    if (screen !== "challenge-waiting" || challengeToken === null) {
+      return;
+    }
+
+    const delays = [2_000, 4_000, 8_000, 15_000, 30_000];
+    let active = true;
+    let timer: number | null = null;
+    let requestController: AbortController | null = null;
+    let delayIndex = 0;
+
+    const clearTimer = () => {
+      if (timer !== null) {
+        window.clearTimeout(timer);
+        timer = null;
+      }
+    };
+    const schedule = () => {
+      if (!active || document.hidden) {
+        return;
+      }
+      const delay = delays[Math.min(delayIndex, delays.length - 1)];
+      delayIndex += 1;
+      timer = window.setTimeout(() => void poll(), delay);
+    };
+    const poll = async () => {
+      clearTimer();
+      if (!active || document.hidden) {
+        return;
+      }
+      requestController?.abort();
+      const controller = new AbortController();
+      requestController = controller;
+      try {
+        const loadedResult = await getChallengeResult(
+          challengeToken,
+          controller.signal,
+        );
+        if (!active) {
+          return;
+        }
+        setActionError(null);
+        showChallengeResult(loadedResult);
+        switch (loadedResult.status) {
+          case "open":
+          case "claimed":
+            schedule();
+            break;
+          case "completed":
+          case "redacted":
+          case "voided":
+            break;
+          default:
+            assertNever(loadedResult);
+        }
+      } catch (error) {
+        if (
+          !active ||
+          document.hidden ||
+          (error instanceof ApiClientError && error.code === "REQUEST_ABORTED")
+        ) {
+          return;
+        }
+        if (isDailySetVoidedError(error)) {
+          showVoidedResult();
+          return;
+        }
+        const issue = challengeIssueFromError(error);
+        if (issue !== null) {
+          setChallengeIssue(issue);
+          setScreen("challenge-issue");
+        } else {
+          setActionError(toDisplayError(error));
+          schedule();
+        }
+      } finally {
+        if (requestController === controller) {
+          requestController = null;
+        }
+      }
+    };
+    const handleVisibilityChange = () => {
+      clearTimer();
+      if (document.hidden) {
+        requestController?.abort();
+        requestController = null;
+      }
+      setPollingPaused(document.hidden);
+      if (!document.hidden) {
+        delayIndex = 0;
+        void poll();
+      }
+    };
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    if (!document.hidden) {
+      void poll();
+    }
+
+    return () => {
+      active = false;
+      clearTimer();
+      requestController?.abort();
+      requestController = null;
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [challengeToken, screen, showChallengeResult, showVoidedResult]);
+
+  useEffect(() => {
+    if (screen !== "result") {
+      return;
+    }
+
+    let active = true;
+    let requestController: AbortController | null = null;
+
+    const revalidateDaily = async () => {
+      if (!active || document.hidden || requestController !== null) {
+        return;
+      }
+
+      const controller = new AbortController();
+      requestController = controller;
+      try {
+        const loadedDaily = await startDailyQuiz(controller.signal);
+        if (!active) {
+          return;
+        }
+        switch (loadedDaily.status) {
+          case "voided":
+            showVoidedResult();
+            break;
+          case "available":
+            break;
+          default:
+            assertNever(loadedDaily);
+        }
+      } catch (error) {
+        if (!active) {
+          return;
+        }
+        if (isDailySetVoidedError(error)) {
+          showVoidedResult();
+        }
+      } finally {
+        if (requestController === controller) {
+          requestController = null;
+        }
+      }
+    };
+    const handleVisibilityChange = () => {
+      if (document.hidden) {
+        requestController?.abort();
+        requestController = null;
+        return;
+      }
+      void revalidateDaily();
+    };
+    const handleFocus = () => {
+      void revalidateDaily();
+    };
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    window.addEventListener("focus", handleFocus);
+
+    return () => {
+      active = false;
+      requestController?.abort();
+      requestController = null;
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      window.removeEventListener("focus", handleFocus);
+    };
+  }, [screen, showVoidedResult]);
+
+  const handleGoToDaily = useCallback(() => {
+    setChallengeToken(null);
+    setChallengeLanding(null);
+    setChallengeResult(null);
+    setChallengeRole(null);
+    setShareMessage(null);
+    pendingClaimKey.current = null;
+    pendingChallengeCreateKey.current = null;
+    loggedChallengeCompletion.current = false;
+    void initializeDaily();
+  }, [initializeDaily]);
+
+  const handleOpenSettings = useCallback((returnScreen: "home" | "result") => {
+    setSettingsReturnScreen(returnScreen);
+    setActionError(null);
+    setScreen("settings");
+  }, []);
+
+  const loadResultNotificationPreference = useCallback(async () => {
+    setNotificationBusy(true);
+    setNotificationError(null);
+
+    try {
+      const preference = await getResultNotificationPreference();
+      setNotificationEnabled(preference.enabled);
+      setNotificationDeliveryAvailable(preference.deliveryAvailable);
+    } catch (error) {
+      setNotificationEnabled(null);
+      setNotificationDeliveryAvailable(false);
+      setNotificationError(toDisplayError(error));
+    } finally {
+      setNotificationBusy(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (screen !== "settings") {
+      return;
+    }
+
+    let active = true;
+    const timer = window.setTimeout(() => {
+      setNotificationBusy(true);
+      setNotificationError(null);
+
+      void getResultNotificationPreference()
+        .then((preference) => {
+          if (active) {
+            setNotificationEnabled(preference.enabled);
+            setNotificationDeliveryAvailable(preference.deliveryAvailable);
+          }
+        })
+        .catch((error: unknown) => {
+          if (active) {
+            setNotificationEnabled(null);
+            setNotificationDeliveryAvailable(false);
+            setNotificationError(toDisplayError(error));
+          }
+        })
+        .finally(() => {
+          if (active) {
+            setNotificationBusy(false);
+          }
+        });
+    }, 0);
+
+    return () => {
+      active = false;
+      window.clearTimeout(timer);
+      notificationAgreementAbort.current?.abort();
+      notificationAgreementAbort.current = null;
+    };
+  }, [screen]);
+
+  const handleToggleResultNotification = useCallback(async () => {
+    if (
+      busy ||
+      notificationBusy ||
+      notificationEnabled === null ||
+      (!notificationEnabled && !notificationDeliveryAvailable)
+    ) {
+      return;
+    }
+
+    setNotificationBusy(true);
+    setNotificationError(null);
+
+    try {
+      let enabled = false;
+      let agreementDenied = false;
+      if (!notificationEnabled) {
+        const controller = new AbortController();
+        notificationAgreementAbort.current = controller;
+        const agreement = await requestResultNotificationAgreement(
+          controller.signal,
+        );
+        enabled = agreement === "agreed";
+        agreementDenied = agreement === "denied";
+      }
+
+      const preference = await updateResultNotificationPreference(enabled);
+      if (preference.enabled !== enabled) {
+        throw new Error("서버가 결과 알림 설정 변경을 확인하지 못했습니다.");
+      }
+      setNotificationEnabled(preference.enabled);
+      setNotificationDeliveryAvailable(preference.deliveryAvailable);
+      if (agreementDenied) {
+        setNotificationError({
+          title: "알림 동의가 완료되지 않았어요",
+          message: "토스 동의 화면에서 거절해 결과 알림을 켜지 않았습니다.",
+        });
+      }
+    } catch (error) {
+      setNotificationDeliveryAvailable(false);
+      if (!(error instanceof DOMException && error.name === "AbortError")) {
+        setNotificationError(toDisplayError(error));
+      }
+    } finally {
+      notificationAgreementAbort.current = null;
+      setNotificationBusy(false);
+    }
+  }, [
+    busy,
+    notificationBusy,
+    notificationEnabled,
+    notificationDeliveryAvailable,
+  ]);
+
+  const handleDeleteAccount = useCallback(async () => {
+    if (busy || notificationBusy || reportPending) {
+      return;
+    }
+    setBusy(true);
+    setActionError(null);
+
+    try {
+      await deleteAccount({ confirmation: "DELETE" });
+
+      accountDeleted.current = true;
+      capturedInitialChallengeToken = null;
+      setDaily(null);
+      setResult(null);
+      setChallengeToken(null);
+      setChallengeLanding(null);
+      setChallengeResult(null);
+      setChallengeRole(null);
+      setChallengeIssue("not-found");
+      setSelectedIndex(null);
+      setSettingsReturnScreen("home");
+      setShareMessage(null);
+      setFatalError(null);
+      setNotificationEnabled(null);
+      setNotificationDeliveryAvailable(false);
+      setNotificationError(null);
+      setNotificationBusy(false);
+      setRefreshingChallenge(false);
+      setPollingPaused(document.hidden);
+      pendingAnswer.current = null;
+      pendingCompleteKey.current = null;
+      pendingChallengeCreateKey.current = null;
+      pendingClaimKey.current = null;
+      loggedDailyCompletions.current.clear();
+      loggedChallengeCompletion.current = false;
+      completionAnalyticsBlocked.current = true;
+      setScreen("deleted");
+    } catch (error) {
+      setActionError(toDisplayError(error));
+    } finally {
+      setBusy(false);
+    }
+  }, [busy, notificationBusy, reportPending]);
 
   if (screen === "loading") {
-    return <LoadingScreen />;
+    return (
+      <LoadingScreen
+        headingRef={mainHeading}
+        challenge={challengeToken !== null}
+      />
+    );
   }
-  if (screen === "error" || daily === null) {
+  if (screen === "voided") {
+    return (
+      <VoidedResultScreen onToday={handleGoToDaily} headingRef={mainHeading} />
+    );
+  }
+  if (screen === "challenge-issue") {
+    return (
+      <ChallengeIssueScreen
+        kind={challengeIssue}
+        onToday={handleGoToDaily}
+        headingRef={mainHeading}
+      />
+    );
+  }
+  if (screen === "challenge-landing" && challengeLanding !== null) {
+    return (
+      <ChallengeLandingScreen
+        landing={challengeLanding}
+        onClaim={() => void handleClaim()}
+        onToday={handleGoToDaily}
+        busy={busy}
+        error={actionError}
+        headingRef={mainHeading}
+      />
+    );
+  }
+  if (
+    screen === "challenge-result" &&
+    challengeResult !== null &&
+    (challengeResult.status === "completed" ||
+      challengeResult.status === "redacted")
+  ) {
+    return (
+      <ChallengeResultScreen
+        result={challengeResult}
+        onToday={handleGoToDaily}
+        headingRef={mainHeading}
+      />
+    );
+  }
+  if (screen === "challenge-waiting") {
+    if (challengeResult === null) {
+      const error =
+        actionError ??
+        ({
+          title: "대결 결과를 불러오는 중이에요",
+          message: "잠시 후 다시 확인해 주세요.",
+        } satisfies DisplayError);
+      return (
+        <main className="app-shell">
+          <section className="card error-card" role="alert">
+            <span className="status-icon status-icon-error" aria-hidden="true">
+              !
+            </span>
+            <h1 ref={mainHeading} tabIndex={-1}>
+              {error.title}
+            </h1>
+            <p>{error.message}</p>
+            {error.requestId ? (
+              <p className="request-id">문의 코드: {error.requestId}</p>
+            ) : null}
+            <div className="button-stack">
+              <button
+                className="primary-button"
+                onClick={() => void refreshChallengeResult()}
+                disabled={refreshingChallenge}
+              >
+                {refreshingChallenge
+                  ? "다시 확인하는 중…"
+                  : "대결 결과 다시 확인"}
+              </button>
+              <button className="secondary-button" onClick={handleGoToDaily}>
+                오늘의 퀴즈로 이동
+              </button>
+            </div>
+          </section>
+        </main>
+      );
+    }
+    if (
+      challengeResult.status === "completed" ||
+      challengeResult.status === "redacted"
+    ) {
+      return (
+        <ChallengeResultScreen
+          result={challengeResult}
+          onToday={handleGoToDaily}
+          headingRef={mainHeading}
+        />
+      );
+    }
+    return (
+      <ChallengeWaitingScreen
+        result={challengeResult}
+        paused={pollingPaused}
+        refreshing={refreshingChallenge || busy}
+        onRefresh={() => void refreshChallengeResult()}
+        onShare={
+          challengeRole === "creator" ? () => void handleShareChallenge() : null
+        }
+        onToday={handleGoToDaily}
+        error={actionError}
+        message={shareMessage}
+        headingRef={mainHeading}
+      />
+    );
+  }
+  if (screen === "error") {
     return (
       <ErrorPanel
         error={
@@ -555,20 +1811,84 @@ function App() {
             message: "잠시 후 다시 시도해 주세요.",
           }
         }
-        onRetry={() => void initialize()}
+        onRetry={() =>
+          void (challengeToken === null
+            ? initializeDaily()
+            : initializeChallenge(challengeToken))
+        }
         busy={busy}
+        headingRef={mainHeading}
       />
     );
   }
+  if (screen === "deleted") {
+    return (
+      <main className="app-shell">
+        <section className="card deleted-card" aria-labelledby="deleted-title">
+          <span className="status-icon status-icon-success" aria-hidden="true">
+            ✓
+          </span>
+          <h1 id="deleted-title" ref={mainHeading} tabIndex={-1}>
+            계정 삭제 완료
+          </h1>
+          <p>
+            계정과 저장된 기록을 삭제했어요. 앱을 다시 시작하면 새로운 익명
+            사용자로 생성됩니다.
+          </p>
+        </section>
+      </main>
+    );
+  }
+  if (screen === "settings") {
+    return (
+      <AccountSettings
+        busy={busy}
+        error={actionError}
+        headingRef={mainHeading}
+        notificationBusy={notificationBusy}
+        notificationDeliveryAvailable={notificationDeliveryAvailable}
+        notificationEnabled={notificationEnabled}
+        notificationError={notificationError}
+        onCancel={() => {
+          setActionError(null);
+          setScreen(settingsReturnScreen);
+        }}
+        onDelete={() => void handleDeleteAccount()}
+        onClearError={() => setActionError(null)}
+        onReloadNotification={() => void loadResultNotificationPreference()}
+        onToggleNotification={() => void handleToggleResultNotification()}
+      />
+    );
+  }
+  if (daily === null) {
+    return <LoadingScreen headingRef={mainHeading} challenge={false} />;
+  }
   if (screen === "home") {
-    return <HomeScreen daily={daily} onStart={() => setScreen("quiz")} />;
+    return (
+      <HomeScreen
+        daily={daily}
+        onStart={() => setScreen("quiz")}
+        onSettings={() => handleOpenSettings("home")}
+        headingRef={mainHeading}
+      />
+    );
   }
   if (screen === "result" && result !== null) {
     return (
       <ResultScreen
         daily={daily}
         result={result}
-        onRestart={() => void initialize()}
+        onRestart={() => void initializeDaily()}
+        onSettings={() => handleOpenSettings("result")}
+        onShare={() => void handleShareChallenge()}
+        onChallengeStatus={() => void refreshChallengeResult()}
+        challengeCreated={challengeToken !== null}
+        busy={busy || refreshingChallenge}
+        actionError={actionError}
+        shareMessage={shareMessage}
+        reportPending={reportPending}
+        onReportPendingChange={setReportPending}
+        headingRef={mainHeading}
       />
     );
   }
@@ -586,6 +1906,7 @@ function App() {
       onComplete={() => void handleComplete()}
       busy={busy}
       actionError={actionError}
+      headingRef={mainHeading}
     />
   );
 }
