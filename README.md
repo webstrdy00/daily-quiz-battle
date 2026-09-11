@@ -2,7 +2,7 @@
 
 Apps in Toss WebView에서 매일 같은 5문제를 풀고 친구와 결과를 비교하는 퀴즈 앱입니다. 현재 working tree에는 **Phase 1~4의 로컬 기능 수직 슬라이스**(오늘 퀴즈, Challenge, 신고·콘텐츠 운영 API, 계정 삭제·알림 outbox·cleanup)가 구현되어 있습니다.
 
-> 기준 commit은 `72dd2da`이며, 아래 신규 신고 triage·kill switch·외부 API 계약 보강은 2026-09-05 KST의 미커밋 working tree 증거입니다. 공개 출시 준비 완료를 뜻하지 않습니다. 실제 Apps in Toss mTLS identity/알림 발송, 콘솔 appName·알림 템플릿, 클라우드 인프라, 실제 기기 QR·접근성 QA, 콘텐츠·개인정보·운영 하드 게이트가 남아 있습니다.
+> 기능·배포 준비 기준 commit은 `776237d`입니다. 신고 운영, CMS, Challenge와 Netlify 실행 설정은 커밋되어 있으며 앱인토스 앱 초안도 등록했습니다. 공개 출시 준비 완료를 뜻하지 않습니다. 실제 mTLS identity, 운영 DB/Redis 연결과 배포, 게임 등급분류, 실기기 QR·접근성 QA, 콘텐츠·개인정보·운영 검증이 남아 있습니다. 아래 날짜별 테스트 기록은 당시 로컬 검증이며 원격 CI나 운영 검증과 구분합니다.
 
 ## 현재 구현 범위
 
@@ -30,7 +30,20 @@ Apps in Toss WebView에서 매일 같은 5문제를 풀고 친구와 결과를 �
 - PostgreSQL migration `0001`~`0017`, 제약조건/trigger, 로컬 seed
 - pull request/main용 CI 정적 검사·PostgreSQL 통합 테스트·build와 별도 gitleaks job
 
-로컬 구현과 외부 연동 완료는 구분합니다. identity와 notification에는 mTLS adapter가 있지만 실제 자격증명·콘솔 템플릿을 사용한 성공 호출은 확인하지 않았습니다. development는 in-memory rate limit fallback을 허용하지만 staging/production은 Redis URL이 없으면 시작하지 않습니다. CMS는 별도 Vite bundle로 구현됐지만 production IAM/SSO와 배포 공급자는 아직 정해지지 않았습니다.
+로컬 구현과 외부 연동 완료는 구분합니다. identity와 notification에는 mTLS adapter가 있지만 실제 자격증명·콘솔 템플릿을 사용한 성공 호출은 확인하지 않았습니다. development는 in-memory rate limit fallback을 허용하지만 staging/production은 Redis URL이 없으면 시작하지 않습니다. CMS는 별도 Vite bundle이며 첫 배포 방향은 Netlify Free + Supabase + Upstash입니다. production IAM/SSO와 실제 배포·연결 검증은 미완료입니다. 리더보드는 콘솔의 점수 단위·정렬 설정만 저장했으며 SDK 점수 전송은 구현하지 않았습니다.
+
+### 사용자 식별 SDK 버전 경계
+
+현재 고정 버전 `@apps-in-toss/web-framework@3.1.1`의 구현·타입에서
+`getUserKeyForGame`은 `getAnonymousKey`의 deprecated v2 호환 별칭이며,
+권장 API는 `User.getAnonymousKey()`입니다. 따라서 현재 호출을 유지합니다.
+v3 API는 미지원 앱 버전과 조회 실패를 예외로 처리하며, 개발용 키 대체는
+development 환경에만 허용합니다. 내부 `anonymousKey` 계약도 변경하지 않습니다.
+
+[공식 사용자 식별 가이드](https://developers-apps-in-toss.toss.im/documentation/common/authentication/hash-key)는
+게임·비게임별 기존 함수 구분을 설명하므로 설치된 v3 구현과 구분해서 읽어야 합니다.
+이 소스 확인만으로 실제 게임 카테고리의 QR 실행이나 서버 mTLS 검증 성공을
+보장하지 않습니다. 등록 앱으로 실기기 사용자 식별과 서버 검증을 확인해야 합니다.
 
 ## 아키텍처
 
@@ -206,7 +219,7 @@ Scheduler만 중지하려면 다음 명령을 사용합니다. Compose가 SIGTER
 docker compose --profile operations stop operations
 ```
 
-staging/production에서는 올바른 interval 설정과 함께 `OPERATIONS_SCHEDULER_ENABLED=true`를 명시해야 scheduler가 시작됩니다. production은 이 development Compose profile이 아니라 별도 외부 orchestrator에서 `node apps/api/dist/operations/scheduler.js`를 API와 분리해 실행해야 합니다. Advisory lock은 replica 중복 실행만 막으며 배포, restart/health monitoring, alerting, secret·mTLS certificate 주입, Apps in Toss template 설정을 제공하지 않습니다. 현재 저장소에는 cloud 공급자 설정이나 실제 template/certificate가 없으므로 production scheduler 실행 또는 실제 알림 발송 완료를 검증한 상태가 아닙니다.
+staging/production에서는 올바른 interval 설정과 함께 `OPERATIONS_SCHEDULER_ENABLED=true`를 명시해야 scheduler가 시작됩니다. 상시 production scheduler는 이 development Compose profile이 아니라 별도 외부 orchestrator에서 `node apps/api/dist/operations/scheduler.js`를 API와 분리해 실행해야 합니다. Netlify의 일일 단일 실행 구성은 아래 절을 참고합니다. Advisory lock은 replica 중복 실행만 막으며 배포, restart/health monitoring, alerting, secret·mTLS certificate 주입, Apps in Toss template 설정을 제공하지 않습니다. Netlify 설정 파일은 있지만 실제 template/certificate 주입, production scheduler 실행 또는 실제 알림 발송은 검증하지 않았습니다.
 
 ### Scale-to-zero 배포 준비
 
@@ -241,7 +254,7 @@ staging/production은 이 모드도 `OPERATIONS_SCHEDULER_ENABLED=true`가 필�
   외부 backup/restore 및 토스 실기기 검증은 여전히 출시 게이트입니다.
   무료 한도나 예산 알림은 무제한 사용 또는 초과 과금 차단을 보장하지 않습니다.
 
-단일 실행 배포 준비의 로컬 검증: focused CLI/DB 설정 **23/23**, 전체 PostgreSQL·Redis
+2026-09-06 단일 실행 배포 준비 당시의 로컬 검증: focused CLI/DB 설정 **23/23**, 전체 PostgreSQL·Redis
 회귀 **114/114** 통과. lint/typecheck/전체 build/format check와 Docker image build를
 통과했고, 빌드된 image의 `--once`를 격리 DB에서 실행해 cleanup 성공 ledger와 종료를
 확인했습니다. 임시 테스트 DB는 0개이며 실제 managed DB TLS/mTLS·cloud 배포 증거는 아닙니다.
@@ -270,7 +283,7 @@ API function으로 연결되고 기존 인증·CORS·metrics token 검증을 유
 
 ### Local monitoring
 
-공급자 선택 전 metrics scrape, alert rule, dashboard를 로컬에서 확인하는 opt-in `monitoring` profile입니다. 다음 명령은 Grafana의 dependency인 Prometheus와 API, migration, Redis, PostgreSQL을 함께 시작하지만 operations scheduler는 시작하지 않습니다.
+metrics scrape, alert rule, dashboard를 로컬에서 확인하는 opt-in `monitoring` profile입니다. Netlify 운영 모니터링 배포를 의미하지 않습니다. 다음 명령은 Grafana의 dependency인 Prometheus와 API, migration, Redis, PostgreSQL을 함께 시작하지만 operations scheduler는 시작하지 않습니다.
 
 ```powershell
 docker compose --profile monitoring up -d --build --wait grafana
@@ -365,7 +378,16 @@ corepack pnpm build
 - 320×640 화면·200% 글자 설정에서 가로 overflow 0, 계정 설정 제품 DOM axe A/AA 위반 0.
   삭제 확인 문구에서 발견한 대비 결함은 공통 danger 색상을 어둡게 바꾸고 재검증했다.
 
-`.github/workflows/ci.yml`은 pull request/main 및 수동 실행에서 install, format, lint, typecheck, high-severity dependency audit, PostgreSQL·Redis integration test, build, Docker/Compose·Prometheus·backup script 정적 검사와 별도 gitleaks job을 실행하도록 commit `72dd2da`에 구성됐습니다. 후속 working tree와 같은 SHA의 원격 CI 성공 증거는 아직 없으며, 위 결과는 각 날짜에 수행한 로컬 실행 증거입니다.
+2026-09-11 KST develop 병합 전 재검증 (`776237d` 코드, README 현황 정리):
+
+- PostgreSQL와 격리 Redis DB 15를 사용한 전체 회귀 **122 tests, 122 pass, 0 fail, 0 skip**.
+- typecheck, lint, contracts/API/Web/CMS build 및 `.ait` 생성, format check 통과.
+- SDK 3.1.1 소스·타입의 v2 게임 함수 별칭을 확인하여 현재 `User.getAnonymousKey()` 유지.
+- `git fetch origin` 후 `origin/develop` 대비 5개 커밋 앞섬, develop에만 있는 커밋 0개.
+- GitHub 조회에서 `feature/goal` PR과 해당 브랜치 Actions 실행 기록은 없음.
+  원격 CI 성공, production TLS/mTLS, 실제 기기 검증을 완료한 것으로 간주하지 않음.
+
+`.github/workflows/ci.yml`은 pull request/main 및 수동 실행에서 install, format, lint, typecheck, high-severity dependency audit, PostgreSQL·Redis integration test, build, Docker/Compose·Prometheus·backup script 정적 검사와 별도 gitleaks job을 실행하도록 구성되어 있습니다. 기능 브랜치 push만으로는 CI가 실행되지 않습니다. 병합할 최종 변경을 커밋·push한 뒤 develop 대상 PR에서 같은 SHA의 CI 성공을 확인해야 합니다.
 
 ## 보안·데이터 원칙
 
@@ -388,8 +410,8 @@ corepack pnpm build
 Web bundle과 공유·알림 deep link가 등록된 식별자를 사용합니다. 앱 상세 정보 검토,
 게임 등급정보와 출시 승인은 아직 완료되지 않았습니다.
 
-1. production appName, 앱 상세 정보와 알림 template/templateSet code
-2. 실제 mTLS 인증서/키로 identity와 notification send 성공 경로 검증
+1. 등록된 appName의 앱 상세 정보 검토, 개인 개발자·게임 등급분류 절차 완료
+2. 실제 mTLS 인증서/키로 identity 성공 경로 검증; 알림은 재활성화 전에 template/templateSet과 send 검증
 3. production API origin/CORS와 다중 인스턴스 shared rate-limit store
 4. 실제 iOS/Android Apps in Toss QR E2E
 5. VoiceOver/TalkBack, keyboard-only, 200% 확대 수동 QA
@@ -398,18 +420,18 @@ Web bundle과 공유·알림 deep link가 등록된 식별자를 사용합니다
 
 ### 승인된 출시 기준과 외부 실행 경계
 
-2026-09-06 권장안 승인 기준입니다. 아래 선택은 실제 인프라 구성이나 법무 승인을 뜻하지 않습니다.
+첫 출시의 현재 방향입니다. 과거 AWS managed stack 검토안은 무료 우선 배포 방향으로 대체됐습니다. 아래 선택은 실제 배포 완료나 법무 승인을 뜻하지 않습니다.
 
-| 항목      | 선택                                       | 구현·외부 게이트                                                                                                       |
-| --------- | ------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------- |
-| 앱 식별자 | `daily-quiz-battle-anlee`                  | 콘솔 앱 초안 생성 확인; 상세 정보·등급정보·출시 검토 필요                                                              |
-| 닉네임    | 서버가 비식별 별명 자동 생성               | 신규 사용자에만 적용; 기존 사용자·Challenge snapshot 보존                                                              |
-| 알림      | 첫 공개 버전 off                           | `NOTIFICATION_DELIVERY_ENABLED=false`; SDK 동의/신규 enqueue/모든 CLI·scheduler 발송 차단, 기존 동의 철회 허용         |
-| Cloud     | AWS Seoul (`ap-northeast-2`) managed stack | PostgreSQL·Redis·Secret Manager·private network, API/scheduler 분리; AWS 계정·예산·도메인·DPA 확인 전 리소스 생성 없음 |
-| CMS 인증  | reverse proxy OIDC/SSO + short admin JWT   | IdP issuer/client·운영자 그룹·callback domain 필요; 현재 CLI JWT는 로컬용                                              |
-| 복구 목표 | RPO 1시간 / RTO 4시간                      | 운영 목표이며 현재 보장 아님; PITR·격리 복구·page 수신 및 책임자 증거 필요                                             |
-| 콘텐츠    | 30일분 150개 + 예비 약 15개                | 출처·권리·검수자·14+ 적합성 확인 필요; 생성 초안을 검수 재고로 계산하지 않음                                           |
-| CI        | PR에서 실행                                | 현재 변경은 미커밋; 해당 변경의 커밋·push 후 PR 및 같은 SHA의 CI 성공 확인 필요                                        |
+| 항목      | 선택                                     | 구현·외부 게이트                                                                                               |
+| --------- | ---------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| 앱 식별자 | `daily-quiz-battle-anlee`                | 콘솔 앱 초안 생성 확인; 상세 정보·등급정보·출시 검토 필요                                                      |
+| 닉네임    | 서버가 비식별 별명 자동 생성             | 신규 사용자에만 적용; 기존 사용자·Challenge snapshot 보존                                                      |
+| 알림      | 첫 공개 버전 off                         | `NOTIFICATION_DELIVERY_ENABLED=false`; SDK 동의/신규 enqueue/모든 CLI·scheduler 발송 차단, 기존 동의 철회 허용 |
+| Cloud     | Netlify Free + Supabase + Upstash        | 계정·DB·Redis 생성 확인 이력 있음; 운영 연결·migration·배포·TLS 검증 미완료, 과금 조건 재확인 필요             |
+| CMS 인증  | reverse proxy OIDC/SSO + short admin JWT | IdP issuer/client·운영자 그룹·callback domain 필요; 현재 CLI JWT는 로컬용                                      |
+| 복구 목표 | RPO 1시간 / RTO 4시간                    | 운영 목표이며 현재 보장 아님; PITR·격리 복구·page 수신 및 책임자 증거 필요                                     |
+| 콘텐츠    | 30일분 150개 + 예비 약 15개              | 출처·권리·검수자·14+ 적합성 확인 필요; 생성 초안을 검수 재고로 계산하지 않음                                   |
+| CI        | PR에서 실행                              | 기능 변경은 `776237d`까지 커밋됨; 병합 대상 최종 SHA의 PR·CI 성공 확인 필요                                    |
 
 보존기간의 **검토 기준**은 attempts/answers 90일, report detail 30일,
 report metadata 180일, published outbox 30일, failed outbox 90일,
