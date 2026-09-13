@@ -9,3 +9,13 @@
 
 [functions]
   node_bundler = "esbuild"
+  included_files = [
+    "apps/api/ssl/supabase-prod-ca-2021.crt",
+    "!.env",
+    "!.env.*",
+    "!**/.env",
+    "!**/.env.*",
+    "!secrets/**",
+    "!.secrets/**",
+    "!certs/**",
+  ]

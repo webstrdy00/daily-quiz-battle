@@ -5,3 +5,10 @@ coverage
 docs
 pnpm-lock.yaml
 .gjc
+.netlify
+secrets
+.secrets
+certs
+.env
+.env.*
+!.env.example

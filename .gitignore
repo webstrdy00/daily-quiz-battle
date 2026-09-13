@@ -1,7 +1,13 @@
 # Private planning and development references
 # This repository intentionally keeps the entire docs tree out of Git.
 /docs/
-/assets
+/assets/*
+!/assets/store/
+/assets/store/*
+!/assets/store/app-logo.png
+!/assets/store/screenshot-home.png
+!/assets/store/screenshot-question.png
+!/assets/store/screenshot-result.png
 
 # Dependencies and package-manager state
 node_modules/
@@ -20,6 +26,7 @@ out/
 .vite/
 .turbo/
 .cache/
+.netlify/
 *.tsbuildinfo
 
 # Test and quality output
@@ -41,6 +48,7 @@ certs/
 *.p12
 *.pfx
 *.crt
+!apps/api/ssl/supabase-prod-ca-2021.crt
 
 # Local databases and runtime data
 .data/

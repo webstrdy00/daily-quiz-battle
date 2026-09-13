@@ -4,7 +4,7 @@ on:
   pull_request:
   workflow_dispatch:
   push:
-    branches: [main]
+    branches: [main, develop]
 
 permissions:
   contents: read
@@ -71,6 +71,12 @@ jobs:
         run: pnpm test:integration
       - name: Production build
         run: pnpm build
+      - name: Netlify function packaging
+        env:
+          NETLIFY_TELEMETRY_DISABLED: "1"
+        run: pnpm --package=netlify-cli@27.5.2 dlx netlify build --offline --filter @daily-quiz-battle/api
+      - name: Verify function routes and secret exclusion
+        run: python3 ops/verify-netlify-package.py
       - name: Deployment configuration
         run: |
           docker compose --profile local-app config --quiet
