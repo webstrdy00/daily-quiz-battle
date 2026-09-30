@@ -1,23 +1,23 @@
+import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { loadConfig } from "../config.js";
-import { createAdminAccessTokenService } from "./token.js";
+import {
+  ADMIN_ACCESS_TOKEN_SCOPES,
+  createAdminAccessTokenService,
+  isValidAdminScopes,
+  isValidAdminSubject,
+} from "./token.js";
 
 const USAGE =
-  "Usage: pnpm --filter @daily-quiz-battle/api admin:token -- --subject <value> [--scope content:write,content:void,reports:read,reports:triage]";
+  "Usage: pnpm --filter @daily-quiz-battle/api admin:token -- --subject <value> --scope <comma-separated scopes: content:write,content:void,reports:read,reports:triage>";
 const CONTROL_CHARACTER_PATTERN = /\p{Cc}/u;
-const ALLOWED_SCOPES = [
-  "content:write",
-  "content:void",
-  "reports:read",
-  "reports:triage",
-] as const;
-type AllowedScope = (typeof ALLOWED_SCOPES)[number];
 
 interface ParsedArguments {
   subject: string;
-  scopes: AllowedScope[];
+  scopes: string[];
 }
 
-function parseArguments(args: string[]): ParsedArguments {
+export function parseArguments(args: string[]): ParsedArguments {
   if (args.length === 1 && (args[0] === "--help" || args[0] === "-h")) {
     throw new Error(USAGE);
   }
@@ -46,16 +46,13 @@ function parseArguments(args: string[]): ParsedArguments {
     throw new Error(`Invalid arguments. ${USAGE}`);
   }
 
-  if (rawSubject === undefined) {
+  if (rawSubject === undefined || rawScopes === undefined) {
     throw new Error(`Invalid arguments. ${USAGE}`);
   }
 
   const subject = rawSubject.trim();
-  const subjectLength = Array.from(subject).length;
-
   if (
-    subjectLength === 0 ||
-    subjectLength > 100 ||
+    !isValidAdminSubject(subject) ||
     CONTROL_CHARACTER_PATTERN.test(rawSubject)
   ) {
     throw new Error(
@@ -63,22 +60,11 @@ function parseArguments(args: string[]): ParsedArguments {
     );
   }
 
-  const scopes =
-    rawScopes === undefined
-      ? [...ALLOWED_SCOPES]
-      : rawScopes.split(",").map((scope) => {
-          if (!ALLOWED_SCOPES.includes(scope as AllowedScope)) {
-            throw new Error(
-              `Invalid --scope: allowed values are ${ALLOWED_SCOPES.join(",")}.`,
-            );
-          }
+  const scopes = rawScopes.split(",");
 
-          return scope as AllowedScope;
-        });
-
-  if (scopes.length === 0 || new Set(scopes).size !== scopes.length) {
+  if (!isValidAdminScopes(scopes)) {
     throw new Error(
-      `Invalid --scope: use each of ${ALLOWED_SCOPES.join(",")} at most once.`,
+      `Invalid --scope: choose from ${ADMIN_ACCESS_TOKEN_SCOPES.join(",")} without duplicates.`,
     );
   }
 
@@ -96,11 +82,16 @@ async function main(): Promise<void> {
   process.stdout.write(`${token}\n`);
 }
 
-try {
-  await main();
-} catch (error) {
-  const message =
-    error instanceof Error ? error.message : "Unknown token issuance error";
-  process.stderr.write(`Admin token issuance failed: ${message}\n`);
-  process.exitCode = 1;
+if (
+  process.argv[1] !== undefined &&
+  import.meta.url === pathToFileURL(resolve(process.argv[1])).href
+) {
+  try {
+    await main();
+  } catch (error) {
+    const message =
+      error instanceof Error ? error.message : "Unknown token issuance error";
+    process.stderr.write(`Admin token issuance failed: ${message}\n`);
+    process.exitCode = 1;
+  }
 }

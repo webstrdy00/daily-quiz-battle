@@ -17,6 +17,9 @@ export function createDatabase(config: AppConfig): Database {
     idle_timeout: 20,
     connect_timeout: 10,
     prepare: false,
+    ...(config.databaseCaCert
+      ? { ssl: { ca: config.databaseCaCert, rejectUnauthorized: true } }
+      : {}),
   });
   const orm = drizzle(client, { schema });
 

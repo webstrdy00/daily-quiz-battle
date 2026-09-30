@@ -13,7 +13,6 @@ import {
   DeleteAccountResponseSchema,
   OperationalCapabilitiesResponseSchema,
   ResultNotificationPreferenceResponseSchema,
-  SubmitAnswerResponseSchema,
   UpdateResultNotificationPreferenceRequestSchema,
   type ApiError,
   type BootstrapResponse,
@@ -21,6 +20,7 @@ import {
   type ChallengeResultResponse,
   type ClaimChallengeResponse,
   type CompleteAttemptResponse,
+  type CompleteAttemptRequest,
   type CreateChallengeRequest,
   type CreateChallengeResponse,
   type CreateQuestionReportRequest,
@@ -28,22 +28,78 @@ import {
   type DailyStartResponse,
   type DeleteAccountRequest,
   type DeleteAccountResponse,
+  type OperationalCapabilitiesResponse,
   type ResultNotificationPreferenceResponse,
-  type SubmitAnswerRequest,
-  type SubmitAnswerResponse,
 } from "@daily-quiz-battle/contracts";
 import { getAnonymousKey, setAnalyticsPublishingEnabled } from "./platform";
+import { clearUserDrafts, getDraftGeneration } from "./quiz-draft";
 
 const apiBaseUrl = (
   import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:3000"
 ).replace(/\/$/, "");
 
 let accessToken: string | null = null;
+let authenticatedUserId: string | null = null;
+export function getAuthenticatedUserId(): string | null {
+  return sessionState === "active" && accessToken !== null
+    ? authenticatedUserId
+    : null;
+}
 let sessionEpoch = 0;
 let sessionState: "active" | "deleting" | "deleted" | "deletion-uncertain" =
   "active";
 let bootstrapPromise: Promise<BootstrapResponse> | null = null;
 const inFlightControllers = new Set<AbortController>();
+type ChallengeCapabilities = Readonly<
+  Pick<
+    OperationalCapabilitiesResponse,
+    "challengeCreateEnabled" | "challengeClaimEnabled"
+  >
+>;
+const unavailableChallengeCapabilities: ChallengeCapabilities = {
+  challengeCreateEnabled: false,
+  challengeClaimEnabled: false,
+};
+let challengeCapabilities = unavailableChallengeCapabilities;
+let capabilitiesGeneration = 0;
+const challengeCapabilitiesListeners = new Set<() => void>();
+
+export function getChallengeCapabilities(): ChallengeCapabilities {
+  return challengeCapabilities;
+}
+
+export function subscribeChallengeCapabilities(
+  listener: () => void,
+): () => void {
+  challengeCapabilitiesListeners.add(listener);
+  return () => {
+    challengeCapabilitiesListeners.delete(listener);
+  };
+}
+
+function setChallengeCapabilities(capabilities: ChallengeCapabilities): void {
+  if (
+    challengeCapabilities.challengeCreateEnabled ===
+      capabilities.challengeCreateEnabled &&
+    challengeCapabilities.challengeClaimEnabled ===
+      capabilities.challengeClaimEnabled
+  ) {
+    return;
+  }
+  challengeCapabilities = {
+    challengeCreateEnabled: capabilities.challengeCreateEnabled,
+    challengeClaimEnabled: capabilities.challengeClaimEnabled,
+  };
+  for (const listener of challengeCapabilitiesListeners) {
+    listener();
+  }
+}
+
+function invalidateCapabilities(): void {
+  capabilitiesGeneration += 1;
+  setAnalyticsPublishingEnabled(false);
+  setChallengeCapabilities(unavailableChallengeCapabilities);
+}
 
 interface Parser<T> {
   parse(value: unknown): T;
@@ -134,12 +190,16 @@ async function fetchJson<T>(
     controller.abort();
   }
   const timeout = window.setTimeout(() => {
+    if (controller.signal.aborted) {
+      return;
+    }
     timedOut = true;
     controller.abort();
   }, 10_000);
   inFlightControllers.add(controller);
 
   let response: Response;
+  let payload: unknown;
   try {
     response = await fetch(`${apiBaseUrl}${path}`, {
       ...init,
@@ -152,36 +212,46 @@ async function fetchJson<T>(
         ...init.headers,
       },
     });
+    try {
+      payload = await response.json();
+    } catch (error) {
+      if (
+        controller.signal.aborted ||
+        (error instanceof DOMException && error.name === "AbortError")
+      ) {
+        throw error;
+      }
+      throw new ApiClientError({
+        code: "INVALID_RESPONSE",
+        message: "서버 응답을 처리하지 못했습니다.",
+        retryable: response.status >= 500,
+        status: response.status,
+      });
+    }
   } catch (error) {
+    if (error instanceof ApiClientError) {
+      throw error;
+    }
+    const aborted =
+      controller.signal.aborted ||
+      (error instanceof DOMException && error.name === "AbortError");
     throw new ApiClientError({
       code: timedOut
         ? "REQUEST_TIMEOUT"
-        : error instanceof DOMException && error.name === "AbortError"
+        : aborted
           ? "REQUEST_ABORTED"
           : "NETWORK_ERROR",
       message: timedOut
         ? "응답이 늦어지고 있어요. 다시 시도해 주세요."
-        : error instanceof DOMException && error.name === "AbortError"
+        : aborted
           ? "요청이 중단되었습니다."
           : "네트워크 연결을 확인하고 다시 시도해 주세요.",
-      retryable: timedOut || !(error instanceof DOMException),
+      retryable: timedOut || (!aborted && !(error instanceof DOMException)),
     });
   } finally {
     window.clearTimeout(timeout);
     init.signal?.removeEventListener("abort", handleExternalAbort);
     inFlightControllers.delete(controller);
-  }
-
-  let payload: unknown;
-  try {
-    payload = await response.json();
-  } catch {
-    throw new ApiClientError({
-      code: "INVALID_RESPONSE",
-      message: "서버 응답을 처리하지 못했습니다.",
-      retryable: response.status >= 500,
-      status: response.status,
-    });
   }
 
   if (!response.ok) {
@@ -217,6 +287,8 @@ export async function bootstrapSession(): Promise<BootstrapResponse> {
   }
 
   const epoch = sessionEpoch;
+  invalidateCapabilities();
+  const generation = capabilitiesGeneration;
   const pending = (async () => {
     const anonymousKey = await getAnonymousKey();
     assertActiveSession(epoch);
@@ -230,24 +302,49 @@ export async function bootstrapSession(): Promise<BootstrapResponse> {
       { epoch },
     );
     assertActiveSession(epoch);
+    if (
+      authenticatedUserId !== null &&
+      authenticatedUserId !== response.user.id
+    ) {
+      accessToken = null;
+      sessionEpoch += 1;
+      abortInFlightRequests();
+      await clearUserDrafts(authenticatedUserId);
+      authenticatedUserId = response.user.id;
+      assertActiveSession(epoch);
+    }
+    authenticatedUserId = response.user.id;
     accessToken = response.accessToken;
     setAnalyticsPublishingEnabled(false);
-    try {
-      const capabilities = await fetchJson(
-        "/v1/operational-capabilities",
-        OperationalCapabilitiesResponseSchema,
-        {
-          method: "GET",
-          headers: {
-            authorization: `Bearer ${response.accessToken}`,
-          },
+    void fetchJson(
+      "/v1/operational-capabilities",
+      OperationalCapabilitiesResponseSchema,
+      {
+        method: "GET",
+        headers: {
+          authorization: `Bearer ${response.accessToken}`,
         },
-        { epoch },
-      );
-      setAnalyticsPublishingEnabled(capabilities.analyticsPublishEnabled);
-    } catch {
-      setAnalyticsPublishingEnabled(false);
-    }
+      },
+      { epoch },
+    )
+      .then((capabilities) => {
+        assertActiveSession(epoch);
+        if (generation !== capabilitiesGeneration) {
+          return;
+        }
+        setAnalyticsPublishingEnabled(capabilities.analyticsPublishEnabled);
+        setChallengeCapabilities(capabilities);
+      })
+      .catch(() => {
+        if (
+          epoch === sessionEpoch &&
+          sessionState === "active" &&
+          generation === capabilitiesGeneration
+        ) {
+          setAnalyticsPublishingEnabled(false);
+          setChallengeCapabilities(unavailableChallengeCapabilities);
+        }
+      });
     assertActiveSession(epoch);
     return response;
   })();
@@ -273,6 +370,23 @@ async function authorizedRequest<T>(
   }
   assertActiveSession(epoch);
 
+  const draftUser = authenticatedUserId;
+  const loadsDraft = path === "/v1/daily/start" || path.endsWith("/claim");
+  const draftGeneration =
+    loadsDraft && draftUser !== null ? getDraftGeneration(draftUser) : null;
+  const assertDraftGeneration = () => {
+    if (
+      loadsDraft &&
+      draftUser !== null &&
+      draftGeneration !== getDraftGeneration(draftUser)
+    ) {
+      throw new ApiClientError({
+        code: "SESSION_INVALIDATED",
+        message:
+          "다른 창에서 계정의 답안 상태가 변경됐어요. 서버 상태를 다시 확인해 주세요.",
+      });
+    }
+  };
   const request = () =>
     fetchJson(
       path,
@@ -290,6 +404,7 @@ async function authorizedRequest<T>(
   try {
     const response = await request();
     assertActiveSession(epoch);
+    assertDraftGeneration();
     return response;
   } catch (error) {
     if (
@@ -303,6 +418,7 @@ async function authorizedRequest<T>(
       assertActiveSession(epoch);
       const response = await request();
       assertActiveSession(epoch);
+      assertDraftGeneration();
       return response;
     }
     throw error;
@@ -362,9 +478,19 @@ export async function deleteAccount(
 
   sessionState = "deleting";
   sessionEpoch += 1;
+  invalidateCapabilities();
   const deletionEpoch = sessionEpoch;
   bootstrapPromise = null;
   abortInFlightRequests();
+
+  try {
+    if (authenticatedUserId !== null) {
+      await clearUserDrafts(authenticatedUserId);
+    }
+  } catch (error) {
+    sessionState = "active";
+    throw error;
+  }
 
   try {
     const response = await fetchJson(
@@ -411,24 +537,9 @@ export async function deleteAccount(
   }
 }
 
-export function submitAnswer(
-  attemptId: string,
-  answer: SubmitAnswerRequest,
-  idempotencyKey: string,
-): Promise<SubmitAnswerResponse> {
-  return authorizedRequest(
-    `/v1/attempts/${encodeURIComponent(attemptId)}/answers`,
-    SubmitAnswerResponseSchema,
-    {
-      method: "POST",
-      headers: { "idempotency-key": idempotencyKey },
-      body: JSON.stringify(answer),
-    },
-  );
-}
-
 export function completeAttempt(
   attemptId: string,
+  request: CompleteAttemptRequest,
   idempotencyKey: string,
   signal?: AbortSignal,
 ): Promise<CompleteAttemptResponse> {
@@ -438,7 +549,7 @@ export function completeAttempt(
     {
       method: "POST",
       headers: { "idempotency-key": idempotencyKey },
-      body: "{}",
+      body: JSON.stringify(request),
       signal,
     },
   );

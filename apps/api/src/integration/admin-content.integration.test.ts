@@ -223,7 +223,7 @@ test("admin content routes enforce the admin-token and scope boundary", async ()
   expectApiError(invalidCredential, 401, "ADMIN_UNAUTHORIZED");
 
   const readOnlyToken = await issueAdminToken("admin-auth-read-only", [
-    "content:read",
+    "reports:read",
   ]);
   const insufficientScope = await harness.app.inject({
     method: "POST",
@@ -815,7 +815,7 @@ test("admin content reads enforce the existing content-write boundary", async ()
   expectApiError(userCredential, 401, "ADMIN_UNAUTHORIZED");
 
   const readOnlyToken = await issueAdminToken("admin-content-reader", [
-    "content:read",
+    "reports:read",
   ]);
   const insufficientScope = await harness.app.inject({
     method: "GET",

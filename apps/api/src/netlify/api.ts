@@ -49,14 +49,28 @@ export default async function api(
   request: Request,
   context: Context,
 ): Promise<Response> {
+  const startedAt = performance.now();
   if (!isValidProviderIp(context.ip)) {
     return unavailableResponse(request.method);
   }
+  let initializationMs = 0;
+  let response: Response;
   try {
-    return await handleNetlifyRequest(await getApp(), request, context);
+    const app = await getApp();
+    initializationMs = performance.now() - startedAt;
+    response = await handleNetlifyRequest(app, request, context);
   } catch {
-    return unavailableResponse(request.method);
+    response = unavailableResponse(request.method);
   }
+  console.info(
+    JSON.stringify({
+      event: "netlify_request_finished",
+      status: response.status,
+      initializationMs: Math.round(initializationMs),
+      totalMs: Math.round(performance.now() - startedAt),
+    }),
+  );
+  return response;
 }
 
 export const config: Config = {

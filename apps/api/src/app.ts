@@ -53,6 +53,7 @@ export async function buildApp({
 
   await app.register(cors, {
     credentials: false,
+    maxAge: 300,
     methods: ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: [
       "accept",
@@ -151,6 +152,8 @@ export async function buildApp({
     database,
     tokenService,
     analyticsPublishEnabled: config.analyticsPublishEnabled ?? true,
+    challengeCreateEnabled: config.challengeCreateEnabled ?? true,
+    challengeClaimEnabled: config.challengeClaimEnabled ?? true,
   });
   registerAccountRoutes(app, {
     database,

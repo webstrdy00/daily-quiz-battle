@@ -1,6 +1,6 @@
 [build]
   command = "pnpm --filter @daily-quiz-battle/contracts build && pnpm --filter @daily-quiz-battle/api build && pnpm --filter @daily-quiz-battle/admin build"
-  publish = "apps/admin/dist"
+  publish = "apps/api/public"
   functions = "apps/api/src/netlify"
 
 [build.environment]

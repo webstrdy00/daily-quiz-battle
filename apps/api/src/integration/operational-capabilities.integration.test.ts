@@ -4,6 +4,7 @@ import {
   ApiErrorSchema,
   BootstrapResponseSchema,
   OperationalCapabilitiesResponseSchema,
+  type OperationalCapabilitiesResponse,
 } from "@daily-quiz-battle/contracts";
 import { buildApp } from "../app.js";
 import { createDatabase, type Database } from "../db/client.js";
@@ -78,18 +79,21 @@ async function snapshotDatabase(
 
 function assertCapabilitiesResponse(
   response: JsonResponse,
-  analyticsPublishEnabled: boolean,
+  capabilities: OperationalCapabilitiesResponse,
 ): void {
   assert.equal(response.statusCode, 200, response.body);
   const body = response.json();
-  assert.deepEqual(body, { analyticsPublishEnabled });
-  assert.deepEqual(OperationalCapabilitiesResponseSchema.parse(body), {
-    analyticsPublishEnabled,
-  });
+  assert.deepEqual(body, capabilities);
+  assert.deepEqual(
+    OperationalCapabilitiesResponseSchema.parse(body),
+    capabilities,
+  );
 }
 
-test("operational capabilities require authentication and expose only the configured analytics capability without database mutation", async () => {
+test("operational capabilities require authentication and expose configured flags without database mutation", async () => {
   assert.equal(harness.config.analyticsPublishEnabled, undefined);
+  assert.equal(harness.config.challengeCreateEnabled, undefined);
+  assert.equal(harness.config.challengeClaimEnabled, undefined);
 
   const unauthenticated = await harness.app.inject({
     method: "GET",
@@ -100,6 +104,13 @@ test("operational capabilities require authentication and expose only the config
     ApiErrorSchema.parse(unauthenticated.json()).code,
     "UNAUTHORIZED",
   );
+  const invalidToken = await harness.app.inject({
+    method: "GET",
+    url: "/v1/operational-capabilities",
+    headers: authorizationHeaders("invalid-token"),
+  });
+  assert.equal(invalidToken.statusCode, 401, invalidToken.body);
+  assert.equal(ApiErrorSchema.parse(invalidToken.json()).code, "UNAUTHORIZED");
 
   const accessToken = await bootstrapUser();
   const databaseBefore = await snapshotDatabase(harness.database);
@@ -109,31 +120,47 @@ test("operational capabilities require authentication and expose only the config
     url: "/v1/operational-capabilities",
     headers: authorizationHeaders(accessToken),
   });
-  assertCapabilitiesResponse(defaultResponse, true);
+  assertCapabilitiesResponse(defaultResponse, {
+    analyticsPublishEnabled: true,
+    challengeCreateEnabled: true,
+    challengeClaimEnabled: true,
+  });
 
-  const disabledConfig = {
-    ...harness.config,
-    analyticsPublishEnabled: false,
-  };
-  const disabledDatabase = createDatabase(disabledConfig);
-  let disabledApp: Awaited<ReturnType<typeof buildApp>> | undefined;
+  for (const capabilities of [
+    {
+      analyticsPublishEnabled: false,
+      challengeCreateEnabled: false,
+      challengeClaimEnabled: false,
+    },
+    {
+      analyticsPublishEnabled: true,
+      challengeCreateEnabled: true,
+      challengeClaimEnabled: false,
+    },
+    {
+      analyticsPublishEnabled: false,
+      challengeCreateEnabled: false,
+      challengeClaimEnabled: true,
+    },
+  ]) {
+    const config = { ...harness.config, ...capabilities };
+    const database = createDatabase(config);
+    let app: Awaited<ReturnType<typeof buildApp>> | undefined;
 
-  try {
-    disabledApp = await buildApp({
-      config: disabledConfig,
-      database: disabledDatabase,
-    });
-    const disabledResponse = await disabledApp.inject({
-      method: "GET",
-      url: "/v1/operational-capabilities",
-      headers: authorizationHeaders(accessToken),
-    });
-    assertCapabilitiesResponse(disabledResponse, false);
-  } finally {
-    if (disabledApp !== undefined) {
-      await disabledApp.close();
-    } else {
-      await disabledDatabase.close();
+    try {
+      app = await buildApp({ config, database });
+      const response = await app.inject({
+        method: "GET",
+        url: "/v1/operational-capabilities",
+        headers: authorizationHeaders(accessToken),
+      });
+      assertCapabilitiesResponse(response, capabilities);
+    } finally {
+      if (app !== undefined) {
+        await app.close();
+      } else {
+        await database.close();
+      }
     }
   }
 

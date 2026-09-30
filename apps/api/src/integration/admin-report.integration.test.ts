@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { after, before, test } from "node:test";
+import { SignJWT, type JWTPayload } from "jose";
 import {
   AdminListReportsResponseSchema,
   AdminUpdateReportStatusResponseSchema,
@@ -12,6 +13,7 @@ import {
   type ReportTriageStatus,
 } from "@daily-quiz-battle/contracts";
 import { createAdminAccessTokenService } from "../admin/token.js";
+import { parseArguments } from "../admin/issue-token.js";
 import {
   createIntegrationHarness,
   type IntegrationHarness,
@@ -228,6 +230,115 @@ async function patchStatus(token: string, reportId: string, status: string) {
     payload: { status },
   });
 }
+
+test("admin token CLI requires explicit least-privilege scopes", () => {
+  for (const args of [
+    [],
+    ["--subject", "operator"],
+    ["--scope", "reports:read"],
+    ["--subject", "operator", "--scope", ""],
+    ["--subject", "operator", "--scope", "content:read"],
+    ["--subject", "operator", "--scope", "reports:read,reports:read"],
+    ["--subject", "operator", "--scope", "reports:read,"],
+    [
+      "--subject",
+      "operator",
+      "--scope",
+      "reports:read",
+      "--scope",
+      "content:void",
+    ],
+    ["--subject", "\noperator", "--scope", "reports:read"],
+    ["--subject", " ", "--scope", "reports:read"],
+    ["--subject", "a".repeat(101), "--scope", "reports:read"],
+  ]) {
+    assert.throws(() => parseArguments(args), /Invalid/);
+  }
+  assert.deepEqual(
+    parseArguments(["--subject", " operator ", "--scope", "reports:read"]),
+    { subject: "operator", scopes: ["reports:read"] },
+  );
+});
+
+test("admin token signer and verifier reject malformed identity and scope claims", async () => {
+  const service = createAdminAccessTokenService(harness.config);
+  const invalidSubjects = [
+    "",
+    " ",
+    " operator",
+    "operator ",
+    "a".repeat(101),
+    "operator\n",
+    "operator\u0000",
+    "operator\u007f",
+    "operator\u0085",
+  ];
+  const invalidScopes = [
+    [],
+    [""],
+    ["content:read"],
+    ["*"],
+    ["reports:read", "unknown"],
+    ["reports:read", "reports:read"],
+    [" reports:read"],
+  ];
+  for (const actorSubject of invalidSubjects) {
+    await assert.rejects(
+      service.issue({ actorSubject, scopes: ["reports:read"] }),
+      /principal is invalid/,
+    );
+  }
+  for (const scopes of invalidScopes) {
+    await assert.rejects(
+      service.issue({ actorSubject: "operator", scopes }),
+      /principal is invalid/,
+    );
+  }
+  for (const actorSubject of ["a", "가".repeat(100), "😀".repeat(100)]) {
+    const principal = { actorSubject, scopes: ["reports:read"] };
+    assert.deepEqual(
+      await service.verify(await service.issue(principal)),
+      principal,
+    );
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  const valid: JWTPayload = {
+    sub: "operator",
+    scope: ["reports:read"],
+    iat: now,
+    exp: now + 900,
+    iss: harness.config.adminAccessTokenIssuer,
+    aud: harness.config.adminAccessTokenAudience,
+  };
+  const invalidClaims: JWTPayload[] = [
+    ...invalidSubjects.map((sub) => ({ ...valid, sub })),
+    ...invalidScopes.map((scope) => ({ ...valid, scope })),
+    { ...valid, sub: undefined },
+    { ...valid, scope: undefined },
+    { ...valid, scope: "reports:read" },
+    { ...valid, scope: [1] },
+    { ...valid, iat: undefined },
+    { ...valid, exp: undefined },
+    { ...valid, iat: now + 60 },
+    { ...valid, iat: now - 1000, exp: now - 1 },
+    { ...valid, exp: now + 901 },
+    { ...valid, exp: now },
+    { ...valid, iat: now - 0.5 },
+    { ...valid, exp: now + 899.5 },
+    { ...valid, iss: "wrong-issuer" },
+    { ...valid, aud: "wrong-audience" },
+  ];
+  for (const claims of invalidClaims) {
+    const token = await new SignJWT(claims)
+      .setProtectedHeader({ alg: "HS256", typ: "JWT" })
+      .sign(new TextEncoder().encode(harness.config.adminAccessTokenSecret));
+    await assert.rejects(service.verify(token), {
+      code: "ADMIN_UNAUTHORIZED",
+      statusCode: 401,
+    });
+  }
+});
 
 test("admin report routes require admin authentication and separate read from triage scope", async () => {
   await resetReportFixtures();

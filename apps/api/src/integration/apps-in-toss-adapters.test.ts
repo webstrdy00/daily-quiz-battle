@@ -30,6 +30,7 @@ function expectAppError(
   assert.equal(thrown.retryable, expected.retryable);
   assert.equal(thrown.statusCode, expected.statusCode);
   assert.equal(thrown.details, undefined);
+  assert.doesNotMatch(thrown.message, /not exposed|failed-push/);
 }
 
 function jsonBody(value: unknown): string {
@@ -183,20 +184,46 @@ test("identity interpreter treats HTTP 400, 429, and 500 as retryable dependency
   }
 });
 
-test("notification interpreter requires a 2xx SUCCESS envelope with an object", () => {
+function emptyChannelResults() {
+  return {
+    sentAlimtalk: [],
+    sentFriendtalk: [],
+    sentInbox: [],
+    sentPush: [],
+    sentSms: [],
+  };
+}
+
+function notificationSuccess() {
+  return {
+    msgCount: 1,
+    sentAlimtalkCount: 0,
+    sentFriendtalkCount: 0,
+    sentInboxCount: 0,
+    sentPushCount: 1,
+    sentSmsCount: 0,
+    detail: {
+      ...emptyChannelResults(),
+      sentPush: [{ contentId: "push-success" }],
+    },
+    fail: emptyChannelResults(),
+  };
+}
+
+test("notification interpreter requires a documented 2xx successful send outcome", () => {
   for (const statusCode of [200, 201]) {
     assert.doesNotThrow(() =>
       interpretNotificationResponse({
         statusCode,
         body: jsonBody({
           resultType: "SUCCESS",
-          success: { msgCount: 1 },
+          success: notificationSuccess(),
         }),
       }),
     );
   }
 
-  for (const success of [null, true, "sent", [], 1]) {
+  for (const success of [null, true, "sent", [], 1, {}, { msgCount: 1 }]) {
     expectAppError(
       () =>
         interpretNotificationResponse({
@@ -205,6 +232,138 @@ test("notification interpreter requires a 2xx SUCCESS envelope with an object", 
         }),
       notificationRejected,
     );
+  }
+});
+
+test("notification interpreter accepts success in each documented channel and partial success", () => {
+  for (const channel of [
+    "sentAlimtalk",
+    "sentFriendtalk",
+    "sentInbox",
+    "sentPush",
+    "sentSms",
+  ] as const) {
+    const success = {
+      ...notificationSuccess(),
+      sentPushCount: 0,
+      [`${channel}Count`]: 1,
+      detail: {
+        ...emptyChannelResults(),
+        [channel]: [{ contentId: "channel-success" }],
+      },
+      fail: {
+        ...emptyChannelResults(),
+        sentPush: [
+          { contentId: "failed-push", reachedFailReason: "not exposed" },
+        ],
+      },
+    };
+    assert.doesNotThrow(() =>
+      interpretNotificationResponse({
+        statusCode: 200,
+        body: jsonBody({ resultType: "SUCCESS", success }),
+      }),
+    );
+  }
+});
+
+test("notification interpreter rejects zero sends, all failed sends, and contradictory success evidence", () => {
+  for (const success of [
+    {
+      ...notificationSuccess(),
+      msgCount: 0,
+      sentPushCount: 0,
+      detail: emptyChannelResults(),
+    },
+    {
+      ...notificationSuccess(),
+      sentPushCount: 0,
+      detail: emptyChannelResults(),
+      fail: {
+        ...emptyChannelResults(),
+        sentPush: [
+          { contentId: "failed-push", reachedFailReason: "not exposed" },
+        ],
+      },
+    },
+    { ...notificationSuccess(), detail: emptyChannelResults() },
+    { ...notificationSuccess(), msgCount: 0 },
+    { ...notificationSuccess(), sentPushCount: 0 },
+    {
+      ...notificationSuccess(),
+      detail: {
+        ...emptyChannelResults(),
+        sentPush: [
+          { contentId: "failed-push", reachedFailReason: "not exposed" },
+        ],
+      },
+    },
+  ]) {
+    expectAppError(
+      () =>
+        interpretNotificationResponse({
+          statusCode: 200,
+          body: jsonBody({ resultType: "SUCCESS", success }),
+        }),
+      notificationRejected,
+    );
+  }
+});
+
+test("notification interpreter rejects malformed or missing int32 counts in every channel", () => {
+  for (const field of [
+    "msgCount",
+    "sentAlimtalkCount",
+    "sentFriendtalkCount",
+    "sentInboxCount",
+    "sentPushCount",
+    "sentSmsCount",
+  ]) {
+    for (const value of [undefined, null, "1", true, -1, 0.5, 2_147_483_648]) {
+      expectAppError(
+        () =>
+          interpretNotificationResponse({
+            statusCode: 200,
+            body: jsonBody({
+              resultType: "SUCCESS",
+              success: { ...notificationSuccess(), [field]: value },
+            }),
+          }),
+        notificationRejected,
+      );
+    }
+  }
+});
+
+test("notification interpreter rejects malformed channel details without exposing provider data", () => {
+  for (const field of ["detail", "fail"]) {
+    for (const value of [
+      undefined,
+      null,
+      {},
+      { ...emptyChannelResults(), sentPush: "not exposed" },
+      {
+        ...emptyChannelResults(),
+        sentPush: [{ reachedFailReason: "not exposed" }],
+      },
+      { ...emptyChannelResults(), sentPush: [{ contentId: 1 }] },
+      {
+        ...emptyChannelResults(),
+        sentPush: [{ contentId: "not exposed", reachedFailReason: 1 }],
+      },
+    ]) {
+      expectAppError(
+        () =>
+          interpretNotificationResponse({
+            statusCode: 200,
+            body: jsonBody({
+              resultType: "SUCCESS",
+              success: { ...notificationSuccess(), [field]: value },
+            }),
+          }),
+        notificationRejected,
+      );
+    }
   }
 });
 
@@ -275,7 +434,7 @@ test("notification interpreter rejects unknown business and resultType failures"
 test("notification interpreter rejects malformed, non-JSON, and oversized 2xx bodies", () => {
   const oversizedSuccess = jsonBody({
     resultType: "SUCCESS",
-    success: { padding: "x".repeat(65_537) },
+    success: { ...notificationSuccess(), padding: "x".repeat(65_537) },
   });
   for (const body of ["not-json", "{}", oversizedSuccess]) {
     expectAppError(
@@ -286,7 +445,10 @@ test("notification interpreter rejects malformed, non-JSON, and oversized 2xx bo
 });
 
 test("notification interpreter classifies HTTP 400, 429, and 500 before envelopes", () => {
-  const successBody = jsonBody({ resultType: "SUCCESS", success: {} });
+  const successBody = jsonBody({
+    resultType: "SUCCESS",
+    success: notificationSuccess(),
+  });
   expectAppError(
     () => interpretNotificationResponse({ statusCode: 400, body: successBody }),
     notificationRejected,

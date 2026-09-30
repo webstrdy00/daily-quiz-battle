@@ -367,14 +367,27 @@ export default function App() {
     setLoginIssue(issue ?? null);
     setRevisions([]);
     setRevisionCursor(null);
+    setRevisionLoading(false);
+    setRevisionIssue(null);
+    setRevisionActionBusy(null);
+    setRevisionActionIssue(null);
+    setRevisionSuccess("");
+    setTimeSensitive(false);
     setPublishedRevisions([]);
     setPublishedCursor(null);
+    setPublishedLoading(false);
+    setPublishedIssue(null);
     setSelectedRevisionIds([]);
     setChoiceOrders({});
     setRevisionCreateOpen(false);
     setQuestionIdInput("");
     setCorrectionSource(null);
     setDailySets([]);
+    setDailyLoading(false);
+    setDailyIssue(null);
+    setDailyActionBusy(false);
+    setDailyActionIssue(null);
+    setDailySuccess("");
     setLatestDraft(null);
     setPendingPublish(null);
     setPendingVoid(null);
@@ -383,6 +396,8 @@ export default function App() {
     setVoidActionIssue(null);
     setAuditLogs([]);
     setAuditCursor(null);
+    setAuditLoading(false);
+    setAuditIssue(null);
     setReports([]);
     setReportCursor(null);
     setReportLoading(false);
@@ -421,7 +436,12 @@ export default function App() {
 
     let client: AdminApiClient;
     try {
-      client = new AdminApiClient(tokenInput);
+      client = new AdminApiClient(tokenInput, () => {
+        if (!mountedRef.current || clientRef.current !== client) return;
+        clearSession({
+          message: "운영자 JWT가 만료되었습니다. 새 토큰을 입력해 주세요.",
+        });
+      });
     } catch (error) {
       setTokenInput("");
       setLoginBusy(false);
@@ -447,14 +467,8 @@ export default function App() {
       void loadAuditLogs(false, client);
       void loadReports(false, client);
     } catch (error) {
-      if (clientRef.current === client) {
-        client.dispose();
-        clientRef.current = null;
-      }
-      if (mountedRef.current) {
-        setLoginBusy(false);
-        setLoginIssue(toUiIssue(error));
-      }
+      if (!mountedRef.current || clientRef.current !== client) return;
+      clearSession(toUiIssue(error));
     }
   }
 

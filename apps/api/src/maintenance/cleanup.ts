@@ -20,6 +20,13 @@ export interface CleanupCounts {
   claimedChallengesPurged: number;
   completedChallengesRedacted: number;
   idempotencyRecordsDeleted: number;
+  terminalReportsDeleted?: number;
+  publishedOutboxDeleted?: number;
+  adminAuditLogsDeleted?: number;
+}
+
+export interface CleanupOptions {
+  operationalRetentionEnabled?: boolean;
 }
 
 function retentionCutoff(now: Date, days: number): string {
@@ -220,9 +227,70 @@ async function deleteExpiredIdempotencyRecords(
   return count(rows);
 }
 
+async function deleteTerminalReports(
+  transaction: Transaction,
+  cutoff: string,
+): Promise<number> {
+  const rows = await transaction<CountRow[]>`
+    WITH candidates AS (
+      SELECT id FROM reports
+      WHERE status IN ('resolved', 'dismissed') AND triaged_at <= ${cutoff}
+      ORDER BY id
+      FOR UPDATE SKIP LOCKED
+      LIMIT ${CLEANUP_BATCH_SIZE}
+    ), deleted AS (
+      DELETE FROM reports AS report USING candidates
+      WHERE report.id = candidates.id RETURNING report.id
+    )
+    SELECT count(*)::integer AS count FROM deleted
+  `;
+  return count(rows);
+}
+
+async function deletePublishedOutbox(
+  transaction: Transaction,
+  cutoff: string,
+): Promise<number> {
+  const rows = await transaction<CountRow[]>`
+    WITH candidates AS (
+      SELECT id FROM notification_outbox
+      WHERE status = 'published' AND published_at <= ${cutoff}
+      ORDER BY id
+      FOR UPDATE SKIP LOCKED
+      LIMIT ${CLEANUP_BATCH_SIZE}
+    ), deleted AS (
+      DELETE FROM notification_outbox AS event USING candidates
+      WHERE event.id = candidates.id RETURNING event.id
+    )
+    SELECT count(*)::integer AS count FROM deleted
+  `;
+  return count(rows);
+}
+
+async function deleteAdminAuditLogs(
+  transaction: Transaction,
+  cutoff: string,
+): Promise<number> {
+  const rows = await transaction<CountRow[]>`
+    WITH candidates AS (
+      SELECT id FROM admin_audit_logs
+      WHERE created_at <= ${cutoff}
+      ORDER BY id
+      FOR UPDATE SKIP LOCKED
+      LIMIT ${CLEANUP_BATCH_SIZE}
+    ), deleted AS (
+      DELETE FROM admin_audit_logs AS log USING candidates
+      WHERE log.id = candidates.id RETURNING log.id
+    )
+    SELECT count(*)::integer AS count FROM deleted
+  `;
+  return count(rows);
+}
+
 export async function runCleanup(
   database: Database,
   now: Date,
+  options: CleanupOptions = {},
 ): Promise<CleanupCounts> {
   if (!Number.isFinite(now.getTime())) {
     throw new TypeError("Cleanup time must be a valid Date");
@@ -237,6 +305,12 @@ export async function runCleanup(
     CHALLENGE_RESULT_RETENTION_DAYS,
   );
   const currentTimestamp = now.toISOString();
+  const operationalCutoff = options.operationalRetentionEnabled
+    ? retentionCutoff(now, 30)
+    : undefined;
+  const auditCutoff = options.operationalRetentionEnabled
+    ? retentionCutoff(now, 180)
+    : undefined;
 
   return database.client.begin(async (transaction) => ({
     challengesExpired: await expireOpenChallenges(
@@ -265,5 +339,21 @@ export async function runCleanup(
       transaction,
       currentTimestamp,
     ),
+    ...(operationalCutoff !== undefined && auditCutoff !== undefined
+      ? {
+          terminalReportsDeleted: await deleteTerminalReports(
+            transaction,
+            operationalCutoff,
+          ),
+          publishedOutboxDeleted: await deletePublishedOutbox(
+            transaction,
+            operationalCutoff,
+          ),
+          adminAuditLogsDeleted: await deleteAdminAuditLogs(
+            transaction,
+            auditCutoff,
+          ),
+        }
+      : {}),
   }));
 }

@@ -115,6 +115,23 @@ function parseCompletedAttempt(value: unknown): CompletedAttemptResponse {
   return result;
 }
 
+function completionPayload(
+  start: DailyAvailableStartResponse,
+  expectedScore: number,
+) {
+  const answers = start.questions.map((question, index) => {
+    const correctIndex = correctSelections[index]!;
+    const selectedIndex =
+      index < expectedScore ? correctIndex : (correctIndex + 1) % 4;
+    return {
+      sequence: question.sequence,
+      questionRevisionId: question.revisionId,
+      selectedIndex,
+    };
+  });
+  return { answers };
+}
+
 async function finishQuiz(
   user: TestUser,
   keyPrefix: string,
@@ -122,31 +139,11 @@ async function finishQuiz(
   existingStart?: DailyAvailableStartResponse,
 ): Promise<DailyAvailableStartResponse> {
   const start = existingStart ?? (await startQuiz(user.token));
-  for (const [index, question] of start.questions.entries()) {
-    const correctIndex = correctSelections[index]!;
-    const selectedIndex =
-      index < expectedScore ? correctIndex : (correctIndex + 1) % 4;
-    const response = await harness.app.inject({
-      method: "POST",
-      url: `/v1/attempts/${start.attempt.id}/answers`,
-      headers: idempotentHeaders(
-        user.token,
-        `${keyPrefix}-answer-${index + 1}`,
-      ),
-      payload: {
-        sequence: question.sequence,
-        questionRevisionId: question.revisionId,
-        selectedIndex,
-      },
-    });
-    assert.equal(response.statusCode, 200, response.body);
-  }
-
   const completion = await harness.app.inject({
     method: "POST",
     url: `/v1/attempts/${start.attempt.id}/complete`,
     headers: idempotentHeaders(user.token, `${keyPrefix}-complete`),
-    payload: {},
+    payload: completionPayload(start, expectedScore),
   });
   assert.equal(completion.statusCode, 200, completion.body);
   const completed = parseCompletedAttempt(completion.json());
@@ -972,21 +969,16 @@ test("claiming an existing same-set attempt preserves the daily deadline", async
   }, /attempt challenge provenance is immutable/);
 
   harness.setNow(new Date("2026-08-29T16:00:00.000Z"));
-  const question = existingAttempt.questions[0]!;
-  const answerAtDailyDeadline = await harness.app.inject({
+  const completionAtDailyDeadline = await harness.app.inject({
     method: "POST",
-    url: `/v1/attempts/${existingAttempt.attempt.id}/answers`,
+    url: `/v1/attempts/${existingAttempt.attempt.id}/complete`,
     headers: idempotentHeaders(
       opponent.token,
-      "existing-deadline-answer-at-boundary",
+      "existing-deadline-complete-at-boundary",
     ),
-    payload: {
-      sequence: question.sequence,
-      questionRevisionId: question.revisionId,
-      selectedIndex: correctSelections[0],
-    },
+    payload: completionPayload(existingAttempt, 5),
   });
-  expectApiError(answerAtDailyDeadline, 409, "ATTEMPT_ABANDONED");
+  expectApiError(completionAtDailyDeadline, 409, "ATTEMPT_ABANDONED");
 
   const abandonedRows = await harness.database.client<
     { status: string; challenge_id: string | null }[]
@@ -997,6 +989,41 @@ test("claiming an existing same-set attempt preserves the daily deadline", async
   `;
   assert.equal(abandonedRows[0]?.status, "abandoned");
   assert.equal(abandonedRows[0]?.challenge_id, null);
+});
+
+test("historical challenge attempts accept a full batch before challenge expiry", async () => {
+  harness.setNow(PRIMARY_DAY_NOON);
+  const creator = await bootstrapUser("historical-batch-creator");
+  const creatorAttempt = await finishQuiz(
+    creator,
+    "historical-batch-creator",
+    4,
+  );
+  const created = await createChallenge(
+    creator,
+    creatorAttempt.attempt.id,
+    "historical-batch-create",
+  );
+  harness.setNow(new Date("2026-08-29T16:00:00.001Z"));
+  const opponent = await bootstrapUser("historical-batch-opponent");
+  const claimResponse = await claimChallenge(
+    opponent,
+    created.challenge.token,
+    "historical-batch-claim",
+  );
+  assert.equal(claimResponse.statusCode, 200, claimResponse.body);
+  const claimed = ClaimChallengeResponseSchema.parse(claimResponse.json());
+  harness.setNow(new Date(new Date(created.challenge.expiresAt).getTime() - 1));
+  await finishQuiz(opponent, "historical-batch-opponent", 5, claimed.daily);
+  const resultResponse = await getResult(opponent, created.challenge.token);
+  assert.equal(resultResponse.statusCode, 200, resultResponse.body);
+  const result = ChallengeResultResponseSchema.parse(resultResponse.json());
+  assert.equal(result.status, "completed");
+  if (result.status !== "completed") {
+    assert.fail("historical batch must complete the challenge before expiry");
+  }
+  assert.equal(result.me.score, 5);
+  assert.equal(result.opponent.score, 4);
 });
 
 test("historical challenge attempts use immutable provenance until challenge expiry", async () => {
@@ -1047,34 +1074,41 @@ test("historical challenge attempts use immutable provenance until challenge exp
   );
 
   const firstQuestion = claimed.daily.questions[0]!;
-  const historicalAnswer = await harness.app.inject({
-    method: "POST",
-    url: `/v1/attempts/${claimed.daily.attempt.id}/answers`,
-    headers: idempotentHeaders(
-      opponent.token,
-      "provenance-answer-before-expiry",
-    ),
-    payload: {
-      sequence: firstQuestion.sequence,
-      questionRevisionId: firstQuestion.revisionId,
-      selectedIndex: correctSelections[0],
-    },
-  });
-  assert.equal(historicalAnswer.statusCode, 200, historicalAnswer.body);
+  // Preserve a historical partial submission without invoking the removed API.
+  await harness.database.client`
+    INSERT INTO attempt_answers
+      (attempt_id, sequence, question_revision_id, selected_index, received_at)
+    VALUES (
+      ${claimed.daily.attempt.id}, ${firstQuestion.sequence},
+      ${firstQuestion.revisionId}, ${correctSelections[0]},
+      ${new Date("2026-08-29T16:00:00.001Z").toISOString()}
+    )
+  `;
 
   harness.setNow(new Date(created.challenge.expiresAt));
-  const secondQuestion = claimed.daily.questions[1]!;
-  const answerAtChallengeExpiry = await harness.app.inject({
+  const completionAtChallengeExpiry = await harness.app.inject({
     method: "POST",
-    url: `/v1/attempts/${claimed.daily.attempt.id}/answers`,
-    headers: idempotentHeaders(opponent.token, "provenance-answer-at-expiry"),
-    payload: {
-      sequence: secondQuestion.sequence,
-      questionRevisionId: secondQuestion.revisionId,
-      selectedIndex: correctSelections[1],
-    },
+    url: `/v1/attempts/${claimed.daily.attempt.id}/complete`,
+    headers: idempotentHeaders(opponent.token, "provenance-complete-at-expiry"),
+    payload: completionPayload(claimed.daily, 5),
   });
-  expectApiError(answerAtChallengeExpiry, 409, "ATTEMPT_ABANDONED");
+  expectApiError(completionAtChallengeExpiry, 409, "ATTEMPT_ABANDONED");
+  const savedAnswers = await harness.database.client<
+    { sequence: number; selected_index: number }[]
+  >`
+    SELECT sequence, selected_index
+    FROM attempt_answers
+    WHERE attempt_id = ${claimed.daily.attempt.id}
+  `;
+  assert.deepEqual(
+    [...savedAnswers],
+    [
+      {
+        sequence: firstQuestion.sequence,
+        selected_index: correctSelections[0],
+      },
+    ],
+  );
 
   await harness.database.client`
     DELETE FROM challenges
@@ -1251,20 +1285,15 @@ test("void overrides challenge replays and participant projections without rewri
   const firstClaimBody = ClaimChallengeResponseSchema.parse(firstClaim.json());
   assert.equal(firstClaimBody.challenge.status, "claimed");
   for (const [index, question] of firstClaimBody.daily.questions.entries()) {
-    const answer = await harness.app.inject({
-      method: "POST",
-      url: `/v1/attempts/${firstClaimBody.daily.attempt.id}/answers`,
-      headers: idempotentHeaders(
-        replayOpponent.token,
-        `void-replay-opponent-answer-${index + 1}`,
-      ),
-      payload: {
-        sequence: question.sequence,
-        questionRevisionId: question.revisionId,
-        selectedIndex: correctSelections[index],
-      },
-    });
-    assert.equal(answer.statusCode, 200, answer.body);
+    await harness.database.client`
+      INSERT INTO attempt_answers
+        (attempt_id, sequence, question_revision_id, selected_index, received_at)
+      VALUES (
+        ${firstClaimBody.daily.attempt.id}, ${question.sequence},
+        ${question.revisionId}, ${correctSelections[index]!},
+        ${PRIMARY_DAY_NOON.toISOString()}
+      )
+    `;
   }
 
   const completedChallenge = await createChallenge(
@@ -1411,7 +1440,7 @@ test("void overrides challenge replays and participant projections without rewri
       replayOpponent.token,
       "void-replay-opponent-complete",
     ),
-    payload: {},
+    payload: completionPayload(firstClaimBody.daily, 5),
   });
   assert.equal(blockedCompletion.statusCode, 200, blockedCompletion.body);
   const blockedCompletionBody = CompleteAttemptResponseSchema.parse(

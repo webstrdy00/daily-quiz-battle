@@ -33,6 +33,10 @@ GRANT SELECT ON ALL TABLES IN SCHEMA public TO daily_quiz_worker;
 REVOKE ALL ON public.app_migrations FROM daily_quiz_worker;
 GRANT UPDATE, DELETE ON public.challenges, public.idempotency_records TO daily_quiz_worker;
 GRANT UPDATE ON public.notification_outbox, public.users TO daily_quiz_worker;
+GRANT DELETE ON public.reports, public.notification_outbox, public.admin_audit_logs TO daily_quiz_worker;
+-- SELECT FOR UPDATE SKIP LOCKED requires UPDATE on at least one column.
+-- Grant only the primary key, not report triage or audit payload mutation.
+GRANT UPDATE (id) ON public.reports, public.admin_audit_logs TO daily_quiz_worker;
 GRANT INSERT, UPDATE ON public.operation_task_runs TO daily_quiz_worker;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO daily_quiz_api, daily_quiz_worker;
 -- No table ownership, DDL, role management, TRUNCATE or future-object defaults.

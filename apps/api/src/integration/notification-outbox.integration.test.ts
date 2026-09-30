@@ -144,6 +144,19 @@ function parseCompletedAttempt(value: unknown): CompletedAttemptResponse {
   return result;
 }
 
+function completionPayload(start: DailyAvailableStartResponse, score: number) {
+  const answers = start.questions.map((question, index) => {
+    const correctIndex = correctSelections[index]!;
+    const selectedIndex = index < score ? correctIndex : (correctIndex + 1) % 4;
+    return {
+      sequence: question.sequence,
+      questionRevisionId: question.revisionId,
+      selectedIndex,
+    };
+  });
+  return { answers };
+}
+
 async function finishQuiz(
   user: TestUser,
   label: string,
@@ -151,27 +164,11 @@ async function finishQuiz(
   existingStart?: DailyAvailableStartResponse,
 ): Promise<DailyAvailableStartResponse> {
   const start = existingStart ?? (await startQuiz(user));
-  for (const [index, question] of start.questions.entries()) {
-    const correctIndex = correctSelections[index]!;
-    const selectedIndex = index < score ? correctIndex : (correctIndex + 1) % 4;
-    const answer = await harness.app.inject({
-      method: "POST",
-      url: `/v1/attempts/${start.attempt.id}/answers`,
-      headers: idempotentHeaders(user.token, `${label}-answer-${index + 1}`),
-      payload: {
-        sequence: question.sequence,
-        questionRevisionId: question.revisionId,
-        selectedIndex,
-      },
-    });
-    assert.equal(answer.statusCode, 200, answer.body);
-  }
-
   const completion = await harness.app.inject({
     method: "POST",
     url: `/v1/attempts/${start.attempt.id}/complete`,
     headers: idempotentHeaders(user.token, `${label}-complete`),
-    payload: {},
+    payload: completionPayload(start, score),
   });
   assert.equal(completion.statusCode, 200, completion.body);
   const completed = parseCompletedAttempt(completion.json());
@@ -261,7 +258,7 @@ async function createCompletedChallenge(
       method: "POST",
       url: `/v1/attempts/${opponentAttemptId}/complete`,
       headers: idempotentHeaders(opponent.token, `${label}-complete-replay`),
-      payload: {},
+      payload: completionPayload(claimed.daily, 2),
     });
     assert.equal(replay.statusCode, 200, replay.body);
     assert.equal(parseCompletedAttempt(replay.json()).score, 2);

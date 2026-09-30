@@ -3,15 +3,14 @@ import {
   type ChallengeResultResponse,
   type CompleteAttemptResponse,
   type DailyStartResponse,
-  type PublicQuestion,
 } from "@daily-quiz-battle/contracts";
 import {
   type Ref,
   useCallback,
   useEffect,
-  useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
 } from "react";
 import {
   ApiClientError,
@@ -21,11 +20,13 @@ import {
   createIdempotencyKey,
   deleteAccount,
   getChallengeLanding,
+  getChallengeCapabilities,
+  subscribeChallengeCapabilities,
   getChallengeResult,
   getResultNotificationPreference,
+  getAuthenticatedUserId,
   isDailySetVoidedError,
   startDailyQuiz,
-  submitAnswer,
   updateResultNotificationPreference,
 } from "./lib/api";
 import {
@@ -44,6 +45,15 @@ import {
   shareChallenge,
 } from "./lib/platform";
 import "./App.css";
+import {
+  clearDraft,
+  clearQuizDateDrafts,
+  draftKey,
+  newDraft,
+  readDraft,
+  mutateDraft,
+  type QuizDraft,
+} from "./lib/quiz-draft";
 
 type Screen =
   | "loading"
@@ -77,13 +87,6 @@ interface DisplayError {
   title: string;
   message: string;
   requestId?: string;
-}
-
-interface PendingAnswer {
-  key: string;
-  sequence: number;
-  revisionId: string;
-  selectedIndex: number;
 }
 
 const challengePathPattern = /^\/challenge\/([A-Za-z0-9_-]{43})\/?$/;
@@ -180,7 +183,7 @@ function ErrorPanel({
   headingRef,
 }: {
   error: DisplayError;
-  onRetry: () => void;
+  onRetry: (() => void) | null;
   busy: boolean;
   headingRef: Ref<HTMLHeadingElement>;
 }) {
@@ -197,9 +200,11 @@ function ErrorPanel({
         {error.requestId ? (
           <p className="request-id">문의 코드: {error.requestId}</p>
         ) : null}
-        <button className="primary-button" onClick={onRetry} disabled={busy}>
-          {busy ? "다시 연결하는 중…" : "다시 시도"}
-        </button>
+        {onRetry ? (
+          <button className="primary-button" onClick={onRetry} disabled={busy}>
+            {busy ? "다시 연결하는 중…" : "다시 시도"}
+          </button>
+        ) : null}
       </section>
     </main>
   );
@@ -211,16 +216,16 @@ function HomeScreen({
   onSettings,
   headingRef,
 }: {
-  daily: AvailableDaily;
+  daily: AvailableDaily | null;
   onStart: () => void;
   onSettings: () => void;
   headingRef: Ref<HTMLHeadingElement>;
 }) {
-  const answeredCount = daily.attempt.answeredCount;
+  const answeredCount = daily?.attempt.answeredCount ?? 0;
   const isResume = answeredCount > 0;
 
   return (
-    <main className="app-shell">
+    <main className="app-shell home-shell">
       <header className="top-bar">
         <div className="brand-lockup">
           <span className="brand-mark brand-mark-small" aria-hidden="true">
@@ -228,49 +233,88 @@ function HomeScreen({
           </span>
           <span>오늘의 상식대결</span>
         </div>
-        <span className="date-chip">{daily.attempt.quizDate}</span>
+        {daily ? (
+          <span className="date-chip">{daily.attempt.quizDate}</span>
+        ) : null}
       </header>
 
       <section className="hero-card" aria-labelledby="home-title">
         <p className="eyebrow">DAILY QUIZ · 5 QUESTIONS</p>
         <h1 id="home-title" ref={headingRef} tabIndex={-1}>
-          오늘 5문제, 얼마나 맞힐까요?
+          오늘 5문제,
+          <br />
+          얼마나
+          <br />
+          <span>맞힐까요?</span>
         </h1>
         <p className="hero-copy">
-          모두에게 같은 문제가 제공돼요. 1~2분이면 오늘의 상식 점수를 확인할 수
-          있어요.
+          잠깐의 호기심, 오늘의 상식.
+          <br />
+          모두에게 같은 5문제로 가볍게 시작해요.
         </p>
+
+        <div className="daily-deck" aria-hidden="true">
+          <span className="deck-card">
+            <small>01</small>
+            <b>?</b>
+          </span>
+          <span className="deck-card">
+            <small>02</small>
+            <b>?</b>
+          </span>
+          <span className="deck-card">
+            <small>03</small>
+            <b>?</b>
+          </span>
+          <span className="deck-card">
+            <small>04</small>
+            <b>?</b>
+          </span>
+          <span className="deck-card">
+            <small>05</small>
+            <b>Q</b>
+          </span>
+          <span className="deck-caption">다섯 번의 작은 발견</span>
+        </div>
 
         {isResume ? (
           <div className="resume-box">
-            <strong>{answeredCount}문제까지 저장됐어요</strong>
-            <span>중단한 곳부터 안전하게 이어집니다.</span>
+            <strong>이전에 서버에 제출한 답 {answeredCount}개</strong>
+            <span>이 답들은 유지하고 나머지 답을 선택해 주세요.</span>
           </div>
         ) : (
           <div className="quiz-preview" aria-label="퀴즈 구성">
-            <div>
-              <strong>5</strong>
-              <span>오늘의 문제</span>
-            </div>
-            <div>
-              <strong>4지</strong>
-              <span>선다형</span>
-            </div>
-            <div>
-              <strong>1회</strong>
-              <span>공정한 도전</span>
-            </div>
+            <span>5문제</span>
+            <span>4지선다</span>
+            <span>하루 한 번</span>
           </div>
         )}
 
-        <button className="primary-button hero-button" onClick={onStart}>
-          {isResume ? "이어서 풀기" : "오늘 퀴즈 시작"}
+        <button
+          className="primary-button hero-button"
+          onClick={onStart}
+          disabled={daily === null}
+          aria-busy={daily === null}
+        >
+          <span aria-live="polite">
+            {daily === null
+              ? "퀴즈를 연결하고 있어요…"
+              : isResume
+                ? "이어서 풀기"
+                : "오늘 퀴즈 시작"}
+          </span>
+          <span aria-hidden="true">↗</span>
         </button>
-        <button className="text-button" onClick={onSettings}>
+        <button
+          className="text-button"
+          onClick={onSettings}
+          disabled={daily === null}
+        >
           계정 설정
         </button>
         <p className="trust-copy">
-          제출한 답은 바꿀 수 없으며 점수는 서버가 계산해요.
+          답은 기기에 임시 보관하고, 5문제를 최종 제출하면 서버가 점수를
+          계산해요.
         </p>
       </section>
     </main>
@@ -279,27 +323,37 @@ function HomeScreen({
 
 function QuizScreen({
   daily,
-  selectedIndex,
+  draft,
   onSelect,
-  onSubmit,
+  onNavigate,
   onComplete,
+  onReload,
   busy,
   actionError,
+  storageError,
   headingRef,
 }: {
   daily: AvailableDaily;
-  selectedIndex: number | null;
+  draft: QuizDraft;
   onSelect: (index: number) => void;
-  onSubmit: () => void;
+  onNavigate: (index: number) => void;
   onComplete: () => void;
+  onReload: () => void;
   busy: boolean;
   actionError: DisplayError | null;
+  storageError: string | null;
   headingRef: Ref<HTMLHeadingElement>;
 }) {
-  const answeredCount = daily.attempt.answeredCount;
-  const question: PublicQuestion | undefined = daily.questions[answeredCount];
+  const answeredCount = draft.selections.filter(
+    (answer) => answer !== null,
+  ).length;
+  const question = daily.questions[draft.currentQuestion];
+  const selectedIndex = draft.selections[draft.currentQuestion];
+  const locked = daily.attempt.answers.some(
+    (answer) => answer.sequence === question?.sequence,
+  );
 
-  if (question === undefined) {
+  if (question === undefined || draft.frozen !== null) {
     return (
       <main className="app-shell">
         <section className="card finishing-card">
@@ -307,9 +361,43 @@ function QuizScreen({
             ✓
           </span>
           <h1 ref={headingRef} tabIndex={-1}>
-            5문제를 모두 저장했어요
+            다섯 답을 최종 제출할까요?
           </h1>
-          <p>서버에서 정답을 확인하고 점수를 계산할게요.</p>
+          <p>최종 제출하면 서버에서 정답을 확인하고 점수를 계산해요.</p>
+          <ol className="draft-review">
+            {daily.questions.map((item, index) => (
+              <li key={item.revisionId}>
+                <strong>
+                  {item.sequence}. {item.prompt}
+                </strong>
+                <span>
+                  {draft.selections[index] === null
+                    ? "아직 선택하지 않았어요"
+                    : item.choices[draft.selections[index]!]}
+                </span>
+                <button
+                  className="text-button"
+                  disabled={busy || draft.frozen !== null}
+                  onClick={() => onNavigate(index)}
+                >
+                  답 확인·수정
+                </button>
+              </li>
+            ))}
+          </ol>
+          {storageError ? (
+            <p className="inline-error" role="alert">
+              {storageError}
+            </p>
+          ) : (
+            <p className="save-status">기기에 임시 보관</p>
+          )}
+          {draft.frozen !== null ? (
+            <p>
+              제출을 시작한 답안은 수정할 수 없어요. 응답을 확인하지 못했다면
+              같은 답안으로만 다시 제출합니다.
+            </p>
+          ) : null}
           {actionError ? (
             <div className="inline-error" role="alert">
               <strong>{actionError.title}</strong>
@@ -319,10 +407,19 @@ function QuizScreen({
           <button
             className="primary-button"
             onClick={onComplete}
-            disabled={busy}
+            disabled={busy || answeredCount !== 5}
           >
-            {busy ? "점수 계산 중…" : "결과 확인"}
+            {busy
+              ? "최종 제출 중…"
+              : draft.frozen
+                ? "같은 답안으로 다시 제출"
+                : "5문제 최종 제출"}
           </button>
+          {draft.frozen ? (
+            <button className="text-button" onClick={onReload} disabled={busy}>
+              서버 제출 상태 다시 확인
+            </button>
+          ) : null}
         </section>
       </main>
     );
@@ -341,12 +438,14 @@ function QuizScreen({
       </header>
 
       <section className="question-card" aria-labelledby="question-title">
-        <p className="category-label">오늘의 상식</p>
+        <p className="category-label">
+          QUESTION 0{question.sequence} · 오늘의 상식
+        </p>
         <h1 id="question-title" ref={headingRef} tabIndex={-1}>
           {question.prompt}
         </h1>
 
-        <fieldset disabled={busy}>
+        <fieldset disabled={busy || locked}>
           <legend className="sr-only">정답 선택</legend>
           <div className="choice-list">
             {question.choices.map((choice, index) => {
@@ -386,18 +485,34 @@ function QuizScreen({
           </div>
         ) : null}
 
-        <button
-          className="primary-button submit-button"
-          onClick={onSubmit}
-          disabled={selectedIndex === null || busy}
-        >
-          {busy ? "답을 저장하는 중…" : "이 답으로 제출"}
-        </button>
+        <div className="quiz-navigation">
+          <button
+            className="secondary-button"
+            disabled={busy || draft.currentQuestion === 0}
+            onClick={() => onNavigate(draft.currentQuestion - 1)}
+          >
+            이전
+          </button>
+          <button
+            className="primary-button"
+            disabled={busy}
+            onClick={() => onNavigate(draft.currentQuestion + 1)}
+          >
+            {draft.currentQuestion === 4 ? "답안 검토" : "다음"}
+          </button>
+        </div>
         <p className="save-status" aria-live="polite">
-          {busy
-            ? "서버에 안전하게 저장하고 있어요."
-            : "선택 후 제출하면 답을 바꿀 수 없어요."}
+          {locked
+            ? "이전에 서버에 제출한 답은 변경할 수 없어요."
+            : "최종 제출 전까지 답을 수정할 수 있어요."}
         </p>
+        {storageError ? (
+          <p className="inline-error" role="alert">
+            {storageError}
+          </p>
+        ) : (
+          <p className="save-status">기기에 임시 보관</p>
+        )}
       </section>
     </main>
   );
@@ -411,6 +526,7 @@ function ResultScreen({
   onShare,
   onChallengeStatus,
   challengeCreated,
+  invitationAvailable,
   busy,
   actionError,
   shareMessage,
@@ -425,6 +541,7 @@ function ResultScreen({
   onShare: () => void;
   onChallengeStatus: () => void;
   challengeCreated: boolean;
+  invitationAvailable: boolean;
   busy: boolean;
   actionError: DisplayError | null;
   shareMessage: string | null;
@@ -450,11 +567,12 @@ function ResultScreen({
           오늘 퀴즈 완료!
         </h1>
         <div
-          className="score-circle"
+          className="score-card"
           aria-label={`5문제 중 ${result.score}문제 정답`}
         >
           <strong>{result.score}</strong>
           <span>/ 5</span>
+          <small>문제 정답</small>
         </div>
         <p className="result-label">{resultLabel}</p>
         <p>소요시간은 승패에 사용하지 않아요. 정답 수로만 공정하게 겨룹니다.</p>
@@ -518,8 +636,16 @@ function ResultScreen({
       </section>
 
       <section className="next-step-card">
-        <strong>친구와 오늘 점수로 대결해 보세요.</strong>
-        <span>도전장을 받은 친구는 같은 날짜의 같은 5문제를 풀게 돼요.</span>
+        <strong>
+          {invitationAvailable
+            ? "친구와 오늘 점수로 대결해 보세요."
+            : "오늘의 도전을 마쳤어요."}
+        </strong>
+        <span>
+          {invitationAvailable
+            ? "도전장을 받은 친구는 같은 날짜의 같은 5문제를 풀게 돼요."
+            : "친구 초대는 현재 이용할 수 없어요. 아래에서 저장된 결과를 확인할 수 있어요."}
+        </span>
         {actionError ? (
           <div className="inline-error" role="alert">
             <strong>{actionError.title}</strong>
@@ -531,17 +657,19 @@ function ResultScreen({
             {shareMessage}
           </p>
         ) : null}
-        <button
-          className="primary-button"
-          onClick={onShare}
-          disabled={busy || reportPending}
-        >
-          {busy
-            ? "도전장을 준비하는 중…"
-            : challengeCreated
-              ? "도전장 다시 공유"
-              : "친구에게 도전장 보내기"}
-        </button>
+        {invitationAvailable ? (
+          <button
+            className="primary-button"
+            onClick={onShare}
+            disabled={busy || reportPending}
+          >
+            {busy
+              ? "도전장을 준비하는 중…"
+              : challengeCreated
+                ? "도전장 다시 공유"
+                : "친구에게 도전장 보내기"}
+          </button>
+        ) : null}
         {challengeCreated ? (
           <button
             className="secondary-button"
@@ -571,6 +699,13 @@ function ResultScreen({
 }
 
 function App() {
+  const challengeCapabilities = useSyncExternalStore(
+    subscribeChallengeCapabilities,
+    getChallengeCapabilities,
+  );
+  const invitationAvailable =
+    challengeCapabilities.challengeCreateEnabled &&
+    challengeCapabilities.challengeClaimEnabled;
   const [screen, setScreen] = useState<Screen>("loading");
   const [daily, setDaily] = useState<AvailableDaily | null>(null);
   const [result, setResult] = useState<CompletedResult | null>(null);
@@ -586,7 +721,11 @@ function App() {
   >(null);
   const [challengeIssue, setChallengeIssue] =
     useState<ChallengeIssueKind>("not-found");
-  const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
+  const [draft, setDraft] = useState<QuizDraft | null>(null);
+  const draftRef = useRef<QuizDraft | null>(null);
+  const activeQuizDate = useRef<string | null>(null);
+  const submitting = useRef(false);
+  const [storageError, setStorageError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [refreshingChallenge, setRefreshingChallenge] = useState(false);
   const [pollingPaused, setPollingPaused] = useState(document.hidden);
@@ -606,11 +745,10 @@ function App() {
     "home" | "result"
   >("home");
   const accountDeleted = useRef(false);
+  const [sessionEnded, setSessionEnded] = useState(false);
   const initialChallengeToken = useRef(challengeToken);
   const initializationGeneration = useRef(0);
   const initializationAbort = useRef<AbortController | null>(null);
-  const pendingAnswer = useRef<PendingAnswer | null>(null);
-  const pendingCompleteKey = useRef<string | null>(null);
   const pendingChallengeCreateKey = useRef<string | null>(null);
   const pendingClaimKey = useRef<string | null>(null);
   const notificationAgreementAbort = useRef<AbortController | null>(null);
@@ -620,39 +758,188 @@ function App() {
   const mainHeading = useRef<HTMLHeadingElement>(null);
   const lastFocusedHeading = useRef<string | null>(null);
 
-  const showVoidedResult = useCallback(() => {
-    initializationAbort.current?.abort();
-    initializationAbort.current = null;
-    initializationGeneration.current += 1;
-    completionAnalyticsBlocked.current = true;
-    setDaily(null);
-    setResult(null);
-    setChallengeToken(null);
-    setChallengeLanding(null);
-    setChallengeResult(null);
-    setChallengeRole(null);
-    setSelectedIndex(null);
-    setShareMessage(null);
-    setFatalError(null);
-    setActionError(null);
-    setReportPending(false);
-    setRefreshingChallenge(false);
-    setPollingPaused(true);
-    pendingAnswer.current = null;
-    pendingCompleteKey.current = null;
-    pendingChallengeCreateKey.current = null;
-    pendingClaimKey.current = null;
-    setBusy(false);
-    setScreen("voided");
+  const discardDraft = useCallback(() => {
+    const current = draftRef.current;
+    draftRef.current = null;
+    setDraft(null);
+    if (current !== null) {
+      void clearDraft(current).catch((error: unknown) => {
+        setStorageError(toDisplayError(error).message);
+      });
+    }
   }, []);
+
+  const discardDateDrafts = useCallback((quizDate: string) => {
+    const userId = getAuthenticatedUserId();
+    if (userId !== null) {
+      void clearQuizDateDrafts(userId, quizDate).catch((error: unknown) => {
+        setStorageError(toDisplayError(error).message);
+      });
+    }
+  }, []);
+
+  const hydrateDraft = useCallback(async (loaded: AvailableDaily) => {
+    const userId = getAuthenticatedUserId();
+    if (userId === null || accountDeleted.current) return;
+    const generation = initializationGeneration.current;
+    const isCurrent = () =>
+      !accountDeleted.current &&
+      generation === initializationGeneration.current &&
+      userId === getAuthenticatedUserId();
+    const base = newDraft(userId, loaded);
+    activeQuizDate.current = loaded.attempt.quizDate;
+    draftRef.current = null;
+    setDraft(null);
+    setStorageError(null);
+    try {
+      if (loaded.attempt.status !== "started") {
+        await clearDraft(base);
+        return;
+      }
+      const restored = await mutateDraft(
+        base,
+        (stored) => {
+          const next = stored ?? base;
+          const selections = [...next.selections];
+          for (const answer of loaded.attempt.answers)
+            selections[answer.sequence - 1] = answer.selectedIndex;
+          return { ...next, selections };
+        },
+        isCurrent,
+      );
+      if (!isCurrent()) return;
+      draftRef.current = restored;
+      setDraft(restored);
+    } catch (error) {
+      if (isCurrent()) setStorageError(toDisplayError(error).message);
+    }
+  }, []);
+
+  const updateDraft = useCallback(
+    async (attemptId: string, change: (current: QuizDraft) => QuizDraft) => {
+      const current = draftRef.current;
+      const generation = initializationGeneration.current;
+      const isCurrent = () =>
+        !accountDeleted.current &&
+        generation === initializationGeneration.current &&
+        current?.userId === getAuthenticatedUserId() &&
+        draftRef.current?.attemptId === attemptId;
+      if (
+        current === null ||
+        submitting.current ||
+        current.attemptId !== attemptId ||
+        current.frozen !== null ||
+        !isCurrent()
+      )
+        return;
+      try {
+        const updated = await mutateDraft(
+          current,
+          (stored) => {
+            if (stored === null)
+              throw new Error(
+                "기기의 답안이 삭제됐어요. 서버에서 최신 상태를 다시 확인해 주세요.",
+              );
+            return change(stored);
+          },
+          isCurrent,
+        );
+        if (!isCurrent()) return;
+        draftRef.current = updated;
+        setDraft(updated);
+        setStorageError(null);
+        setActionError(null);
+      } catch (error) {
+        if (isCurrent()) setStorageError(toDisplayError(error).message);
+      }
+    },
+    [],
+  );
+
+  useEffect(() => {
+    const handleStorage = (event: StorageEvent) => {
+      const current = draftRef.current;
+      if (
+        current === null ||
+        (event.key !== null && event.key !== draftKey(current))
+      )
+        return;
+      // Remote removal can mean completion or deletion; never recreate that draft.
+      if (
+        event.newValue === null ||
+        getAuthenticatedUserId() !== current.userId
+      ) {
+        draftRef.current = null;
+        setDraft(null);
+        initializationGeneration.current += 1;
+        setFatalError({
+          title: "기기의 답안 상태가 변경됐어요",
+          message: "서버에서 최신 상태를 다시 확인해 주세요.",
+        });
+        setScreen("error");
+        return;
+      }
+      try {
+        const stored = readDraft(current);
+        if (stored !== null) {
+          if (
+            current.frozen !== null &&
+            JSON.stringify(current.frozen) !== JSON.stringify(stored.frozen)
+          ) {
+            setStorageError(
+              "다른 창에서 답안 상태가 변경됐어요. 제출한 답은 유지하며 서버 제출 상태를 다시 확인해야 해요.",
+            );
+            return;
+          }
+          draftRef.current = stored;
+          setDraft(stored);
+        }
+      } catch (error) {
+        setStorageError(toDisplayError(error).message);
+      }
+    };
+    window.addEventListener("storage", handleStorage);
+    return () => window.removeEventListener("storage", handleStorage);
+  }, []);
+
+  const showVoidedResult = useCallback(
+    (quizDate?: string) => {
+      const date = quizDate ?? activeQuizDate.current;
+      if (date !== null) discardDateDrafts(date);
+      discardDraft();
+      initializationAbort.current?.abort();
+      initializationAbort.current = null;
+      initializationGeneration.current += 1;
+      completionAnalyticsBlocked.current = true;
+      setDaily(null);
+      setResult(null);
+      setChallengeToken(null);
+      setChallengeLanding(null);
+      setChallengeResult(null);
+      setChallengeRole(null);
+      setShareMessage(null);
+      setFatalError(null);
+      setActionError(null);
+      setReportPending(false);
+      setRefreshingChallenge(false);
+      setPollingPaused(true);
+      pendingChallengeCreateKey.current = null;
+      pendingClaimKey.current = null;
+      setBusy(false);
+      setScreen("voided");
+    },
+    [discardDateDrafts, discardDraft],
+  );
 
   const showChallengeResult = useCallback(
     (loadedResult: ChallengeResultResponse) => {
       switch (loadedResult.status) {
         case "voided":
-          showVoidedResult();
+          showVoidedResult(loadedResult.quizDate);
           return;
         case "completed":
+          discardDateDrafts(loadedResult.quizDate);
+          discardDraft();
           setChallengeResult(loadedResult);
           setChallengeRole(loadedResult.viewerRole);
           if (
@@ -683,7 +970,7 @@ function App() {
           assertNever(loadedResult);
       }
     },
-    [showVoidedResult],
+    [discardDateDrafts, discardDraft, showVoidedResult],
   );
 
   const initializeDaily = useCallback(async () => {
@@ -691,6 +978,8 @@ function App() {
     const controller = new AbortController();
     initializationAbort.current = controller;
     const generation = ++initializationGeneration.current;
+    draftRef.current = null;
+    setDraft(null);
     const isCurrent = () =>
       !controller.signal.aborted &&
       initializationGeneration.current === generation &&
@@ -708,7 +997,7 @@ function App() {
       }
       switch (loadedDaily.status) {
         case "voided":
-          showVoidedResult();
+          showVoidedResult(loadedDaily.quizDate);
           return;
         case "available":
           completionAnalyticsBlocked.current = false;
@@ -717,7 +1006,8 @@ function App() {
         default:
           assertNever(loadedDaily);
       }
-      setSelectedIndex(null);
+      await hydrateDraft(loadedDaily);
+      if (!isCurrent()) return;
 
       if (loadedDaily.attempt.status === "abandoned") {
         throw new Error(
@@ -726,25 +1016,13 @@ function App() {
       }
 
       if (loadedDaily.attempt.status === "completed") {
-        const loadedResult = await completeAttempt(
-          loadedDaily.attempt.id,
-          createIdempotencyKey("complete-resume"),
-          controller.signal,
-        );
-        if (!isCurrent()) {
-          return;
+        if (loadedDaily.completedResult === undefined) {
+          throw new Error(
+            "저장된 결과를 불러오지 못했어요. 다시 시도해 주세요.",
+          );
         }
-        switch (loadedResult.status) {
-          case "voided":
-            showVoidedResult();
-            return;
-          case "completed":
-            setResult(loadedResult);
-            setScreen("result");
-            break;
-          default:
-            assertNever(loadedResult);
-        }
+        setResult(loadedDaily.completedResult);
+        setScreen("result");
       } else {
         setResult(null);
         setScreen("home");
@@ -765,7 +1043,7 @@ function App() {
         setBusy(false);
       }
     }
-  }, [showVoidedResult]);
+  }, [hydrateDraft, showVoidedResult]);
 
   const initializeChallenge = useCallback(
     async (token: string) => {
@@ -773,6 +1051,8 @@ function App() {
       const controller = new AbortController();
       initializationAbort.current = controller;
       const generation = ++initializationGeneration.current;
+      draftRef.current = null;
+      setDraft(null);
       const isCurrent = () =>
         !controller.signal.aborted &&
         initializationGeneration.current === generation &&
@@ -788,9 +1068,10 @@ function App() {
         if (!isCurrent()) {
           return;
         }
+        activeQuizDate.current = landing.quizDate;
         switch (landing.status) {
           case "voided":
-            showVoidedResult();
+            showVoidedResult(landing.quizDate);
             return;
           case "expired":
             setChallengeLanding(landing);
@@ -828,7 +1109,13 @@ function App() {
           }
           setDaily(resumed.daily);
           setResult(null);
-          setSelectedIndex(null);
+          await hydrateDraft(resumed.daily);
+          if (!isCurrent()) return;
+          if (resumed.daily.attempt.status === "abandoned") {
+            setChallengeIssue("expired");
+            setScreen("challenge-issue");
+            return;
+          }
           if (resumed.daily.attempt.status !== "completed") {
             setScreen("quiz");
             return;
@@ -849,6 +1136,14 @@ function App() {
         }
         const issue = challengeIssueFromError(error);
         if (issue !== null) {
+          if (
+            error instanceof ApiClientError &&
+            error.code === "ATTEMPT_ABANDONED" &&
+            activeQuizDate.current !== null
+          ) {
+            discardDateDrafts(activeQuizDate.current);
+            discardDraft();
+          }
           setChallengeIssue(issue);
           setScreen("challenge-issue");
         } else {
@@ -862,7 +1157,13 @@ function App() {
         }
       }
     },
-    [showChallengeResult, showVoidedResult],
+    [
+      discardDateDrafts,
+      discardDraft,
+      hydrateDraft,
+      showChallengeResult,
+      showVoidedResult,
+    ],
   );
 
   useEffect(() => {
@@ -882,10 +1183,9 @@ function App() {
     };
   }, [initializeChallenge, initializeDaily]);
 
-  const currentQuestion = useMemo(
-    () => daily?.questions[daily.attempt.answeredCount],
-    [daily],
-  );
+  const currentQuestion = draft?.frozen
+    ? undefined
+    : daily?.questions[draft?.currentQuestion ?? 0];
   const headingFocusKey =
     screen === "quiz"
       ? `quiz:${daily?.attempt.id ?? "unknown"}:${currentQuestion?.revisionId ?? "complete"}`
@@ -920,283 +1220,161 @@ function App() {
   );
 
   const handleComplete = useCallback(async () => {
-    if (daily === null) {
+    const current = draftRef.current;
+    if (
+      daily === null ||
+      current === null ||
+      submitting.current ||
+      accountDeleted.current ||
+      current.userId !== getAuthenticatedUserId() ||
+      current.attemptId !== daily.attempt.id ||
+      current.selections.some((answer) => answer === null)
+    )
       return;
-    }
-
+    const generation = initializationGeneration.current;
+    const isCurrent = () =>
+      !accountDeleted.current &&
+      generation === initializationGeneration.current &&
+      getAuthenticatedUserId() === current.userId &&
+      draftRef.current?.attemptId === current.attemptId;
+    submitting.current = true;
     setBusy(true);
     setActionError(null);
-    pendingCompleteKey.current ??= createIdempotencyKey("complete");
-
     try {
-      const completed = await completeAttempt(
-        daily.attempt.id,
-        pendingCompleteKey.current,
+      if (!navigator.locks)
+        throw new Error(
+          "안전한 최종 제출을 위해 최신 브라우저에서 다시 열어 주세요.",
+        );
+      const locked = await mutateDraft(
+        current,
+        (stored) => {
+          if (stored === null)
+            throw new Error(
+              "기기의 답안이 삭제됐어요. 서버에서 최신 제출 상태를 다시 확인해 주세요.",
+            );
+          const snapshot = stored;
+          if (snapshot.selections.some((answer) => answer === null))
+            throw new Error("다섯 답을 모두 선택한 뒤 최종 제출해 주세요.");
+          const frozen = snapshot.frozen ?? {
+            key: createIdempotencyKey("complete"),
+            answers: snapshot.selections.map((selectedIndex, index) => ({
+              sequence: index + 1,
+              questionRevisionId: snapshot.revisions[index]!,
+              selectedIndex: selectedIndex!,
+            })),
+          };
+          const frozenDraft = { ...snapshot, currentQuestion: 5, frozen };
+          // Serialize competing tabs and persist the exact request before HTTP.
+          return frozenDraft;
+        },
+        isCurrent,
       );
-      pendingCompleteKey.current = null;
-      switch (completed.status) {
-        case "voided":
-          showVoidedResult();
-          return;
-        case "completed":
-          break;
-        default:
-          assertNever(completed);
-      }
-      if (completionAnalyticsBlocked.current) {
+      if (!isCurrent()) return;
+      const frozen = locked.frozen;
+      if (frozen === null)
+        throw new Error("최종 답안을 임시 보관하지 못했어요.");
+      draftRef.current = locked;
+      setDraft(locked);
+      setStorageError(null);
+      const completed = await completeAttempt(
+        current.attemptId,
+        { answers: frozen.answers },
+        frozen.key,
+      );
+      if (!isCurrent()) return;
+      if (completed.status === "voided") {
+        showVoidedResult();
         return;
       }
+      discardDraft();
       setResult(completed);
-      setDaily((current) =>
-        current === null
-          ? current
-          : {
-              ...current,
-              attempt: {
-                ...current.attempt,
-                status: "completed",
-                score: completed.score,
-              },
-            },
-      );
+      setDaily({
+        ...daily,
+        completedResult: completed,
+        attempt: {
+          ...daily.attempt,
+          status: "completed",
+          answeredCount: 5,
+          answers: frozen.answers,
+          score: completed.score,
+        },
+      });
       if (challengeToken !== null && challengeRole === "opponent") {
         try {
-          showChallengeResult(await getChallengeResult(challengeToken));
-          recordDailyCompletion(daily.attempt.id, "challenge");
-        } catch (challengeError) {
-          if (isDailySetVoidedError(challengeError)) {
+          const loaded = await getChallengeResult(challengeToken);
+          if (
+            accountDeleted.current ||
+            generation !== initializationGeneration.current ||
+            getAuthenticatedUserId() !== current.userId
+          )
+            return;
+          showChallengeResult(loaded);
+          recordDailyCompletion(current.attemptId, "challenge");
+        } catch (error) {
+          if (
+            accountDeleted.current ||
+            generation !== initializationGeneration.current ||
+            getAuthenticatedUserId() !== current.userId
+          )
+            return;
+          if (isDailySetVoidedError(error)) {
             showVoidedResult();
             return;
           }
-          recordDailyCompletion(daily.attempt.id, "challenge");
-          setActionError(toDisplayError(challengeError));
+          setActionError(toDisplayError(error));
           setChallengeResult(null);
           setScreen("challenge-waiting");
         }
       } else {
-        recordDailyCompletion(daily.attempt.id, "solo");
+        recordDailyCompletion(current.attemptId, "solo");
         setScreen("result");
       }
     } catch (error) {
-      if (isDailySetVoidedError(error)) {
-        showVoidedResult();
-        return;
-      }
-      setActionError(toDisplayError(error));
-      setScreen("quiz");
-    } finally {
-      setBusy(false);
-    }
-  }, [
-    challengeRole,
-    challengeToken,
-    daily,
-    recordDailyCompletion,
-    showChallengeResult,
-    showVoidedResult,
-  ]);
-
-  const handleSubmit = useCallback(async () => {
-    if (
-      daily === null ||
-      currentQuestion === undefined ||
-      selectedIndex === null
-    ) {
-      return;
-    }
-
-    setBusy(true);
-    setActionError(null);
-
-    const existing = pendingAnswer.current;
-    const pending =
-      existing !== null &&
-      existing.sequence === currentQuestion.sequence &&
-      existing.revisionId === currentQuestion.revisionId &&
-      existing.selectedIndex === selectedIndex
-        ? existing
-        : {
-            key: createIdempotencyKey("answer"),
-            sequence: currentQuestion.sequence,
-            revisionId: currentQuestion.revisionId,
-            selectedIndex,
-          };
-    pendingAnswer.current = pending;
-    if (existing === pending) {
-      void logAnalyticsEvent("answer_retry", {
-        source: challengeRole === "opponent" ? "challenge" : "solo",
-      });
-    }
-
-    try {
-      const saved = await submitAnswer(
-        daily.attempt.id,
-        {
-          sequence: pending.sequence,
-          questionRevisionId: pending.revisionId,
-          selectedIndex: pending.selectedIndex,
-        },
-        pending.key,
-      );
-      if (completionAnalyticsBlocked.current) {
-        return;
-      }
-      pendingAnswer.current = null;
-      setSelectedIndex(null);
-
-      setDaily((current) => {
-        if (current === null) {
-          return current;
-        }
-        return {
-          ...current,
-          attempt: {
-            ...current.attempt,
-            answeredCount: saved.answeredCount,
-            answers: [
-              ...current.attempt.answers,
-              {
-                sequence: pending.sequence,
-                questionRevisionId: pending.revisionId,
-                selectedIndex: pending.selectedIndex,
-              },
-            ],
-          },
-        };
-      });
-
-      if (saved.nextSequence === null) {
-        window.setTimeout(() => {
-          void handleComplete();
-        }, 0);
-      }
-    } catch (error) {
+      if (!isCurrent()) return;
       if (isDailySetVoidedError(error)) {
         showVoidedResult();
         return;
       }
       if (
         error instanceof ApiClientError &&
-        (error.code === "ANSWER_ALREADY_SUBMITTED" ||
-          error.code === "ANSWER_OUT_OF_ORDER")
+        error.code === "ATTEMPT_ABANDONED"
       ) {
-        pendingAnswer.current = null;
-
-        try {
-          const loadedDaily =
-            challengeToken !== null && challengeRole === "opponent"
-              ? (
-                  await claimChallenge(
-                    challengeToken,
-                    createIdempotencyKey("claim-recovery"),
-                  )
-                ).daily
-              : await startDailyQuiz();
-          switch (loadedDaily.status) {
-            case "voided":
-              showVoidedResult();
-              return;
-            case "available":
-              setDaily(loadedDaily);
-              break;
-            default:
-              assertNever(loadedDaily);
-          }
-          setSelectedIndex(null);
-          setResult(null);
-          setActionError(null);
-
-          if (loadedDaily.attempt.status === "abandoned") {
-            setFatalError(
-              toDisplayError(
-                new Error(
-                  "오늘 퀴즈의 완료 가능 시간이 지났어요. 새 퀴즈를 기다려 주세요.",
-                ),
-              ),
-            );
-            setScreen("error");
-            return;
-          }
-
-          if (
-            loadedDaily.attempt.status === "completed" ||
-            loadedDaily.attempt.answeredCount === loadedDaily.questions.length
-          ) {
-            pendingCompleteKey.current ??=
-              createIdempotencyKey("complete-recovery");
-            const completed = await completeAttempt(
-              loadedDaily.attempt.id,
-              pendingCompleteKey.current,
-            );
-            pendingCompleteKey.current = null;
-            switch (completed.status) {
-              case "voided":
-                showVoidedResult();
-                return;
-              case "completed":
-                break;
-              default:
-                assertNever(completed);
-            }
-            if (completionAnalyticsBlocked.current) {
-              return;
-            }
-            setDaily({
-              ...loadedDaily,
-              attempt: {
-                ...loadedDaily.attempt,
-                status: "completed",
-                score: completed.score,
-              },
-            });
-            setResult(completed);
-            if (challengeToken !== null && challengeRole === "opponent") {
-              try {
-                showChallengeResult(await getChallengeResult(challengeToken));
-                recordDailyCompletion(loadedDaily.attempt.id, "challenge");
-              } catch (challengeError) {
-                if (isDailySetVoidedError(challengeError)) {
-                  showVoidedResult();
-                  return;
-                }
-                recordDailyCompletion(loadedDaily.attempt.id, "challenge");
-                throw challengeError;
-              }
-            } else {
-              recordDailyCompletion(loadedDaily.attempt.id, "solo");
-              setScreen("result");
-            }
-          } else {
-            setScreen(
-              challengeRole === "opponent"
-                ? "quiz"
-                : loadedDaily.attempt.answeredCount === 0
-                  ? "home"
-                  : "quiz",
-            );
-          }
-        } catch (recoveryError) {
-          if (isDailySetVoidedError(recoveryError)) {
-            showVoidedResult();
-            return;
-          }
-          setActionError(toDisplayError(recoveryError));
-          setScreen("quiz");
-        }
-      } else {
-        setActionError(toDisplayError(error));
+        discardDraft();
+        setFatalError(toDisplayError(error));
+        setScreen("error");
+        return;
       }
+      // Conflicting server records must be reloaded, never overwritten locally.
+      if (
+        error instanceof ApiClientError &&
+        (error.code === "ATTEMPT_ALREADY_COMPLETED" ||
+          error.code === "SAVED_ANSWER_CONFLICT")
+      ) {
+        if (challengeToken !== null && challengeRole === "opponent")
+          await initializeChallenge(challengeToken);
+        else await initializeDaily();
+        return;
+      }
+      setActionError(toDisplayError(error));
+      if (!(error instanceof ApiClientError))
+        setStorageError(toDisplayError(error).message);
+      setScreen("quiz");
     } finally {
-      setBusy(false);
+      submitting.current = false;
+      if (
+        !accountDeleted.current &&
+        generation === initializationGeneration.current
+      )
+        setBusy(false);
     }
   }, [
     challengeRole,
     challengeToken,
-    currentQuestion,
     daily,
-    handleComplete,
+    discardDraft,
+    initializeChallenge,
+    initializeDaily,
     recordDailyCompletion,
-    selectedIndex,
     showChallengeResult,
     showVoidedResult,
   ]);
@@ -1205,6 +1383,12 @@ function App() {
     if (challengeToken === null) {
       return;
     }
+    const generation = initializationGeneration.current;
+    const userId = getAuthenticatedUserId();
+    const isCurrent = () =>
+      !accountDeleted.current &&
+      generation === initializationGeneration.current &&
+      userId === getAuthenticatedUserId();
 
     setBusy(true);
     setActionError(null);
@@ -1215,25 +1399,31 @@ function App() {
         challengeToken,
         pendingClaimKey.current,
       );
-      if (completionAnalyticsBlocked.current) {
+      if (!isCurrent() || completionAnalyticsBlocked.current) {
         return;
       }
       pendingClaimKey.current = null;
       setDaily(claimed.daily);
       setResult(null);
-      setSelectedIndex(null);
+      await hydrateDraft(claimed.daily);
+      if (!isCurrent()) return;
       setChallengeRole("opponent");
       void logAnalyticsEvent("claim_challenge", { role: "opponent" });
 
-      if (
+      if (claimed.daily.attempt.status === "abandoned") {
+        setChallengeIssue("expired");
+        setScreen("challenge-issue");
+      } else if (
         claimed.challenge.status === "completed" ||
         claimed.daily.attempt.status === "completed"
       ) {
-        showChallengeResult(await getChallengeResult(challengeToken));
+        const loaded = await getChallengeResult(challengeToken);
+        if (isCurrent()) showChallengeResult(loaded);
       } else {
         setScreen("quiz");
       }
     } catch (error) {
+      if (!isCurrent()) return;
       if (isDailySetVoidedError(error)) {
         showVoidedResult();
         return;
@@ -1241,6 +1431,14 @@ function App() {
       const issue = challengeIssueFromError(error);
       if (issue !== null) {
         pendingClaimKey.current = null;
+        if (
+          error instanceof ApiClientError &&
+          error.code === "ATTEMPT_ABANDONED" &&
+          activeQuizDate.current !== null
+        ) {
+          discardDateDrafts(activeQuizDate.current);
+          discardDraft();
+        }
         void logAnalyticsEvent("claim_conflict", {
           reason: error instanceof ApiClientError ? error.code : "unknown",
         });
@@ -1250,11 +1448,26 @@ function App() {
         setActionError(toDisplayError(error));
       }
     } finally {
-      setBusy(false);
+      if (isCurrent()) setBusy(false);
     }
-  }, [challengeToken, showChallengeResult, showVoidedResult]);
+  }, [
+    challengeToken,
+    discardDateDrafts,
+    discardDraft,
+    hydrateDraft,
+    showChallengeResult,
+    showVoidedResult,
+  ]);
 
   const handleShareChallenge = useCallback(async () => {
+    const availability = getChallengeCapabilities();
+    if (
+      !availability.challengeCreateEnabled ||
+      !availability.challengeClaimEnabled
+    ) {
+      setShareMessage("친구 초대는 현재 이용할 수 없어요.");
+      return;
+    }
     if (challengeToken === null && (daily === null || result === null)) {
       return;
     }
@@ -1649,11 +1862,16 @@ function App() {
     }
     setBusy(true);
     setActionError(null);
+    initializationAbort.current?.abort();
+    initializationGeneration.current += 1;
+    draftRef.current = null;
+    setDraft(null);
 
     try {
       await deleteAccount({ confirmation: "DELETE" });
 
       accountDeleted.current = true;
+      setSessionEnded(true);
       capturedInitialChallengeToken = null;
       setDaily(null);
       setResult(null);
@@ -1662,7 +1880,6 @@ function App() {
       setChallengeResult(null);
       setChallengeRole(null);
       setChallengeIssue("not-found");
-      setSelectedIndex(null);
       setSettingsReturnScreen("home");
       setShareMessage(null);
       setFatalError(null);
@@ -1672,8 +1889,6 @@ function App() {
       setNotificationBusy(false);
       setRefreshingChallenge(false);
       setPollingPaused(document.hidden);
-      pendingAnswer.current = null;
-      pendingCompleteKey.current = null;
       pendingChallengeCreateKey.current = null;
       pendingClaimKey.current = null;
       loggedDailyCompletions.current.clear();
@@ -1681,6 +1896,17 @@ function App() {
       completionAnalyticsBlocked.current = true;
       setScreen("deleted");
     } catch (error) {
+      if (
+        error instanceof ApiClientError &&
+        error.code === "ACCOUNT_DELETION_OUTCOME_UNKNOWN"
+      ) {
+        accountDeleted.current = true;
+        setSessionEnded(true);
+        setDaily(null);
+        setResult(null);
+        setFatalError(toDisplayError(error));
+        setScreen("error");
+      }
       setActionError(toDisplayError(error));
     } finally {
       setBusy(false);
@@ -1688,6 +1914,16 @@ function App() {
   }, [busy, notificationBusy, reportPending]);
 
   if (screen === "loading") {
+    if (challengeToken === null) {
+      return (
+        <HomeScreen
+          daily={null}
+          onStart={() => setScreen("quiz")}
+          onSettings={() => handleOpenSettings("home")}
+          headingRef={mainHeading}
+        />
+      );
+    }
     return (
       <LoadingScreen
         headingRef={mainHeading}
@@ -1697,7 +1933,17 @@ function App() {
   }
   if (screen === "voided") {
     return (
-      <VoidedResultScreen onToday={handleGoToDaily} headingRef={mainHeading} />
+      <>
+        {storageError ? (
+          <p className="inline-error" role="alert">
+            {storageError}
+          </p>
+        ) : null}
+        <VoidedResultScreen
+          onToday={handleGoToDaily}
+          headingRef={mainHeading}
+        />
+      </>
     );
   }
   if (screen === "challenge-issue") {
@@ -1728,11 +1974,18 @@ function App() {
       challengeResult.status === "redacted")
   ) {
     return (
-      <ChallengeResultScreen
-        result={challengeResult}
-        onToday={handleGoToDaily}
-        headingRef={mainHeading}
-      />
+      <>
+        {storageError ? (
+          <p className="inline-error" role="alert">
+            {storageError}
+          </p>
+        ) : null}
+        <ChallengeResultScreen
+          result={challengeResult}
+          onToday={handleGoToDaily}
+          headingRef={mainHeading}
+        />
+      </>
     );
   }
   if (screen === "challenge-waiting") {
@@ -1793,7 +2046,9 @@ function App() {
         refreshing={refreshingChallenge || busy}
         onRefresh={() => void refreshChallengeResult()}
         onShare={
-          challengeRole === "creator" ? () => void handleShareChallenge() : null
+          challengeRole === "creator" && invitationAvailable
+            ? () => void handleShareChallenge()
+            : null
         }
         onToday={handleGoToDaily}
         error={actionError}
@@ -1811,10 +2066,13 @@ function App() {
             message: "잠시 후 다시 시도해 주세요.",
           }
         }
-        onRetry={() =>
-          void (challengeToken === null
-            ? initializeDaily()
-            : initializeChallenge(challengeToken))
+        onRetry={
+          sessionEnded
+            ? null
+            : () =>
+                void (challengeToken === null
+                  ? initializeDaily()
+                  : initializeChallenge(challengeToken))
         }
         busy={busy}
         headingRef={mainHeading}
@@ -1883,8 +2141,14 @@ function App() {
         onShare={() => void handleShareChallenge()}
         onChallengeStatus={() => void refreshChallengeResult()}
         challengeCreated={challengeToken !== null}
+        invitationAvailable={invitationAvailable}
         busy={busy || refreshingChallenge}
-        actionError={actionError}
+        actionError={
+          actionError ??
+          (storageError
+            ? { title: "기기 저장 공간을 확인해 주세요", message: storageError }
+            : null)
+        }
         shareMessage={shareMessage}
         reportPending={reportPending}
         onReportPendingChange={setReportPending}
@@ -1893,19 +2157,57 @@ function App() {
     );
   }
 
+  if (draft === null) {
+    return (
+      <ErrorPanel
+        error={{
+          title: "답안을 다시 확인해 주세요",
+          message:
+            storageError ?? "서버에서 최신 상태를 불러와야 계속할 수 있어요.",
+        }}
+        onRetry={() =>
+          void (challengeToken === null
+            ? initializeDaily()
+            : initializeChallenge(challengeToken))
+        }
+        busy={busy}
+        headingRef={mainHeading}
+      />
+    );
+  }
+
   return (
     <QuizScreen
       daily={daily}
-      selectedIndex={selectedIndex}
+      draft={draft}
       onSelect={(index) => {
-        setSelectedIndex(index);
-        setActionError(null);
-        pendingAnswer.current = null;
+        updateDraft(daily.attempt.id, (current) => {
+          if (
+            daily.attempt.answers.some(
+              (answer) => answer.sequence === current.currentQuestion + 1,
+            )
+          )
+            return current;
+          const selections = [...current.selections];
+          selections[current.currentQuestion] = index;
+          return { ...current, selections };
+        });
       }}
-      onSubmit={() => void handleSubmit()}
+      onNavigate={(index) =>
+        updateDraft(daily.attempt.id, (current) => ({
+          ...current,
+          currentQuestion: index,
+        }))
+      }
       onComplete={() => void handleComplete()}
+      onReload={() =>
+        void (challengeToken === null
+          ? initializeDaily()
+          : initializeChallenge(challengeToken))
+      }
       busy={busy}
       actionError={actionError}
+      storageError={storageError}
       headingRef={mainHeading}
     />
   );

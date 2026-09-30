@@ -10,9 +10,38 @@ import type {
 
 const MAX_RESPONSE_BYTES = 65_536;
 
+const MessageCountSchema = z.number().int().min(0).max(2_147_483_647);
+const SentContentSchema = z.object({
+  contentId: z.string(),
+  reachedFailReason: z.string().optional(),
+});
+const ChannelResultsSchema = z.object({
+  sentAlimtalk: z.array(SentContentSchema),
+  sentFriendtalk: z.array(SentContentSchema),
+  sentInbox: z.array(SentContentSchema),
+  sentPush: z.array(SentContentSchema),
+  sentSms: z.array(SentContentSchema),
+});
+const CHANNELS = [
+  "sentAlimtalk",
+  "sentFriendtalk",
+  "sentInbox",
+  "sentPush",
+  "sentSms",
+] as const;
+
 const NotificationSuccessSchema = z.object({
   resultType: z.literal("SUCCESS"),
-  success: z.object({}).passthrough(),
+  success: z.object({
+    detail: ChannelResultsSchema,
+    fail: ChannelResultsSchema,
+    msgCount: MessageCountSchema,
+    sentAlimtalkCount: MessageCountSchema,
+    sentFriendtalkCount: MessageCountSchema,
+    sentInboxCount: MessageCountSchema,
+    sentPushCount: MessageCountSchema,
+    sentSmsCount: MessageCountSchema,
+  }),
 });
 
 const NotificationFailureSchema = z.object({
@@ -125,7 +154,20 @@ export function interpretNotificationResponse(response: {
     throw deliveryRejected();
   }
 
-  if (NotificationSuccessSchema.safeParse(parsedJson).success) {
+  const success = NotificationSuccessSchema.safeParse(parsedJson);
+  if (success.success) {
+    const outcome = success.data.success;
+    // A SUCCESS envelope alone is not evidence that any message was sent.
+    if (
+      outcome.msgCount === 0 ||
+      !CHANNELS.some(
+        (channel) =>
+          outcome[`${channel}Count`] > 0 &&
+          outcome.detail[channel].some((item) => !item.reachedFailReason),
+      )
+    ) {
+      throw deliveryRejected();
+    }
     return;
   }
 

@@ -97,7 +97,7 @@ export function registerAuthRoutes(
       return BootstrapResponseSchema.parse({
         accessToken,
         expiresInSeconds: config.accessTokenTtlSeconds,
-        user: { nickname: user.nickname },
+        user: { id: user.id, nickname: user.nickname },
       });
     },
   );

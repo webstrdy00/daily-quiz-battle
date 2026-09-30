@@ -1,11 +1,10 @@
 import {
+  CompleteAttemptRequestSchema,
   CompleteAttemptResponseSchema,
   DailyStartResponseSchema,
-  SubmitAnswerResponseSchema,
+  type CompleteAttemptRequest,
   type CompleteAttemptResponse,
   type DailyStartResponse,
-  type SubmitAnswerRequest,
-  type SubmitAnswerResponse,
 } from "@daily-quiz-battle/contracts";
 import type { TransactionSql } from "postgres";
 import type { Database } from "../db/client.js";
@@ -69,16 +68,15 @@ interface AttemptRow {
   id: string;
   user_id: string;
   daily_set_id: string;
+  challenge_id: string | null;
   status: "started" | "completed" | "abandoned";
   score: number | null;
   quiz_date: string;
   completed_at: Date | string | null;
 }
 
-interface AnswerRow {
-  sequence: number;
+interface AnswerRow extends ReviewRow {
   question_revision_id: string;
-  selected_index: number;
 }
 
 interface IdempotencyRow {
@@ -94,6 +92,32 @@ interface ReviewRow {
   correct_index: number;
   choice_order: unknown;
   explanation: string;
+}
+
+function mapReview(rows: ReviewRow[]) {
+  if (rows.length !== 5) {
+    throw new AppError({
+      statusCode: 422,
+      code: "ANSWERS_INCOMPLETE",
+      message: "5문제를 모두 제출한 뒤 완료해 주세요.",
+      details: { answeredCount: rows.length },
+    });
+  }
+
+  return rows.map((row) => {
+    const correctIndex = getDisplayedChoiceIndex(
+      row.correct_index,
+      row.choice_order,
+    );
+    return {
+      sequence: row.sequence,
+      prompt: row.prompt,
+      selectedIndex: row.selected_index,
+      correctIndex,
+      correct: row.selected_index === correctIndex,
+      explanation: row.explanation,
+    };
+  });
 }
 
 function toChoiceTuple(value: unknown): [string, string, string, string] {
@@ -195,22 +219,6 @@ async function loadDailySetVoid(
   return rows[0];
 }
 
-function dailySetVoidedError(
-  quizDate: string,
-  voidedAt: Date | string,
-): AppError {
-  return new AppError({
-    statusCode: 409,
-    code: "DAILY_SET_VOIDED",
-    message: "운영 검토로 이 날짜의 퀴즈 결과가 무효 처리되었습니다.",
-    retryable: false,
-    details: {
-      quizDate,
-      voidedAt: toIsoDateTime(voidedAt),
-    },
-  });
-}
-
 async function lockActiveUser(
   transaction: Transaction,
   userId: string,
@@ -307,6 +315,7 @@ export async function startOrResumeAttempt(
         a.id,
         a.user_id,
         a.daily_set_id,
+        a.challenge_id,
         a.status::text AS status,
         a.score::int AS score,
         ds.quiz_date::text AS quiz_date,
@@ -387,6 +396,7 @@ export async function startOrResumeAttempt(
           a.id,
           a.user_id,
           a.daily_set_id,
+          a.challenge_id,
           a.status::text AS status,
           a.score::int AS score,
           ds.quiz_date::text AS quiz_date,
@@ -408,11 +418,10 @@ export async function startOrResumeAttempt(
       });
     }
 
-    const deadline = await getAttemptDeadline(
-      transaction,
-      attempt.id,
-      attempt.quiz_date,
-    );
+    const deadline =
+      attempt.challenge_id === null
+        ? getDailyCompletionDeadline(attempt.quiz_date)
+        : await getAttemptDeadline(transaction, attempt.id, attempt.quiz_date);
     if (attempt.status === "started" && now >= deadline) {
       const abandoned = await transaction<AttemptRow[]>`
         UPDATE attempts
@@ -422,6 +431,7 @@ export async function startOrResumeAttempt(
           id,
           user_id,
           daily_set_id,
+          challenge_id,
           status::text AS status,
           score::int AS score,
           ${attempt.quiz_date}::text AS quiz_date,
@@ -432,12 +442,20 @@ export async function startOrResumeAttempt(
 
     const answers = await transaction<AnswerRow[]>`
       SELECT
-        sequence::int AS sequence,
-        question_revision_id,
-        selected_index::int AS selected_index
-      FROM attempt_answers
-      WHERE attempt_id = ${attempt.id}
-      ORDER BY sequence
+        aa.sequence::int AS sequence,
+        aa.question_revision_id,
+        aa.selected_index::int AS selected_index,
+        qr.prompt,
+        qr.correct_index::int AS correct_index,
+        dsi.choice_order,
+        qr.explanation
+      FROM attempt_answers aa
+      JOIN question_revisions qr ON qr.id = aa.question_revision_id
+      JOIN daily_set_items dsi
+        ON dsi.daily_set_id = ${attempt.daily_set_id}
+        AND dsi.question_revision_id = aa.question_revision_id
+      WHERE aa.attempt_id = ${attempt.id}
+      ORDER BY aa.sequence
     `;
 
     return DailyStartResponseSchema.parse({
@@ -460,248 +478,20 @@ export async function startOrResumeAttempt(
         prompt: item.prompt,
         choices: applyChoiceOrder(item.choices, item.choice_order),
       })),
+      ...(attempt.status === "completed"
+        ? {
+            completedResult: {
+              attemptId: attempt.id,
+              status: "completed",
+              score: attempt.score,
+              total: 5,
+              completedAt: toIsoDateTime(attempt.completed_at),
+              review: mapReview(answers),
+            },
+          }
+        : {}),
     });
   }
-}
-
-export async function submitAnswer(
-  database: Database,
-  userId: string,
-  attemptId: string,
-  idempotencyKey: string,
-  answer: SubmitAnswerRequest,
-  now = new Date(),
-): Promise<SubmitAnswerResponse> {
-  const operation = `answer:${attemptId}`;
-  const keyHash = sha256(idempotencyKey);
-  const requestHash = sha256(JSON.stringify(answer));
-
-  const result = await database.client.begin(async (transaction) => {
-    await lockActiveUser(transaction, userId);
-
-    const attempts = await transaction<AttemptRow[]>`
-      SELECT
-        a.id,
-        a.user_id,
-        a.daily_set_id,
-        a.status::text AS status,
-        a.score::int AS score,
-        ds.quiz_date::text AS quiz_date,
-        a.completed_at
-      FROM attempts a
-      JOIN daily_sets ds ON ds.id = a.daily_set_id
-      WHERE a.id = ${attemptId}
-      FOR UPDATE OF a
-      FOR SHARE OF ds
-    `;
-    const attempt = attempts[0];
-
-    if (attempt === undefined) {
-      throw new AppError({
-        statusCode: 404,
-        code: "ATTEMPT_NOT_FOUND",
-        message: "퀴즈 진행 정보를 찾을 수 없습니다.",
-      });
-    }
-    if (attempt.user_id !== userId) {
-      throw new AppError({
-        statusCode: 403,
-        code: "FORBIDDEN",
-        message: "이 퀴즈에 답할 권한이 없습니다.",
-      });
-    }
-
-    const dailySetVoid = await loadDailySetVoid(
-      transaction,
-      attempt.daily_set_id,
-    );
-    if (dailySetVoid !== undefined) {
-      throw dailySetVoidedError(attempt.quiz_date, dailySetVoid.voided_at);
-    }
-
-    const insertedIdempotency = await transaction`
-      INSERT INTO idempotency_records (
-        user_id,
-        operation,
-        key_hash,
-        request_hash,
-        expires_at
-      )
-      VALUES (
-        ${userId},
-        ${operation},
-        ${keyHash},
-        ${requestHash},
-        now() + interval '24 hours'
-      )
-      ON CONFLICT (user_id, operation, key_hash) DO NOTHING
-      RETURNING id
-    `;
-
-    if (insertedIdempotency.length === 0) {
-      const existing = await transaction<IdempotencyRow[]>`
-        SELECT request_hash, status::text AS status, response_body
-        FROM idempotency_records
-        WHERE user_id = ${userId}
-          AND operation = ${operation}
-          AND key_hash = ${keyHash}
-      `;
-      const record = existing[0];
-      if (record === undefined) {
-        throw new AppError({
-          statusCode: 409,
-          code: "REQUEST_IN_PROGRESS",
-          message: "같은 요청을 처리하고 있습니다.",
-          retryable: true,
-        });
-      }
-      if (record.request_hash !== requestHash) {
-        throw new AppError({
-          statusCode: 409,
-          code: "IDEMPOTENCY_KEY_REUSED",
-          message: "같은 요청 키를 다른 내용에 사용할 수 없습니다.",
-        });
-      }
-      if (record.status !== "completed" || record.response_body === null) {
-        throw new AppError({
-          statusCode: 409,
-          code: "REQUEST_IN_PROGRESS",
-          message: "같은 요청을 처리하고 있습니다.",
-          retryable: true,
-        });
-      }
-      return {
-        response: SubmitAnswerResponseSchema.parse(record.response_body),
-      };
-    }
-
-    if (attempt.status === "completed") {
-      throw new AppError({
-        statusCode: 409,
-        code: "ATTEMPT_ALREADY_COMPLETED",
-        message: "이미 완료한 퀴즈입니다.",
-      });
-    }
-    if (attempt.status === "abandoned") {
-      throw new AppError({
-        statusCode: 409,
-        code: "ATTEMPT_ABANDONED",
-        message: "완료 가능 시간이 지난 퀴즈입니다.",
-      });
-    }
-
-    if (
-      now >=
-      (await getAttemptDeadline(transaction, attempt.id, attempt.quiz_date))
-    ) {
-      await transaction`
-        UPDATE attempts
-        SET status = 'abandoned', abandoned_at = ${now.toISOString()}, updated_at = ${now.toISOString()}
-        WHERE id = ${attempt.id}
-      `;
-      await transaction`
-        DELETE FROM idempotency_records
-        WHERE user_id = ${userId}
-          AND operation = ${operation}
-          AND key_hash = ${keyHash}
-      `;
-      return {
-        error: new AppError({
-          statusCode: 409,
-          code: "ATTEMPT_ABANDONED",
-          message: "완료 가능 시간이 지난 퀴즈입니다.",
-        }),
-      };
-    }
-
-    const existingAnswer = await transaction`
-      SELECT 1
-      FROM attempt_answers
-      WHERE attempt_id = ${attemptId}
-        AND sequence = ${answer.sequence}
-    `;
-    if (existingAnswer.length > 0) {
-      throw new AppError({
-        statusCode: 422,
-        code: "ANSWER_ALREADY_SUBMITTED",
-        message: "이미 제출한 문항입니다.",
-      });
-    }
-
-    const counts = await transaction<{ count: number }[]>`
-      SELECT count(*)::int AS count
-      FROM attempt_answers
-      WHERE attempt_id = ${attemptId}
-    `;
-    const answeredCount = counts[0]?.count ?? 0;
-    if (answer.sequence !== answeredCount + 1) {
-      throw new AppError({
-        statusCode: 422,
-        code: "ANSWER_OUT_OF_ORDER",
-        message: "문항을 순서대로 제출해 주세요.",
-        details: { expectedSequence: answeredCount + 1 },
-      });
-    }
-
-    const expected = await transaction<{ revision_id: string }[]>`
-      SELECT dsi.question_revision_id AS revision_id
-      FROM attempts a
-      JOIN daily_set_items dsi ON dsi.daily_set_id = a.daily_set_id
-      WHERE a.id = ${attemptId}
-        AND dsi.position = ${answer.sequence}
-    `;
-    if (expected[0]?.revision_id !== answer.questionRevisionId) {
-      throw new AppError({
-        statusCode: 409,
-        code: "QUESTION_REVISION_CONFLICT",
-        message: "문제 버전이 현재 퀴즈와 일치하지 않습니다.",
-      });
-    }
-
-    await transaction`
-      INSERT INTO attempt_answers (
-        attempt_id,
-        sequence,
-        question_revision_id,
-        selected_index,
-        received_at
-      )
-      VALUES (
-        ${attemptId},
-        ${answer.sequence},
-        ${answer.questionRevisionId},
-        ${answer.selectedIndex},
-        ${now.toISOString()}
-      )
-    `;
-
-    const response = SubmitAnswerResponseSchema.parse({
-      attemptId,
-      sequence: answer.sequence,
-      saved: true,
-      answeredCount: answeredCount + 1,
-      nextSequence: answer.sequence === 5 ? null : answer.sequence + 1,
-    });
-
-    await transaction`
-      UPDATE idempotency_records
-      SET
-        status = 'completed',
-        response_status = 200,
-        response_body = ${JSON.stringify(response)}::jsonb,
-        resource_id = ${attemptId}
-      WHERE user_id = ${userId}
-        AND operation = ${operation}
-        AND key_hash = ${keyHash}
-    `;
-
-    return { response };
-  });
-
-  if ("error" in result && result.error !== undefined) {
-    throw result.error;
-  }
-  return result.response;
 }
 
 export async function completeAttempt(
@@ -709,12 +499,20 @@ export async function completeAttempt(
   userId: string,
   attemptId: string,
   idempotencyKey: string,
+  request: CompleteAttemptRequest,
   now = new Date(),
   notificationDeliveryEnabled = true,
 ): Promise<CompleteAttemptResponse> {
-  const operation = `complete:${attemptId}`;
+  const answers = CompleteAttemptRequestSchema.parse(request)
+    .answers.map((answer) => ({
+      sequence: answer.sequence,
+      questionRevisionId: answer.questionRevisionId,
+      selectedIndex: answer.selectedIndex,
+    }))
+    .sort((left, right) => left.sequence - right.sequence);
+  const operation = `batch-complete:${attemptId}`;
   const keyHash = sha256(idempotencyKey);
-  const requestHash = sha256("{}");
+  const requestHash = sha256(JSON.stringify({ answers }));
 
   const result = await database.client.begin(async (transaction) => {
     await lockActiveUser(transaction, userId);
@@ -724,6 +522,7 @@ export async function completeAttempt(
         a.id,
         a.user_id,
         a.daily_set_id,
+        a.challenge_id,
         a.status::text AS status,
         a.score::int AS score,
         ds.quiz_date::text AS quiz_date,
@@ -825,7 +624,13 @@ export async function completeAttempt(
     if (
       attempt.status === "started" &&
       now >=
-        (await getAttemptDeadline(transaction, attempt.id, attempt.quiz_date))
+        (attempt.challenge_id === null
+          ? getDailyCompletionDeadline(attempt.quiz_date)
+          : await getAttemptDeadline(
+              transaction,
+              attempt.id,
+              attempt.quiz_date,
+            ))
     ) {
       await transaction`
         UPDATE attempts
@@ -847,6 +652,93 @@ export async function completeAttempt(
       };
     }
 
+    const savedAnswers = await transaction<
+      {
+        sequence: number;
+        question_revision_id: string;
+        selected_index: number;
+      }[]
+    >`
+      SELECT sequence::int AS sequence, question_revision_id,
+        selected_index::int AS selected_index
+      FROM attempt_answers
+      WHERE attempt_id = ${attemptId}
+      ORDER BY sequence
+    `;
+    const savedAnswersMatch = savedAnswers.every((saved) => {
+      const answer = answers[saved.sequence - 1];
+      return (
+        answer !== undefined &&
+        answer.questionRevisionId === saved.question_revision_id &&
+        answer.selectedIndex === saved.selected_index
+      );
+    });
+    if (
+      attempt.status === "completed" &&
+      (!savedAnswersMatch || savedAnswers.length !== 5)
+    ) {
+      throw new AppError({
+        statusCode: 409,
+        code: "ATTEMPT_ALREADY_COMPLETED",
+        message: "이미 다른 답안으로 완료한 퀴즈입니다.",
+      });
+    }
+
+    const setItems = await transaction<
+      { sequence: number; question_revision_id: string }[]
+    >`
+      SELECT position::int AS sequence, question_revision_id
+      FROM daily_set_items
+      WHERE daily_set_id = ${attempt.daily_set_id}
+      ORDER BY position
+    `;
+    if (
+      setItems.length !== 5 ||
+      answers.some(
+        (answer, index) =>
+          setItems[index]?.sequence !== answer.sequence ||
+          setItems[index]?.question_revision_id !== answer.questionRevisionId,
+      )
+    ) {
+      throw new AppError({
+        statusCode: 409,
+        code: "QUESTION_REVISION_CONFLICT",
+        message: "문제 버전이 현재 퀴즈와 일치하지 않습니다.",
+      });
+    }
+    if (!savedAnswersMatch) {
+      throw new AppError({
+        statusCode: 409,
+        code: "SAVED_ANSWER_CONFLICT",
+        message: "이미 제출한 답안은 변경할 수 없습니다.",
+      });
+    }
+
+    const savedSequences = new Set(
+      savedAnswers.map((answer) => answer.sequence),
+    );
+    const missingAnswers = answers
+      .filter((answer) => !savedSequences.has(answer.sequence))
+      .map((answer) => ({
+        attempt_id: attemptId,
+        sequence: answer.sequence,
+        question_revision_id: answer.questionRevisionId,
+        selected_index: answer.selectedIndex,
+        received_at: now.toISOString(),
+      }));
+    if (missingAnswers.length > 0) {
+      await transaction`
+        INSERT INTO attempt_answers ${transaction(
+          missingAnswers,
+          "attempt_id",
+          "sequence",
+          "question_revision_id",
+          "selected_index",
+          "received_at",
+        )}
+      `;
+    }
+
     const reviewRows = await transaction<ReviewRow[]>`
       SELECT
         aa.sequence::int AS sequence,
@@ -865,29 +757,7 @@ export async function completeAttempt(
       ORDER BY aa.sequence
     `;
 
-    if (reviewRows.length !== 5) {
-      throw new AppError({
-        statusCode: 422,
-        code: "ANSWERS_INCOMPLETE",
-        message: "5문제를 모두 제출한 뒤 완료해 주세요.",
-        details: { answeredCount: reviewRows.length },
-      });
-    }
-
-    const review = reviewRows.map((row) => {
-      const correctIndex = getDisplayedChoiceIndex(
-        row.correct_index,
-        row.choice_order,
-      );
-      return {
-        sequence: row.sequence,
-        prompt: row.prompt,
-        selectedIndex: row.selected_index,
-        correctIndex,
-        correct: row.selected_index === correctIndex,
-        explanation: row.explanation,
-      };
-    });
+    const review = mapReview(reviewRows);
 
     let score = attempt.score;
     let completedAt = attempt.completed_at;

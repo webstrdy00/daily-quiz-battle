@@ -16,8 +16,10 @@
     "typecheck": "pnpm --filter @daily-quiz-battle/contracts build && pnpm -r --if-present typecheck",
     "format": "prettier --write . --ignore-path .prettierignore",
     "format:check": "prettier --check . --ignore-path .prettierignore",
-    "test": "pnpm --filter @daily-quiz-battle/api test",
+    "test": "pnpm test:integration && pnpm test:ops && pnpm test:web",
     "test:integration": "pnpm --filter @daily-quiz-battle/api test",
+    "test:ops": "node --test ops/check-backup.test.mjs",
+    "test:web": "node --test apps/web/tests/*.test.ts",
     "db:migrate": "pnpm --filter @daily-quiz-battle/api db:migrate",
     "db:seed": "pnpm --filter @daily-quiz-battle/api db:seed"
   },

@@ -146,43 +146,31 @@ async function startQuiz(token: string): Promise<AvailableDailyStart> {
   return start as AvailableDailyStart;
 }
 
-async function answerQuiz(
-  user: TestUser,
-  keyPrefix: string,
-  start: AvailableDailyStart,
-  expectedScore: number,
-): Promise<void> {
-  for (const [index, question] of start.questions.entries()) {
+function completionPayload(start: AvailableDailyStart, expectedScore: number) {
+  const answers = start.questions.map((question, index) => {
     const correctIndex = correctSelections[index]!;
     const selectedIndex =
       index < expectedScore ? correctIndex : (correctIndex + 1) % 4;
-    const response = await harness.app.inject({
-      method: "POST",
-      url: `/v1/attempts/${start.attempt.id}/answers`,
-      headers: idempotentHeaders(
-        user.token,
-        `${keyPrefix}-answer-${index + 1}`,
-      ),
-      payload: {
-        sequence: question.sequence,
-        questionRevisionId: question.revisionId,
-        selectedIndex,
-      },
-    });
-    assert.equal(response.statusCode, 200, response.body);
-  }
+    return {
+      sequence: question.sequence,
+      questionRevisionId: question.revisionId,
+      selectedIndex,
+    };
+  });
+  return { answers };
 }
 
 async function requestCompletion(
   user: TestUser,
-  attemptId: string,
+  start: AvailableDailyStart,
   idempotencyKey: string,
+  expectedScore: number,
 ): Promise<JsonResponse> {
   return harness.app.inject({
     method: "POST",
-    url: `/v1/attempts/${attemptId}/complete`,
+    url: `/v1/attempts/${start.attempt.id}/complete`,
     headers: idempotentHeaders(user.token, idempotencyKey),
-    payload: {},
+    payload: completionPayload(start, expectedScore),
   });
 }
 
@@ -193,11 +181,11 @@ async function finishQuiz(
   existingStart?: AvailableDailyStart,
 ): Promise<AvailableDailyStart> {
   const start = existingStart ?? (await startQuiz(user.token));
-  await answerQuiz(user, keyPrefix, start, expectedScore);
   const completion = await requestCompletion(
     user,
-    start.attempt.id,
+    start,
     `${keyPrefix}-complete`,
+    expectedScore,
   );
   assert.equal(completion.statusCode, 200, completion.body);
   const completed = CompleteAttemptResponseSchema.parse(completion.json());
@@ -889,7 +877,6 @@ test(
       "complete-delete-create",
     );
     const opponentAttempt = await startQuiz(opponent.token);
-    await answerQuiz(opponent, "complete-delete-opponent", opponentAttempt, 5);
     const claimResponse = await requestClaimChallenge(
       opponent,
       created.challenge.token,
@@ -911,8 +898,9 @@ test(
     const barrier = await holdChallengeLock(challengeIds[0]!.id);
     const completionPromise = requestCompletion(
       opponent,
-      opponentAttempt.attempt.id,
+      opponentAttempt,
       "complete-delete-complete",
+      5,
     );
     await waitForBlockedChallengeLocks();
     const deletionPromise = deleteUser(opponent);

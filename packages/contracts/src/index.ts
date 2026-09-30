@@ -41,6 +41,7 @@ export const BootstrapResponseSchema = z.object({
   accessToken: z.string().min(1),
   expiresInSeconds: z.number().int().positive(),
   user: z.object({
+    id: UuidSchema,
     nickname: z.string().min(1).max(12),
   }),
 });
@@ -48,6 +49,8 @@ export const BootstrapResponseSchema = z.object({
 export const OperationalCapabilitiesResponseSchema = z
   .object({
     analyticsPublishEnabled: z.boolean(),
+    challengeCreateEnabled: z.boolean(),
+    challengeClaimEnabled: z.boolean(),
   })
   .strict();
 
@@ -95,44 +98,6 @@ export const SavedAnswerSchema = z.object({
   selectedIndex: AnswerIndexSchema,
 });
 
-export const DailyAvailableStartResponseSchema = z.object({
-  status: z.literal("available"),
-  attempt: z.object({
-    id: UuidSchema,
-    status: AttemptStatusSchema,
-    quizDate: IsoDateSchema,
-    answeredCount: z.number().int().min(0).max(5),
-    score: z.number().int().min(0).max(5).nullable(),
-    answers: z.array(SavedAnswerSchema).max(5),
-  }),
-  questions: z.array(PublicQuestionSchema).length(5),
-});
-
-export const DailyVoidProjectionSchema = z.object({
-  status: z.literal("voided"),
-  quizDate: IsoDateSchema,
-  voidedAt: IsoDateTimeSchema,
-});
-
-export const DailyStartResponseSchema = z.discriminatedUnion("status", [
-  DailyAvailableStartResponseSchema,
-  DailyVoidProjectionSchema,
-]);
-
-export const SubmitAnswerRequestSchema = z.object({
-  sequence: QuestionSequenceSchema,
-  questionRevisionId: UuidSchema,
-  selectedIndex: AnswerIndexSchema,
-});
-
-export const SubmitAnswerResponseSchema = z.object({
-  attemptId: UuidSchema,
-  sequence: QuestionSequenceSchema,
-  saved: z.literal(true),
-  answeredCount: z.number().int().min(1).max(5),
-  nextSequence: QuestionSequenceSchema.nullable(),
-});
-
 export const QuizReviewItemSchema = z.object({
   sequence: QuestionSequenceSchema,
   prompt: z.string().min(1),
@@ -150,6 +115,46 @@ export const CompletedAttemptResponseSchema = z.object({
   completedAt: IsoDateTimeSchema,
   review: z.array(QuizReviewItemSchema).length(5),
 });
+
+export const DailyAvailableStartResponseSchema = z.object({
+  status: z.literal("available"),
+  attempt: z.object({
+    id: UuidSchema,
+    status: AttemptStatusSchema,
+    quizDate: IsoDateSchema,
+    answeredCount: z.number().int().min(0).max(5),
+    score: z.number().int().min(0).max(5).nullable(),
+    answers: z.array(SavedAnswerSchema).max(5),
+  }),
+  questions: z.array(PublicQuestionSchema).length(5),
+  completedResult: CompletedAttemptResponseSchema.optional(),
+});
+
+export const DailyVoidProjectionSchema = z.object({
+  status: z.literal("voided"),
+  quizDate: IsoDateSchema,
+  voidedAt: IsoDateTimeSchema,
+});
+
+export const DailyStartResponseSchema = z.discriminatedUnion("status", [
+  DailyAvailableStartResponseSchema,
+  DailyVoidProjectionSchema,
+]);
+
+export const CompleteAttemptRequestSchema = z
+  .object({
+    answers: z
+      .array(SavedAnswerSchema.strict())
+      .length(5)
+      .refine(
+        (answers) =>
+          new Set(answers.map((answer) => answer.sequence)).size === 5,
+        {
+          message: "문항 번호 1–5를 각각 한 번씩 제출해 주세요.",
+        },
+      ),
+  })
+  .strict();
 
 export const VoidedAttemptResponseSchema = DailyVoidProjectionSchema.extend({
   attemptId: UuidSchema,
@@ -724,8 +729,9 @@ export type DailyAvailableStartResponse = z.infer<
 >;
 export type DailyVoidProjection = z.infer<typeof DailyVoidProjectionSchema>;
 export type DailyStartResponse = z.infer<typeof DailyStartResponseSchema>;
-export type SubmitAnswerRequest = z.infer<typeof SubmitAnswerRequestSchema>;
-export type SubmitAnswerResponse = z.infer<typeof SubmitAnswerResponseSchema>;
+export type CompleteAttemptRequest = z.infer<
+  typeof CompleteAttemptRequestSchema
+>;
 export type QuizReviewItem = z.infer<typeof QuizReviewItemSchema>;
 export type CompletedAttemptResponse = z.infer<
   typeof CompletedAttemptResponseSchema

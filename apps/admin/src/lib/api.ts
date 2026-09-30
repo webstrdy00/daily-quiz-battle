@@ -144,26 +144,116 @@ function invalidRequest(): ApiClientError {
   });
 }
 
+// Unverified JWT claims only bound local UI lifetime. The API still authenticates
+// every request, including signature, issuer, audience, role and expiry checks.
+export function tokenExpiryHint(token: string, now = Date.now()): number {
+  try {
+    const parts = token.split(".");
+    if (
+      parts.length !== 3 ||
+      parts.some(
+        (part) => !/^[A-Za-z0-9_-]+$/.test(part) || part.length % 4 === 1,
+      )
+    ) {
+      throw new Error("Invalid JWT encoding");
+    }
+    const decode = (part: string): unknown => {
+      const base64 = part.replace(/-/g, "+").replace(/_/g, "/");
+      const bytes = Uint8Array.from(
+        atob(base64.padEnd(Math.ceil(base64.length / 4) * 4, "=")),
+        (character) => character.charCodeAt(0),
+      );
+      return JSON.parse(
+        new TextDecoder("utf-8", { fatal: true }).decode(bytes),
+      );
+    };
+    const header = decode(parts[0]) as { alg?: unknown } | null;
+    const payload = decode(parts[1]) as { exp?: unknown } | null;
+    if (
+      !header ||
+      typeof header.alg !== "string" ||
+      !header.alg ||
+      !payload ||
+      typeof payload.exp !== "number" ||
+      !Number.isFinite(payload.exp) ||
+      !Number.isSafeInteger(payload.exp * 1000)
+    ) {
+      throw new Error("Invalid JWT expiry");
+    }
+    const expiresAt = payload.exp * 1000;
+    if (expiresAt <= now) {
+      throw new Error("Expired JWT");
+    }
+    return expiresAt;
+  } catch {
+    throw new ApiClientError({
+      code: "ADMIN_TOKEN_INVALID",
+      message:
+        "운영자 JWT가 만료되었거나 형식이 올바르지 않습니다. 새 토큰을 입력해 주세요.",
+    });
+  }
+}
+
 export class AdminApiClient {
   private token: string;
   private readonly baseUrl: string;
+  private readonly expiresAt: number;
+  private readonly onExpire: () => void;
+  private expiryTimer: number | undefined;
   private readonly controllers = new Set<AbortController>();
   private disposed = false;
 
-  constructor(token: string) {
+  constructor(token: string, onExpire: () => void) {
     if (!token.trim()) {
       throw new ApiClientError({
         code: "ADMIN_TOKEN_REQUIRED",
         message: "15분 운영자 JWT를 입력해 주세요.",
       });
     }
+    this.expiresAt = tokenExpiryHint(token.trim());
+    this.onExpire = onExpire;
     this.token = token.trim();
     this.baseUrl = resolveApiBaseUrl();
+    this.scheduleExpiry();
+    window.addEventListener("focus", this.checkExpiry);
+    document.addEventListener("visibilitychange", this.checkExpiry);
+    window.addEventListener("pageshow", this.checkExpiry);
+  }
+
+  private readonly checkExpiry = (): void => {
+    if (!this.disposed && Date.now() >= this.expiresAt) {
+      this.dispose();
+      this.onExpire();
+    }
+  };
+
+  private scheduleExpiry(): void {
+    this.expiryTimer = window.setTimeout(
+      () => {
+        this.checkExpiry();
+        if (!this.disposed) this.scheduleExpiry();
+      },
+      Math.min(Math.max(0, this.expiresAt - Date.now()), 2_147_483_647),
+    );
+  }
+
+  private assertActive(): void {
+    this.checkExpiry();
+    if (this.disposed || !this.token) {
+      throw new ApiClientError({
+        code: "ADMIN_SESSION_CLOSED",
+        message: "운영자 세션이 종료되었습니다.",
+      });
+    }
   }
 
   dispose(): void {
     this.disposed = true;
     this.token = "";
+    window.clearTimeout(this.expiryTimer);
+    window.removeEventListener("focus", this.checkExpiry);
+    document.removeEventListener("visibilitychange", this.checkExpiry);
+    window.removeEventListener("pageshow", this.checkExpiry);
     for (const controller of this.controllers) {
       controller.abort();
     }
@@ -359,12 +449,7 @@ export class AdminApiClient {
     parser: Parser<T>,
     init: RequestInit,
   ): Promise<T> {
-    if (this.disposed || !this.token) {
-      throw new ApiClientError({
-        code: "ADMIN_SESSION_CLOSED",
-        message: "운영자 세션이 종료되었습니다.",
-      });
-    }
+    this.assertActive();
 
     const controller = new AbortController();
     const timeout = window.setTimeout(() => controller.abort(), 10_000);
@@ -387,6 +472,8 @@ export class AdminApiClient {
         },
       });
     } catch (error) {
+      window.clearTimeout(timeout);
+      this.controllers.delete(controller);
       const aborted =
         error instanceof DOMException && error.name === "AbortError";
       throw new ApiClientError({
@@ -396,9 +483,6 @@ export class AdminApiClient {
           : "네트워크 연결을 확인하고 다시 시도해 주세요.",
         retryable: true,
       });
-    } finally {
-      window.clearTimeout(timeout);
-      this.controllers.delete(controller);
     }
 
     let payload: unknown;
@@ -411,8 +495,12 @@ export class AdminApiClient {
         retryable: response.status >= 500,
         status: response.status,
       });
+    } finally {
+      window.clearTimeout(timeout);
+      this.controllers.delete(controller);
     }
 
+    this.assertActive();
     if (!response.ok) {
       const result = ApiErrorSchema.safeParse(payload);
       throw new ApiClientError({

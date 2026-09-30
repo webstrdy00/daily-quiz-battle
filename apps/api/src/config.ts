@@ -60,6 +60,7 @@ const EnvironmentSchema = z.object({
     .enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"])
     .default("info"),
   DATABASE_URL: z.string().url().default(LOCAL_DATABASE_URL),
+  DATABASE_CA_CERT: z.string().min(1).optional(),
   // Two scheduler session locks must leave a connection available for task work.
   DATABASE_POOL_MAX: z.coerce.number().int().min(3).max(20).default(5),
   IDENTITY_VERIFICATION_MODE: z.enum(["mock", "mtls"]).default("mock"),
@@ -141,6 +142,10 @@ const EnvironmentSchema = z.object({
     .enum(["true", "false"])
     .default("false")
     .transform((value) => value === "true"),
+  OPERATIONS_RETENTION_ENABLED: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((value) => value === "true"),
   OPERATIONS_NOTIFICATION_INTERVAL_SECONDS: z.coerce
     .number()
     .int()
@@ -205,6 +210,7 @@ export interface AppConfig {
   apiPort: number;
   logLevel: "fatal" | "error" | "warn" | "info" | "debug" | "trace" | "silent";
   databaseUrl: string;
+  databaseCaCert?: string;
   databasePoolMax: number;
   identityVerificationMode: IdentityVerificationMode;
   identityVerifyUrl: string;
@@ -241,6 +247,7 @@ export interface AppConfig {
 
 export interface OperationsSchedulerConfig {
   operationsSchedulerEnabled: boolean;
+  operationalRetentionEnabled?: boolean;
   operationsNotificationIntervalSeconds: number;
   operationsCleanupIntervalHours: number;
 }
@@ -449,6 +456,7 @@ export function loadConfig(): RuntimeConfig {
     apiPort: values.API_PORT,
     logLevel: values.LOG_LEVEL,
     databaseUrl: values.DATABASE_URL,
+    databaseCaCert: values.DATABASE_CA_CERT,
     databasePoolMax: values.DATABASE_POOL_MAX,
     identityVerificationMode: values.IDENTITY_VERIFICATION_MODE,
     identityVerifyUrl: values.IDENTITY_VERIFY_URL,
@@ -486,6 +494,7 @@ export function loadConfig(): RuntimeConfig {
     notificationDeliveryEnabled: values.NOTIFICATION_DELIVERY_ENABLED,
     analyticsPublishEnabled: values.ANALYTICS_PUBLISH_ENABLED,
     operationsSchedulerEnabled: values.OPERATIONS_SCHEDULER_ENABLED,
+    operationalRetentionEnabled: values.OPERATIONS_RETENTION_ENABLED,
     operationsNotificationIntervalSeconds:
       values.OPERATIONS_NOTIFICATION_INTERVAL_SECONDS,
     operationsCleanupIntervalHours: values.OPERATIONS_CLEANUP_INTERVAL_HOURS,

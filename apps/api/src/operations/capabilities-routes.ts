@@ -8,18 +8,28 @@ export interface OperationalCapabilitiesRouteDependencies {
   database: Database;
   tokenService: AccessTokenService;
   analyticsPublishEnabled: boolean;
+  challengeCreateEnabled: boolean;
+  challengeClaimEnabled: boolean;
 }
 
 export function registerOperationalCapabilitiesRoutes(
   app: FastifyInstance,
   dependencies: OperationalCapabilitiesRouteDependencies,
 ): void {
-  const { database, tokenService, analyticsPublishEnabled } = dependencies;
+  const {
+    database,
+    tokenService,
+    analyticsPublishEnabled,
+    challengeCreateEnabled,
+    challengeClaimEnabled,
+  } = dependencies;
 
   app.get("/v1/operational-capabilities", async (request) => {
     await authenticateRequest(request, database, tokenService);
     return OperationalCapabilitiesResponseSchema.parse({
       analyticsPublishEnabled,
+      challengeCreateEnabled,
+      challengeClaimEnabled,
     });
   });
 }

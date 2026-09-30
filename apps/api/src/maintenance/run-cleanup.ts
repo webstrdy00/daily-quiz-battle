@@ -7,8 +7,11 @@ let counts: CleanupCounts | undefined;
 let failed = false;
 
 try {
-  database = createDatabase(loadConfig());
-  counts = await runCleanup(database, new Date());
+  const config = loadConfig();
+  database = createDatabase(config);
+  counts = await runCleanup(database, new Date(), {
+    operationalRetentionEnabled: config.operationalRetentionEnabled,
+  });
 } catch {
   failed = true;
 } finally {

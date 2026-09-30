@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import { after, before, test } from "node:test";
+import { createDatabase } from "../db/client.js";
 import {
   CLEANUP_BATCH_SIZE,
   runCleanup,
@@ -463,4 +465,357 @@ test("cleanup limits each idempotency deletion batch to 500", async () => {
     WHERE operation = 'cleanup-future'
   `;
   assert.equal(futureRows[0]!.count, 1);
+});
+
+const operationalOptions = { operationalRetentionEnabled: true };
+
+function operationalCounts(value = 0): CleanupCounts {
+  return {
+    ...zeroCounts(),
+    terminalReportsDeleted: value,
+    publishedOutboxDeleted: value,
+    adminAuditLogsDeleted: value,
+  };
+}
+
+async function insertOperationalRows(
+  size = 1,
+  milliseconds = 0,
+  reportStatus = "resolved",
+  outboxStatus = "published",
+): Promise<{ reports: string[]; outbox: string[]; audits: string[] }> {
+  const challengeId = await insertChallenge({
+    label: randomUUID(),
+    status: "completed",
+    expiresAt: shiftedNow(-40),
+    completedAt: CLEANUP_NOW,
+  });
+  const reports = await harness.database.client<{ id: string }[]>`
+    INSERT INTO reports (
+      reporter_user_id, challenge_id, reason_code, status,
+      triaged_by, triaged_at, created_at
+    )
+    SELECT ${creatorUserId}, ${challengeId}, 'other',
+      ${reportStatus}::report_status,
+      ${reportStatus === "open" ? null : "cleanup-test"},
+      ${reportStatus === "open" ? null : timestamp(shiftedNow(-30, milliseconds))},
+      ${timestamp(shiftedNow(-200))}
+    FROM generate_series(1, ${size})
+    RETURNING id
+  `;
+  const outbox = await harness.database.client<{ id: string }[]>`
+    INSERT INTO notification_outbox (
+      event_type, recipient_user_id, challenge_id, dedupe_key,
+      status, occurred_at, published_at
+    )
+    SELECT 'challenge.completed', ${creatorUserId}, ${challengeId},
+      gen_random_uuid()::text, ${outboxStatus}::notification_outbox_status,
+      ${timestamp(shiftedNow(-200))},
+      ${outboxStatus === "published" ? timestamp(shiftedNow(-30, milliseconds)) : null}
+    FROM generate_series(1, ${size})
+    RETURNING id
+  `;
+  const audits = await harness.database.client<{ id: string }[]>`
+    INSERT INTO admin_audit_logs (
+      actor_subject, action, resource_type, resource_id, created_at
+    )
+    SELECT 'cleanup-test', 'test', 'challenge', ${challengeId},
+      ${timestamp(shiftedNow(-180, milliseconds))}
+    FROM generate_series(1, ${size})
+    RETURNING id
+  `;
+  return {
+    reports: reports.map((row) => row.id).sort(),
+    outbox: outbox.map((row) => row.id).sort(),
+    audits: audits.map((row) => row.id).sort(),
+  };
+}
+
+async function retainedOperationalRows(
+  fixture: Awaited<ReturnType<typeof insertOperationalRows>>,
+) {
+  const reports = await harness.database.client<{ id: string }[]>`
+    SELECT id FROM reports WHERE id IN ${harness.database.client(fixture.reports)} ORDER BY id
+  `;
+  const outbox = await harness.database.client<{ id: string }[]>`
+    SELECT id FROM notification_outbox WHERE id IN ${harness.database.client(fixture.outbox)} ORDER BY id
+  `;
+  const audits = await harness.database.client<{ id: string }[]>`
+    SELECT id FROM admin_audit_logs WHERE id IN ${harness.database.client(fixture.audits)} ORDER BY id
+  `;
+  return {
+    reports: reports.map((row) => row.id),
+    outbox: outbox.map((row) => row.id),
+    audits: audits.map((row) => row.id),
+  };
+}
+
+test("operational retention is opt-in and includes cutoff equality but not +1ms", async () => {
+  const before = await insertOperationalRows(1, -1);
+  const equal = await insertOperationalRows(1, 0, "dismissed");
+  const after = await insertOperationalRows(1, 1);
+  const open = await insertOperationalRows(1, 1, "open", "pending");
+  const reviewing = await insertOperationalRows(1, 1, "reviewing", "failed");
+  const oldReviewing = await insertOperationalRows(1, 1, "open", "failed");
+  // Reviewing reports remain live even with an old triage timestamp.
+  await harness.database.client`
+    UPDATE reports SET status = 'reviewing', triaged_by = 'cleanup-test',
+      triaged_at = ${timestamp(shiftedNow(-100))}
+    WHERE id = ${oldReviewing.reports[0]!}
+  `;
+  for (const options of [undefined, { operationalRetentionEnabled: false }]) {
+    assert.deepEqual(
+      await runCleanup(harness.database, CLEANUP_NOW, options),
+      zeroCounts(),
+    );
+    for (const fixture of [
+      before,
+      equal,
+      after,
+      open,
+      reviewing,
+      oldReviewing,
+    ]) {
+      assert.deepEqual(await retainedOperationalRows(fixture), fixture);
+    }
+  }
+  assert.deepEqual(
+    await runCleanup(harness.database, CLEANUP_NOW, operationalOptions),
+    operationalCounts(2),
+  );
+  for (const fixture of [before, equal]) {
+    assert.deepEqual(await retainedOperationalRows(fixture), {
+      reports: [],
+      outbox: [],
+      audits: [],
+    });
+  }
+  for (const fixture of [after, open, reviewing, oldReviewing]) {
+    assert.deepEqual(await retainedOperationalRows(fixture), fixture);
+  }
+  assert.deepEqual(
+    await runCleanup(harness.database, CLEANUP_NOW, operationalOptions),
+    operationalCounts(),
+  );
+});
+
+test("operational retention deterministically limits every stage to 500 and drains to zero", async () => {
+  const fixture = await insertOperationalRows(CLEANUP_BATCH_SIZE + 1);
+  assert.deepEqual(
+    await runCleanup(harness.database, CLEANUP_NOW, operationalOptions),
+    operationalCounts(500),
+  );
+  assert.deepEqual(await retainedOperationalRows(fixture), {
+    reports: fixture.reports.slice(500),
+    outbox: fixture.outbox.slice(500),
+    audits: fixture.audits.slice(500),
+  });
+  assert.deepEqual(
+    await runCleanup(harness.database, CLEANUP_NOW, operationalOptions),
+    operationalCounts(1),
+  );
+  assert.deepEqual(
+    await runCleanup(harness.database, CLEANUP_NOW, operationalOptions),
+    operationalCounts(),
+  );
+});
+
+test("operational retention skips locked rows in every stage", async () => {
+  const fixture = await insertOperationalRows(2);
+  await harness.database.client.begin(async (transaction) => {
+    await transaction`SELECT id FROM reports WHERE id = ${fixture.reports[0]!} FOR UPDATE`;
+    await transaction`SELECT id FROM notification_outbox WHERE id = ${fixture.outbox[0]!} FOR UPDATE`;
+    await transaction`SELECT id FROM admin_audit_logs WHERE id = ${fixture.audits[0]!} FOR UPDATE`;
+    assert.deepEqual(
+      await runCleanup(harness.database, CLEANUP_NOW, operationalOptions),
+      operationalCounts(1),
+    );
+    assert.deepEqual(await retainedOperationalRows(fixture), {
+      reports: fixture.reports.slice(0, 1),
+      outbox: fixture.outbox.slice(0, 1),
+      audits: fixture.audits.slice(0, 1),
+    });
+  });
+  assert.deepEqual(
+    await runCleanup(harness.database, CLEANUP_NOW, operationalOptions),
+    operationalCounts(1),
+  );
+  assert.deepEqual(
+    await runCleanup(harness.database, CLEANUP_NOW, operationalOptions),
+    operationalCounts(),
+  );
+});
+
+test("a late operational failure rolls back all cleanup stages", async () => {
+  const fixture = await insertOperationalRows();
+  const challengeId = await insertChallenge({
+    label: randomUUID(),
+    status: "open",
+    expiresAt: CLEANUP_NOW,
+  });
+  await harness.database.client`
+    CREATE FUNCTION fail_cleanup_audit_delete() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN RAISE EXCEPTION 'cleanup rollback sentinel'; END;
+    $$
+  `;
+  await harness.database.client`
+    CREATE TRIGGER fail_cleanup_audit_delete BEFORE DELETE ON admin_audit_logs
+    FOR EACH ROW EXECUTE FUNCTION fail_cleanup_audit_delete()
+  `;
+  try {
+    await assert.rejects(
+      runCleanup(harness.database, CLEANUP_NOW, operationalOptions),
+      /cleanup rollback sentinel/,
+    );
+    assert.deepEqual(await retainedOperationalRows(fixture), fixture);
+    assert.equal((await getChallenge(challengeId))?.status, "open");
+  } finally {
+    await harness.database
+      .client`DROP TRIGGER fail_cleanup_audit_delete ON admin_audit_logs`;
+    await harness.database.client`DROP FUNCTION fail_cleanup_audit_delete()`;
+  }
+  assert.deepEqual(
+    await runCleanup(harness.database, CLEANUP_NOW, operationalOptions),
+    {
+      ...operationalCounts(1),
+      challengesExpired: 1,
+    },
+  );
+});
+
+test("cleanup rejects invalid clocks regardless of operational opt-in", async () => {
+  for (const options of [
+    undefined,
+    { operationalRetentionEnabled: false },
+    operationalOptions,
+  ]) {
+    await assert.rejects(
+      runCleanup(harness.database, new Date(Number.NaN), options),
+      {
+        name: "TypeError",
+        message: "Cleanup time must be a valid Date",
+      },
+    );
+  }
+});
+
+test("operational retention leaves attempts, answers, voids, content, and user tombstones untouched", async () => {
+  const deletedUserId = await insertUser("deleted");
+  const answerUserId = await insertUser("answers");
+  const answerAttemptId = randomUUID();
+  await harness.database.client`
+    INSERT INTO attempts (id, user_id, daily_set_id, status, started_at, updated_at)
+    VALUES (${answerAttemptId}, ${answerUserId}, ${dailySetId}, 'started',
+      ${timestamp(shiftedNow(-200))}, ${timestamp(shiftedNow(-200))})
+  `;
+  await harness.database.client`
+    UPDATE users SET identity_status = 'deleted',
+      deleted_at = ${timestamp(shiftedNow(-200))}
+    WHERE id = ${deletedUserId}
+  `;
+  await harness.database.client`
+    INSERT INTO attempt_answers (
+      attempt_id, sequence, question_revision_id, selected_index, received_at
+    )
+    SELECT ${answerAttemptId}, 1, question_revision_id, 0, ${timestamp(shiftedNow(-200, 1))}
+    FROM daily_set_items WHERE daily_set_id = ${dailySetId} AND position = 1
+  `;
+  await harness.database.client`
+    UPDATE attempts SET status = 'completed', score = 0,
+      completed_at = ${timestamp(shiftedNow(-200, 2))},
+      updated_at = ${timestamp(shiftedNow(-200, 2))}
+    WHERE id = ${answerAttemptId}
+  `;
+  await harness.database.client`
+    INSERT INTO daily_set_voids (daily_set_id, actor_subject, reason, voided_at)
+    VALUES (${dailySetId}, 'cleanup-test', 'retention fixture', ${timestamp(shiftedNow(-200, 3))})
+  `;
+  const tables = [
+    "users",
+    "attempts",
+    "attempt_answers",
+    "daily_set_voids",
+    "questions",
+    "question_revisions",
+    "daily_sets",
+    "daily_set_items",
+  ];
+  const snapshots = await Promise.all(
+    tables.map(
+      (table) =>
+        harness.database.client`
+      SELECT to_jsonb(record) AS value
+      FROM ${harness.database.client(table)} AS record
+      ORDER BY to_jsonb(record)::text
+    `,
+    ),
+  );
+  await insertOperationalRows();
+  assert.deepEqual(
+    await runCleanup(harness.database, CLEANUP_NOW, operationalOptions),
+    operationalCounts(1),
+  );
+  for (const [index, table] of tables.entries()) {
+    const rows = await harness.database.client`
+      SELECT to_jsonb(record) AS value
+      FROM ${harness.database.client(table)} AS record
+      ORDER BY to_jsonb(record)::text
+    `;
+    assert.deepEqual([...rows], [...snapshots[index]!], table);
+  }
+});
+
+test("worker can run operational cleanup without unrelated DELETE or payload UPDATE privileges", async () => {
+  const roleSql = await readFile(
+    new URL("../../../../ops/database-runtime-roles.sql", import.meta.url),
+    "utf8",
+  );
+  const roleConnection = await harness.database.client.reserve();
+  try {
+    await roleConnection.unsafe(roleSql);
+  } catch (error) {
+    await roleConnection`ROLLBACK`;
+    throw error;
+  } finally {
+    roleConnection.release();
+  }
+  const fixture = await insertOperationalRows();
+  const worker = createDatabase({ ...harness.config, databasePoolMax: 1 });
+  try {
+    await worker.client`SET ROLE daily_quiz_worker`;
+    assert.deepEqual(
+      await runCleanup(worker, CLEANUP_NOW, operationalOptions),
+      operationalCounts(1),
+    );
+    assert.deepEqual(await retainedOperationalRows(fixture), {
+      reports: [],
+      outbox: [],
+      audits: [],
+    });
+    for (const table of [
+      "users",
+      "attempts",
+      "attempt_answers",
+      "daily_set_voids",
+      "questions",
+      "question_revisions",
+      "daily_sets",
+      "daily_set_items",
+    ]) {
+      await assert.rejects(
+        worker.client`DELETE FROM ${worker.client(table)} WHERE false`,
+        { code: "42501" },
+      );
+    }
+    await assert.rejects(
+      worker.client`UPDATE reports SET detail = 'forbidden' WHERE false`,
+      { code: "42501" },
+    );
+    await assert.rejects(
+      worker.client`UPDATE admin_audit_logs SET metadata = '{}'::jsonb WHERE false`,
+      { code: "42501" },
+    );
+  } finally {
+    await worker.close();
+  }
 });

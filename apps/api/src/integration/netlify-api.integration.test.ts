@@ -5,7 +5,7 @@ import {
   ApiErrorSchema,
   BootstrapResponseSchema,
   DailyStartResponseSchema,
-  SubmitAnswerResponseSchema,
+  CompleteAttemptResponseSchema,
 } from "@daily-quiz-battle/contracts";
 import type { FastifyInstance } from "fastify";
 import { buildApp } from "../app.js";
@@ -93,7 +93,7 @@ async function expectError(
   assert.equal(error.requestId, response.headers.get("x-request-id"));
 }
 
-test("Netlify Request adapter preserves bootstrap, authentication and idempotent answer flow", async () => {
+test("Netlify Request adapter preserves bootstrap, authentication and idempotent batch completion", async () => {
   await expectError(
     await send("/v1/daily/start", jsonPost({})),
     401,
@@ -117,22 +117,50 @@ test("Netlify Request adapter preserves bootstrap, authentication and idempotent
   if (start.status !== "available") {
     assert.fail("fixture daily quiz must be available");
   }
-  const question = start.questions[0]!;
   const body = {
-    sequence: question.sequence,
-    questionRevisionId: question.revisionId,
-    selectedIndex: 0,
+    answers: start.questions.map((question) => ({
+      sequence: question.sequence,
+      questionRevisionId: question.revisionId,
+      selectedIndex: 0,
+    })),
   };
   const headers = { authorization, "idempotency-key": randomUUID() };
-  const path = `/v1/attempts/${start.attempt.id}/answers`;
+  const path = `/v1/attempts/${start.attempt.id}/complete`;
   const answer = await send(path, jsonPost(body, headers));
   assert.equal(answer.status, 200);
-  const result = SubmitAnswerResponseSchema.parse(await answer.json());
-  const replay = await send(path, jsonPost(body, headers));
+  const result = CompleteAttemptResponseSchema.parse(await answer.json());
+  assert.equal(result.status, "completed");
+  const replay = await send(
+    path,
+    jsonPost({ answers: [...body.answers].reverse() }, headers),
+  );
   assert.equal(replay.status, 200);
   assert.deepEqual(
-    SubmitAnswerResponseSchema.parse(await replay.json()),
+    CompleteAttemptResponseSchema.parse(await replay.json()),
     result,
+  );
+  await expectError(
+    await send(
+      path,
+      jsonPost(
+        {
+          answers: body.answers.map((answer, index) =>
+            index === 4 ? { ...answer, selectedIndex: 1 } : answer,
+          ),
+        },
+        headers,
+      ),
+    ),
+    409,
+    "IDEMPOTENCY_KEY_REUSED",
+  );
+  await expectError(
+    await send(
+      `/v1/attempts/${start.attempt.id}/answers`,
+      jsonPost(body.answers[0], headers),
+    ),
+    404,
+    "NOT_FOUND",
   );
 });
 
@@ -173,6 +201,7 @@ test("Netlify adapter retains CORS preflight, HEAD and bodyless 204 semantics", 
     },
   });
   assert.equal(preflight.status, 204);
+  assert.equal(preflight.headers.get("access-control-max-age"), "300");
   assert.equal(await preflight.text(), "");
   assert.equal(
     preflight.headers.get("access-control-allow-origin"),

@@ -7,15 +7,16 @@ import {
   CompleteAttemptResponseSchema,
   CreateChallengeResponseSchema,
   DailyStartResponseSchema,
-  SubmitAnswerResponseSchema,
+  type CompleteAttemptRequest,
   type CompletedAttemptResponse,
   type DailyAvailableStartResponse,
   type PublicQuestion,
-  type SubmitAnswerRequest,
+  type SavedAnswer,
 } from "@daily-quiz-battle/contracts";
 import { decodeJwt } from "jose";
 import type postgres from "postgres";
 import { buildApp } from "../app.js";
+import { startOrResumeAttempt } from "../daily/service.js";
 import { createDatabase } from "../db/client.js";
 import {
   createIntegrationHarness,
@@ -97,7 +98,7 @@ async function startQuiz(token: string): Promise<DailyAvailableStartResponse> {
 function answerPayload(
   question: PublicQuestion,
   selectedIndex: number,
-): SubmitAnswerRequest {
+): SavedAnswer {
   return {
     sequence: question.sequence,
     questionRevisionId: question.revisionId,
@@ -105,60 +106,49 @@ function answerPayload(
   };
 }
 
-async function submitAnswer(
-  token: string,
+async function seedHistoricalAnswer(
   attemptId: string,
+  question: PublicQuestion,
+  selectedIndex: number,
+) {
+  await harness.database.client`
+    INSERT INTO attempt_answers (attempt_id, sequence, question_revision_id, selected_index)
+    VALUES (${attemptId}, ${question.sequence}, ${question.revisionId}, ${selectedIndex})
+  `;
+}
+
+function batch(
+  start: DailyAvailableStartResponse,
+  selections: readonly number[] = correctSelections,
+): CompleteAttemptRequest {
+  return {
+    answers: start.questions.map((question, index) =>
+      answerPayload(question, selections[index]!),
+    ),
+  };
+}
+
+async function completeQuiz(
+  token: string,
+  start: DailyAvailableStartResponse,
   idempotencyKey: string,
-  payload: SubmitAnswerRequest,
+  payload: CompleteAttemptRequest = batch(start),
 ) {
   return harness.app.inject({
     method: "POST",
-    url: `/v1/attempts/${attemptId}/answers`,
+    url: `/v1/attempts/${start.attempt.id}/complete`,
     headers: idempotentHeaders(token, idempotencyKey),
     payload,
   });
 }
 
-async function submitSuccessfulAnswer(
-  token: string,
-  attemptId: string,
-  idempotencyKey: string,
-  question: PublicQuestion,
-  selectedIndex: number,
-) {
-  const response = await submitAnswer(
-    token,
-    attemptId,
-    idempotencyKey,
-    answerPayload(question, selectedIndex),
-  );
-  assert.equal(response.statusCode, 200, response.body);
-  return SubmitAnswerResponseSchema.parse(response.json());
-}
-
-async function completeQuiz(
-  token: string,
-  attemptId: string,
-  idempotencyKey: string,
-) {
-  return harness.app.inject({
-    method: "POST",
-    url: `/v1/attempts/${attemptId}/complete`,
-    headers: idempotentHeaders(token, idempotencyKey),
-    payload: {},
-  });
-}
-
-async function answerAllQuestions(
-  token: string,
+async function seedHistoricalAnswers(
   start: DailyAvailableStartResponse,
-  keyPrefix: string,
+  count = 5,
 ): Promise<void> {
-  for (const [index, question] of start.questions.entries()) {
-    await submitSuccessfulAnswer(
-      token,
+  for (const [index, question] of start.questions.slice(0, count).entries()) {
+    await seedHistoricalAnswer(
       start.attempt.id,
-      `${keyPrefix}-${index + 1}`,
       question,
       correctSelections[index]!,
     );
@@ -309,6 +299,8 @@ test("bootstrap assigns an allowed anonymous nickname and preserves it on replay
   const replay = BootstrapResponseSchema.parse(replayResponse.json());
   assert.equal(replay.user.nickname, first.user.nickname);
   const userId = getTokenUserId(first.accessToken);
+  assert.equal(first.user.id, userId);
+  assert.equal(replay.user.id, userId);
   assert.equal(getTokenUserId(replay.accessToken), userId);
   const rows = await harness.database.client<{ nickname: string }[]>`
     SELECT nickname FROM users WHERE id = ${userId}
@@ -426,19 +418,6 @@ test("daily write kill switches separate new starts from attempt draining", asyn
     expectDisabled(disabledStart);
     await assertNoWrites(countsBeforeBlockedStarts);
 
-    for (const [index, question] of drainStart.questions.entries()) {
-      const answerResponse: JsonResponse = await startDisabledApp.inject({
-        method: "POST",
-        url: `/v1/attempts/${drainStart.attempt.id}/answers`,
-        headers: idempotentHeaders(
-          drainToken,
-          `daily-start-disabled-drain-answer-${index + 1}`,
-        ),
-        payload: answerPayload(question, correctSelections[index]!),
-      });
-      assert.equal(answerResponse.statusCode, 200, answerResponse.body);
-      SubmitAnswerResponseSchema.parse(answerResponse.json());
-    }
     const completed = await startDisabledApp.inject({
       method: "POST",
       url: `/v1/attempts/${drainStart.attempt.id}/complete`,
@@ -446,14 +425,14 @@ test("daily write kill switches separate new starts from attempt draining", asyn
         drainToken,
         "daily-start-disabled-drain-complete",
       ),
-      payload: {},
+      payload: batch(drainStart),
     });
     assert.equal(completed.statusCode, 200, completed.body);
     assert.equal(parseCompletedAttempt(completed.json()).score, 5);
     assert.deepEqual(await readWriteRowCounts(), {
       attempt_count: countsBeforeBlockedStarts.attempt_count,
       answer_count: countsBeforeBlockedStarts.answer_count + 5,
-      idempotency_count: countsBeforeBlockedStarts.idempotency_count + 6,
+      idempotency_count: countsBeforeBlockedStarts.idempotency_count + 1,
     });
   } finally {
     if (startDisabledApp !== undefined) {
@@ -505,38 +484,15 @@ test("daily write kill switches separate new starts from attempt draining", asyn
       idempotency_count: countsBeforeAllowedStart.idempotency_count,
     });
 
-    const unauthenticatedAnswer = await continuationDisabledApp.inject({
-      method: "POST",
-      url: `/v1/attempts/${allowedStart.attempt.id}/answers`,
-      headers: {
-        "idempotency-key": "daily-continuation-disabled-unauth-answer",
-      },
-      payload: answerPayload(allowedStart.questions[0]!, correctSelections[0]),
-    });
-    expectApiError(unauthenticatedAnswer, 401, "UNAUTHORIZED");
-    await assertNoWrites(countsBeforeBlockedContinuations);
-
     const unauthenticatedComplete = await continuationDisabledApp.inject({
       method: "POST",
       url: `/v1/attempts/${allowedStart.attempt.id}/complete`,
       headers: {
         "idempotency-key": "daily-continuation-disabled-unauth-complete",
       },
-      payload: {},
+      payload: batch(allowedStart),
     });
     expectApiError(unauthenticatedComplete, 401, "UNAUTHORIZED");
-    await assertNoWrites(countsBeforeBlockedContinuations);
-
-    const disabledAnswer = await continuationDisabledApp.inject({
-      method: "POST",
-      url: `/v1/attempts/${allowedStart.attempt.id}/answers`,
-      headers: idempotentHeaders(
-        continuationToken,
-        "daily-continuation-disabled-answer",
-      ),
-      payload: answerPayload(allowedStart.questions[0]!, correctSelections[0]),
-    });
-    expectDisabled(disabledAnswer);
     await assertNoWrites(countsBeforeBlockedContinuations);
 
     const disabledComplete = await continuationDisabledApp.inject({
@@ -546,7 +502,7 @@ test("daily write kill switches separate new starts from attempt draining", asyn
         continuationToken,
         "daily-continuation-disabled-complete",
       ),
-      payload: {},
+      payload: batch(allowedStart),
     });
     expectDisabled(disabledComplete);
     await assertNoWrites(countsBeforeBlockedContinuations);
@@ -570,59 +526,17 @@ test("full daily flow resumes and replays without exposing answers early", async
   assert.equal(start.questions.length, 5);
   assert.equal(resumed.attempt.id, start.attempt.id);
   assert.equal(resumed.attempt.answeredCount, 0);
+  assert.equal("completedResult" in start, false);
+  assert.equal("completedResult" in resumed, false);
   for (const question of start.questions) {
     assert.equal("correctIndex" in question, false);
     assert.equal("explanation" in question, false);
   }
 
-  const firstPayload = answerPayload(start.questions[0]!, correctSelections[0]);
-  const first = await submitAnswer(
-    token,
-    start.attempt.id,
-    "happy-answer-1",
-    firstPayload,
-  );
-  const firstReplay = await submitAnswer(
-    token,
-    start.attempt.id,
-    "happy-answer-1",
-    firstPayload,
-  );
-  assert.equal(first.statusCode, 200, first.body);
-  assert.equal(firstReplay.statusCode, 200, firstReplay.body);
-  assert.deepEqual(
-    SubmitAnswerResponseSchema.parse(firstReplay.json()),
-    SubmitAnswerResponseSchema.parse(first.json()),
-  );
-
-  const conflict = await submitAnswer(
-    token,
-    start.attempt.id,
-    "happy-answer-1",
-    answerPayload(start.questions[0]!, 1),
-  );
-  expectApiError(conflict, 409, "IDEMPOTENCY_KEY_REUSED");
-
-  for (let index = 1; index < start.questions.length; index += 1) {
-    await submitSuccessfulAnswer(
-      token,
-      start.attempt.id,
-      `happy-answer-${index + 1}`,
-      start.questions[index]!,
-      correctSelections[index]!,
-    );
-  }
-
-  const completed = await completeQuiz(
-    token,
-    start.attempt.id,
-    "happy-complete-1",
-  );
-  const completedReplay = await completeQuiz(
-    token,
-    start.attempt.id,
-    "happy-complete-1",
-  );
+  const completed = await completeQuiz(token, start, "happy-complete-1");
+  const completedReplay = await completeQuiz(token, start, "happy-complete-1", {
+    answers: [...batch(start).answers].reverse(),
+  });
   assert.equal(completed.statusCode, 200, completed.body);
   assert.equal(completedReplay.statusCode, 200, completedReplay.body);
   const result = parseCompletedAttempt(completed.json());
@@ -630,12 +544,47 @@ test("full daily flow resumes and replays without exposing answers early", async
   assert.equal(result.score, 5);
   assert.equal(result.review.length, 5);
   assert.ok(result.review.every((item) => item.correct));
+  const changedBatch = batch(start, [1, 2, 1, 1, 3]);
+  expectApiError(
+    await completeQuiz(token, start, "happy-complete-1", changedBatch),
+    409,
+    "IDEMPOTENCY_KEY_REUSED",
+  );
+  expectApiError(
+    await completeQuiz(token, start, "happy-changed-new-key", changedBatch),
+    409,
+    "ATTEMPT_ALREADY_COMPLETED",
+  );
+  const recovered = await completeQuiz(token, start, "happy-recovery-new-key");
+  assert.equal(recovered.statusCode, 200, recovered.body);
+  assert.deepEqual(parseCompletedAttempt(recovered.json()), result);
+  const oldAnswer = await harness.app.inject({
+    method: "POST",
+    url: `/v1/attempts/${start.attempt.id}/answers`,
+    headers: idempotentHeaders(token, "removed-answer-route"),
+    payload: answerPayload(start.questions[0]!, 0),
+  });
+  expectApiError(oldAnswer, 404, "NOT_FOUND");
 
+  const recordsBeforeResume = await harness.database.client`
+    SELECT *
+    FROM idempotency_records
+    WHERE user_id = ${getTokenUserId(token)}
+    ORDER BY id
+  `;
   const completedResume = await startQuiz(token);
   assert.equal(completedResume.attempt.id, start.attempt.id);
   assert.equal(completedResume.attempt.status, "completed");
   assert.equal(completedResume.attempt.answeredCount, 5);
   assert.equal(completedResume.attempt.score, 5);
+  assert.deepEqual(completedResume.completedResult, result);
+  const recordsAfterResume = await harness.database.client`
+    SELECT *
+    FROM idempotency_records
+    WHERE user_id = ${getTokenUserId(token)}
+    ORDER BY id
+  `;
+  assert.deepEqual([...recordsAfterResume], [...recordsBeforeResume]);
 
   const rows = await harness.database.client<
     {
@@ -673,7 +622,7 @@ test("full daily flow resumes and replays without exposing answers early", async
       AND status = 'completed'
       AND response_status = 200
   `;
-  assert.equal(idempotency[0]?.count, 6);
+  assert.equal(idempotency[0]?.count, 2);
 });
 
 test("retired revisions block new starts without invalidating an existing attempt snapshot", async () => {
@@ -756,10 +705,8 @@ test("retired revisions block new starts without invalidating an existing attemp
     "dev-it-retired-snapshot-existing",
   );
   const started = await startQuiz(existingUserToken);
-  await submitSuccessfulAnswer(
-    existingUserToken,
+  await seedHistoricalAnswer(
     started.attempt.id,
-    "retired-snapshot-answer-1",
     started.questions[0]!,
     correctSelections[0],
   );
@@ -774,6 +721,7 @@ test("retired revisions block new starts without invalidating an existing attemp
   assert.equal(resumed.attempt.id, started.attempt.id);
   assert.equal(resumed.attempt.status, "started");
   assert.equal(resumed.attempt.answeredCount, 1);
+  assert.equal("completedResult" in resumed, false);
   assert.deepEqual(resumed.questions, started.questions);
 
   const newUserToken = await bootstrapUser("dev-it-retired-snapshot-new");
@@ -785,29 +733,19 @@ test("retired revisions block new starts without invalidating an existing attemp
   });
   expectApiError(blockedStart, 503, "DAILY_SET_NOT_READY");
 
-  for (let index = 1; index < resumed.questions.length; index += 1) {
-    await submitSuccessfulAnswer(
-      existingUserToken,
-      resumed.attempt.id,
-      `retired-snapshot-answer-${index + 1}`,
-      resumed.questions[index]!,
-      correctSelections[index]!,
-    );
-  }
-
   const completed = await completeQuiz(
     existingUserToken,
-    resumed.attempt.id,
+    resumed,
     "retired-snapshot-complete",
   );
   const completedReplay = await completeQuiz(
     existingUserToken,
-    resumed.attempt.id,
+    resumed,
     "retired-snapshot-complete",
   );
   const completedRecovery = await completeQuiz(
     existingUserToken,
-    resumed.attempt.id,
+    resumed,
     "retired-snapshot-result-recovery",
   );
   assert.equal(completed.statusCode, 200, completed.body);
@@ -828,6 +766,7 @@ test("retired revisions block new starts without invalidating an existing attemp
   assert.equal(completedResume.attempt.status, "completed");
   assert.equal(completedResume.attempt.score, 5);
   assert.deepEqual(completedResume.questions, started.questions);
+  assert.deepEqual(completedResume.completedResult, completedResult);
 });
 
 test("completion scores and reviews answers in displayed choice order", async () => {
@@ -871,20 +810,11 @@ test("completion scores and reviews answers in displayed choice order", async ()
   assert.equal(start.attempt.quizDate, shuffledQuizDate);
   assert.deepEqual(start.questions[0]?.choices, ["O₂", "H₂O", "NaCl", "CO₂"]);
 
-  for (const [index, question] of start.questions.entries()) {
-    await submitSuccessfulAnswer(
-      token,
-      start.attempt.id,
-      `shuffled-answer-${index + 1}`,
-      question,
-      displayedCorrectSelections[index]!,
-    );
-  }
-
   const completed = await completeQuiz(
     token,
-    start.attempt.id,
+    start,
     "shuffled-complete-1",
+    batch(start, displayedCorrectSelections),
   );
   assert.equal(completed.statusCode, 200, completed.body);
   const result = parseCompletedAttempt(completed.json());
@@ -899,6 +829,9 @@ test("completion scores and reviews answers in displayed choice order", async ()
     displayedCorrectSelections,
   );
   assert.ok(result.review.every((item) => item.correct));
+  const resumed = await startQuiz(token);
+  assert.deepEqual(resumed.completedResult, result);
+  assert.deepEqual(resumed.questions, start.questions);
 });
 
 test("late historical challenge completion does not regress daily streak state", async () => {
@@ -910,10 +843,9 @@ test("late historical challenge completion does not regress daily streak state",
     "dev-it-monotonic-challenge-creator",
   );
   const creator = await startQuiz(creatorToken);
-  await answerAllQuestions(creatorToken, creator, "monotonic-creator-answer");
   const creatorCompleted = await completeQuiz(
     creatorToken,
-    creator.attempt.id,
+    creator,
     "monotonic-creator-complete",
   );
   assert.equal(creatorCompleted.statusCode, 200, creatorCompleted.body);
@@ -948,14 +880,28 @@ test("late historical challenge completion does not regress daily streak state",
     claimedResponse.json(),
   ).daily;
   assert.equal(historical.attempt.quizDate, PRIMARY_QUIZ_DATE);
-  await answerAllQuestions(token, historical, "monotonic-historical-answer");
-
+  assert.equal(historical.attempt.status, "started");
+  const historicalRows = await harness.database.client<
+    { daily_set_id: string; challenge_id: string | null }[]
+  >`
+    SELECT daily_set_id, challenge_id
+    FROM attempts
+    WHERE id = ${historical.attempt.id}
+  `;
+  assert.ok(historicalRows[0]!.challenge_id);
+  const historicalResume = await harness.database.client.begin((transaction) =>
+    startOrResumeAttempt(transaction, {
+      userId,
+      now: new Date("2026-08-30T03:00:00.000Z"),
+      setFilter: { dailySetId: historicalRows[0]!.daily_set_id },
+    }),
+  );
+  assert.deepEqual(historicalResume, historical);
   const current = await startQuiz(token);
   assert.equal(current.attempt.quizDate, NEXT_QUIZ_DATE);
-  await answerAllQuestions(token, current, "monotonic-current-answer");
   const currentCompleted = await completeQuiz(
     token,
-    current.attempt.id,
+    current,
     "monotonic-current-complete",
   );
   assert.equal(currentCompleted.statusCode, 200, currentCompleted.body);
@@ -976,7 +922,7 @@ test("late historical challenge completion does not regress daily streak state",
 
   const historicalCompleted = await completeQuiz(
     token,
-    historical.attempt.id,
+    historical,
     "monotonic-historical-complete",
   );
   assert.equal(historicalCompleted.statusCode, 200, historicalCompleted.body);
@@ -996,7 +942,7 @@ test("late historical challenge completion does not regress daily streak state",
   );
 });
 
-test("authentication, ownership, ordering, and failed idempotency roll back", async () => {
+test("authentication, ownership, and invalid fifth revision roll back the entire batch", async () => {
   harness.setNow(PRIMARY_DAY_NOON);
   const unauthenticated = await harness.app.inject({
     method: "POST",
@@ -1017,81 +963,55 @@ test("authentication, ownership, ordering, and failed idempotency roll back", as
   const intruderToken = await bootstrapUser("dev-it-intruder");
   const start = await startQuiz(ownerToken);
 
-  const forbiddenAnswer = await submitAnswer(
-    intruderToken,
-    start.attempt.id,
-    "owner-answer-forbidden",
-    answerPayload(start.questions[0]!, 0),
-  );
-  expectApiError(forbiddenAnswer, 403, "FORBIDDEN");
-
   const forbiddenComplete = await completeQuiz(
     intruderToken,
-    start.attempt.id,
+    start,
     "owner-complete-forbidden",
   );
   expectApiError(forbiddenComplete, 403, "FORBIDDEN");
 
-  const outOfOrder = await submitAnswer(
+  const invalidBatch = batch(start);
+  invalidBatch.answers[4]!.questionRevisionId = start.questions[0]!.revisionId;
+  const wrongRevision = await completeQuiz(
     ownerToken,
-    start.attempt.id,
-    "rollback-shared-1",
-    answerPayload(start.questions[1]!, correctSelections[1]),
-  );
-  expectApiError(outOfOrder, 422, "ANSWER_OUT_OF_ORDER");
-
-  await submitSuccessfulAnswer(
-    ownerToken,
-    start.attempt.id,
-    "rollback-shared-1",
-    start.questions[0]!,
-    correctSelections[0],
-  );
-
-  const wrongRevision = await submitAnswer(
-    ownerToken,
-    start.attempt.id,
-    "rollback-revision-2",
-    {
-      sequence: 2,
-      questionRevisionId: start.questions[2]!.revisionId,
-      selectedIndex: correctSelections[1],
-    },
+    start,
+    "rollback-complete-1",
+    invalidBatch,
   );
   expectApiError(wrongRevision, 409, "QUESTION_REVISION_CONFLICT");
-
-  await submitSuccessfulAnswer(
-    ownerToken,
-    start.attempt.id,
-    "rollback-revision-2",
-    start.questions[1]!,
-    correctSelections[1],
-  );
-
-  const incomplete = await completeQuiz(
-    ownerToken,
-    start.attempt.id,
-    "rollback-complete-1",
-  );
-  expectApiError(incomplete, 422, "ANSWERS_INCOMPLETE");
-
-  for (let index = 2; index < start.questions.length; index += 1) {
-    await submitSuccessfulAnswer(
-      ownerToken,
-      start.attempt.id,
-      `rollback-answer-${index + 1}`,
-      start.questions[index]!,
-      correctSelections[index]!,
-    );
-  }
+  const rollbackState = await harness.database.client`
+    SELECT a.status::text AS status, a.score, a.completed_at,
+      u.streak_days,
+      (SELECT count(*)::int FROM attempt_answers WHERE attempt_id = a.id) AS answer_count,
+      (SELECT count(*)::int FROM idempotency_records WHERE user_id = u.id) AS idempotency_count
+    FROM attempts a JOIN users u ON u.id = a.user_id
+    WHERE a.id = ${start.attempt.id}
+  `;
+  assert.deepEqual(rollbackState[0], {
+    status: "started",
+    score: null,
+    completed_at: null,
+    streak_days: 0,
+    answer_count: 0,
+    idempotency_count: 0,
+  });
 
   const completed = await completeQuiz(
     ownerToken,
-    start.attempt.id,
+    start,
     "rollback-complete-1",
   );
   assert.equal(completed.statusCode, 200, completed.body);
   assert.equal(parseCompletedAttempt(completed.json()).score, 5);
+  expectApiError(
+    await completeQuiz(intruderToken, start, "rollback-complete-1"),
+    403,
+    "FORBIDDEN",
+  );
+  const answerCount = await harness.database.client`
+    SELECT count(*)::int AS count FROM attempt_answers WHERE attempt_id = ${start.attempt.id}
+  `;
+  assert.equal(answerCount[0]?.count, 5);
 
   const processingRecords = await harness.database.client<{ count: number }[]>`
     SELECT count(*)::int AS count
@@ -1116,7 +1036,65 @@ test("authentication, ownership, ordering, and failed idempotency roll back", as
   expectApiError(invalidatedRequest, 401, "UNAUTHORIZED");
 });
 
-test("concurrent start, answer, and complete requests converge", async () => {
+test("batch validation requires exactly five unique valid answers and leaves no writes", async () => {
+  harness.setNow(PRIMARY_DAY_NOON);
+  const token = await bootstrapUser("dev-it-answer-error-precedence");
+  const start = await startQuiz(token);
+  const answers = batch(start).answers;
+  for (const payload of [
+    {},
+    { answers: answers.slice(0, 4) },
+    { answers: [...answers, answers[0]] },
+    { answers: [...answers.slice(0, 4), answers[0]] },
+    {
+      answers: answers.map((answer, index) =>
+        index === 4 ? { ...answer, sequence: 6 } : answer,
+      ),
+    },
+    {
+      answers: answers.map((answer, index) =>
+        index === 4 ? { ...answer, selectedIndex: 4 } : answer,
+      ),
+    },
+    {
+      answers: answers.map((answer, index) =>
+        index === 4 ? { ...answer, selectedIndex: -1 } : answer,
+      ),
+    },
+    {
+      answers: answers.map((answer, index) =>
+        index === 4 ? { ...answer, questionRevisionId: "invalid" } : answer,
+      ),
+    },
+    {
+      answers: answers.map((answer, index) =>
+        index === 4 ? { ...answer, extra: true } : answer,
+      ),
+    },
+  ]) {
+    const response = await harness.app.inject({
+      method: "POST",
+      url: `/v1/attempts/${start.attempt.id}/complete`,
+      headers: idempotentHeaders(token, "validation-reusable-key"),
+      payload,
+    });
+    expectApiError(response, 400, "INVALID_REQUEST");
+  }
+
+  const resumed = await startQuiz(token);
+  assert.equal(resumed.attempt.answeredCount, 0);
+  const records = await harness.database.client<{ count: number }[]>`
+    SELECT count(*)::int AS count
+    FROM idempotency_records
+    WHERE user_id = ${getTokenUserId(token)}
+      AND operation = ${`batch-complete:${start.attempt.id}`}
+  `;
+  assert.equal(records[0]?.count, 0);
+  const completed = await completeQuiz(token, start, "validation-reusable-key");
+  assert.equal(completed.statusCode, 200, completed.body);
+});
+
+test("concurrent starts and identical batch completions converge", async () => {
   harness.setNow(PRIMARY_DAY_NOON);
   const token = await bootstrapUser("dev-it-concurrency");
   const starts = await Promise.all(
@@ -1127,84 +1105,9 @@ test("concurrent start, answer, and complete requests converge", async () => {
   const start = starts[0]!;
   const userId = getTokenUserId(token);
 
-  const firstPayload = answerPayload(start.questions[0]!, correctSelections[0]);
-  const concurrentAnswers = await Promise.all(
-    Array.from({ length: 8 }, (_, index) =>
-      submitAnswer(
-        token,
-        start.attempt.id,
-        `concurrent-race-answer-1-${index + 1}`,
-        firstPayload,
-      ),
-    ),
-  );
-  const savedAnswers = concurrentAnswers.filter(
-    (response) => response.statusCode === 200,
-  );
-  const duplicateAnswers = concurrentAnswers.filter(
-    (response) => response.statusCode === 422,
-  );
-  assert.equal(savedAnswers.length, 1);
-  assert.equal(duplicateAnswers.length, 7);
-  assert.deepEqual(SubmitAnswerResponseSchema.parse(savedAnswers[0]!.json()), {
-    attemptId: start.attempt.id,
-    sequence: 1,
-    saved: true,
-    answeredCount: 1,
-    nextSequence: 2,
-  });
-  for (const response of duplicateAnswers) {
-    expectApiError(response, 422, "ANSWER_ALREADY_SUBMITTED");
-  }
-
-  const answerRaceState = await harness.database.client<
-    {
-      answer_count: number;
-      completed_idempotency_count: number;
-      processing_idempotency_count: number;
-    }[]
-  >`
-    SELECT
-      (
-        SELECT count(*)::int
-        FROM attempt_answers
-        WHERE attempt_id = ${start.attempt.id}
-      ) AS answer_count,
-      (
-        SELECT count(*)::int
-        FROM idempotency_records
-        WHERE user_id = ${userId}
-          AND operation = ${`answer:${start.attempt.id}`}
-          AND status = 'completed'
-          AND response_status = 200
-      ) AS completed_idempotency_count,
-      (
-        SELECT count(*)::int
-        FROM idempotency_records
-        WHERE user_id = ${userId}
-          AND operation = ${`answer:${start.attempt.id}`}
-          AND status = 'processing'
-      ) AS processing_idempotency_count
-  `;
-  assert.deepEqual(answerRaceState[0], {
-    answer_count: 1,
-    completed_idempotency_count: 1,
-    processing_idempotency_count: 0,
-  });
-
-  for (let index = 1; index < start.questions.length; index += 1) {
-    await submitSuccessfulAnswer(
-      token,
-      start.attempt.id,
-      `concurrent-answer-${index + 1}`,
-      start.questions[index]!,
-      correctSelections[index]!,
-    );
-  }
-
   const completes = await Promise.all(
     Array.from({ length: 8 }, (_, index) =>
-      completeQuiz(token, start.attempt.id, `concurrent-complete-${index + 1}`),
+      completeQuiz(token, start, `concurrent-complete-${index + 1}`),
     ),
   );
   assert.ok(
@@ -1244,7 +1147,7 @@ test("concurrent start, answer, and complete requests converge", async () => {
         SELECT count(*)::int
         FROM idempotency_records ir
         WHERE ir.user_id = u.id
-          AND ir.operation = ${`complete:${start.attempt.id}`}
+          AND ir.operation = ${`batch-complete:${start.attempt.id}`}
           AND ir.status = 'completed'
           AND ir.response_status = 200
       ) AS complete_idempotency_count,
@@ -1265,10 +1168,102 @@ test("concurrent start, answer, and complete requests converge", async () => {
     answer_count: 5,
     streak_days: 1,
     score: 5,
-    answer_idempotency_count: 5,
+    answer_idempotency_count: 0,
     complete_idempotency_count: 8,
     processing_idempotency_count: 0,
   });
+});
+
+test("historical partial answers must match and remain immutable during batch completion", async () => {
+  harness.setNow(PRIMARY_DAY_NOON);
+  for (const count of [1, 2, 3, 4, 5]) {
+    const token = await bootstrapUser(`dev-it-historical-partial-${count}`);
+    const start = await startQuiz(token);
+    await seedHistoricalAnswers(start, count);
+    const before = await harness.database.client`
+      SELECT * FROM attempt_answers WHERE attempt_id = ${start.attempt.id} ORDER BY sequence
+    `;
+    const resumed = await startQuiz(token);
+    assert.equal(resumed.attempt.answeredCount, count);
+    assert.equal("completedResult" in resumed, false);
+    assert.deepEqual(
+      resumed.attempt.answers,
+      batch(start).answers.slice(0, count),
+    );
+    const mismatch = await completeQuiz(
+      token,
+      start,
+      `partial-complete-${count}`,
+      batch(start, [1, 2, 1, 1, 3]),
+    );
+    expectApiError(mismatch, 409, "SAVED_ANSWER_CONFLICT");
+    const afterFailure = await harness.database.client`
+      SELECT * FROM attempt_answers WHERE attempt_id = ${start.attempt.id} ORDER BY sequence
+    `;
+    assert.deepEqual([...afterFailure], [...before]);
+    const records = await harness.database.client`
+      SELECT count(*)::int AS count FROM idempotency_records WHERE user_id = ${getTokenUserId(token)}
+    `;
+    assert.equal(records[0]?.count, 0);
+    const completed = await completeQuiz(
+      token,
+      start,
+      `partial-complete-${count}`,
+    );
+    assert.equal(completed.statusCode, 200, completed.body);
+    assert.equal(parseCompletedAttempt(completed.json()).score, 5);
+    const after = await harness.database.client`
+      SELECT * FROM attempt_answers WHERE attempt_id = ${start.attempt.id} ORDER BY sequence
+    `;
+    assert.equal(after.length, 5);
+    assert.deepEqual([...after].slice(0, count), [...before]);
+  }
+});
+
+test("concurrent changed batches cannot overwrite the winner or split its answers", async () => {
+  harness.setNow(PRIMARY_DAY_NOON);
+  for (const sameKey of [false, true]) {
+    const token = await bootstrapUser(`dev-it-changed-batch-race-${sameKey}`);
+    const start = await startQuiz(token);
+    const requests = [batch(start), batch(start, [1, 3, 2, 2, 0])];
+    const responses = await Promise.all(
+      requests.map((request, index) =>
+        completeQuiz(
+          token,
+          start,
+          sameKey ? "race-shared" : `race-distinct-${index}`,
+          request,
+        ),
+      ),
+    );
+    const winner = responses.findIndex(
+      (response) => response.statusCode === 200,
+    );
+    assert.notEqual(winner, -1);
+    const loser = 1 - winner;
+    expectApiError(
+      responses[loser]!,
+      409,
+      sameKey ? "IDEMPOTENCY_KEY_REUSED" : "ATTEMPT_ALREADY_COMPLETED",
+    );
+    const result = parseCompletedAttempt(responses[winner]!.json());
+    assert.deepEqual(
+      result.review.map((answer) => answer.selectedIndex),
+      requests[winner]!.answers.map((answer) => answer.selectedIndex),
+    );
+    const rows = await harness.database.client`
+      SELECT sequence, question_revision_id AS "questionRevisionId", selected_index AS "selectedIndex"
+      FROM attempt_answers WHERE attempt_id = ${start.attempt.id} ORDER BY sequence
+    `;
+    assert.deepEqual([...rows], requests[winner]!.answers);
+    const state = await harness.database.client`
+      SELECT u.streak_days,
+        (SELECT count(*)::int FROM idempotency_records WHERE user_id = u.id) AS records,
+        (SELECT count(*)::int FROM idempotency_records WHERE user_id = u.id AND status = 'processing') AS processing
+      FROM users u WHERE u.id = ${getTokenUserId(token)}
+    `;
+    assert.deepEqual(state[0], { streak_days: 1, records: 1, processing: 0 });
+  }
 });
 
 test("KST date selection and 01:00 grace deadline are deterministic", async () => {
@@ -1284,27 +1279,10 @@ test("KST date selection and 01:00 grace deadline are deterministic", async () =
     assert.equal(afterMidnight.attempt.quizDate, NEXT_QUIZ_DATE);
     assert.notEqual(afterMidnight.attempt.id, beforeMidnight.attempt.id);
 
-    harness.setNow("2026-08-29T15:30:00.000Z");
-    for (let index = 0; index < 4; index += 1) {
-      await submitSuccessfulAnswer(
-        beforeMidnightToken,
-        beforeMidnight.attempt.id,
-        `grace-answer-${index + 1}`,
-        beforeMidnight.questions[index]!,
-        correctSelections[index]!,
-      );
-    }
     harness.setNow("2026-08-29T15:59:59.999Z");
-    await submitSuccessfulAnswer(
-      beforeMidnightToken,
-      beforeMidnight.attempt.id,
-      "grace-answer-5",
-      beforeMidnight.questions[4]!,
-      correctSelections[4],
-    );
     const graceComplete = await completeQuiz(
       beforeMidnightToken,
-      beforeMidnight.attempt.id,
+      beforeMidnight,
       "grace-complete-1",
     );
     assert.equal(graceComplete.statusCode, 200, graceComplete.body);
@@ -1313,24 +1291,29 @@ test("KST date selection and 01:00 grace deadline are deterministic", async () =
     const expiredAnswerToken = await bootstrapUser("dev-it-expired-answer");
     const expiredAnswerStart = await startQuiz(expiredAnswerToken);
     harness.setNow("2026-08-29T16:00:00.000Z");
-    const expiredAnswer = await submitAnswer(
+    const expiredAnswer = await completeQuiz(
       expiredAnswerToken,
-      expiredAnswerStart.attempt.id,
+      expiredAnswerStart,
       "expired-answer-1",
-      answerPayload(expiredAnswerStart.questions[0]!, correctSelections[0]),
     );
     expectApiError(expiredAnswer, 409, "ATTEMPT_ABANDONED");
 
     const expiredAnswerState = await harness.database.client<
-      { status: string; abandoned: boolean; idempotency_count: number }[]
+      {
+        status: string;
+        abandoned: boolean;
+        answer_count: number;
+        idempotency_count: number;
+      }[]
     >`
       SELECT
         a.status::text AS status,
         (a.abandoned_at IS NOT NULL) AS abandoned,
+        (SELECT count(*)::int FROM attempt_answers WHERE attempt_id = a.id) AS answer_count,
         (
           SELECT count(*)::int
           FROM idempotency_records ir
-          WHERE ir.operation = ${`answer:${expiredAnswerStart.attempt.id}`}
+          WHERE ir.operation = ${`batch-complete:${expiredAnswerStart.attempt.id}`}
         ) AS idempotency_count
       FROM attempts a
       WHERE a.id = ${expiredAnswerStart.attempt.id}
@@ -1338,6 +1321,7 @@ test("KST date selection and 01:00 grace deadline are deterministic", async () =
     assert.deepEqual(expiredAnswerState[0], {
       status: "abandoned",
       abandoned: true,
+      answer_count: 0,
       idempotency_count: 0,
     });
 
@@ -1345,15 +1329,11 @@ test("KST date selection and 01:00 grace deadline are deterministic", async () =
     const expiredCompleteToken = await bootstrapUser("dev-it-expired-complete");
     const expiredCompleteStart = await startQuiz(expiredCompleteToken);
     harness.setNow("2026-08-29T15:30:00.000Z");
-    await answerAllQuestions(
-      expiredCompleteToken,
-      expiredCompleteStart,
-      "expired-complete-answer",
-    );
+    await seedHistoricalAnswers(expiredCompleteStart);
     harness.setNow("2026-08-29T16:00:00.000Z");
     const expiredComplete = await completeQuiz(
       expiredCompleteToken,
-      expiredCompleteStart.attempt.id,
+      expiredCompleteStart,
       "expired-complete-1",
     );
     expectApiError(expiredComplete, 409, "ATTEMPT_ABANDONED");
@@ -1366,7 +1346,7 @@ test("KST date selection and 01:00 grace deadline are deterministic", async () =
         (
           SELECT count(*)::int
           FROM idempotency_records ir
-          WHERE ir.operation = ${`complete:${expiredCompleteStart.attempt.id}`}
+          WHERE ir.operation = ${`batch-complete:${expiredCompleteStart.attempt.id}`}
         ) AS idempotency_count
       FROM attempts a
       WHERE a.id = ${expiredCompleteStart.attempt.id}
@@ -1375,19 +1355,69 @@ test("KST date selection and 01:00 grace deadline are deterministic", async () =
       status: "abandoned",
       idempotency_count: 0,
     });
+    const replay = await completeQuiz(
+      beforeMidnightToken,
+      beforeMidnight,
+      "grace-complete-1",
+    );
+    assert.equal(replay.statusCode, 200, replay.body);
+    assert.deepEqual(replay.json(), graceComplete.json());
   } finally {
     harness.setNow(PRIMARY_DAY_NOON);
   }
+});
+
+test("ordinary attempt resume abandons at the daily deadline without challenge provenance", async () => {
+  harness.setNow(PRIMARY_DAY_NOON);
+  const token = await bootstrapUser("dev-it-ordinary-resume-deadline");
+  const start = await startQuiz(token);
+  const rows = await harness.database.client<
+    { daily_set_id: string; challenge_id: string | null }[]
+  >`
+    SELECT daily_set_id, challenge_id
+    FROM attempts
+    WHERE id = ${start.attempt.id}
+  `;
+  assert.equal(rows[0]!.challenge_id, null);
+  const resumeAt = (now: Date) =>
+    harness.database.client.begin((transaction) =>
+      startOrResumeAttempt(transaction, {
+        userId: getTokenUserId(token),
+        now,
+        setFilter: { dailySetId: rows[0]!.daily_set_id },
+      }),
+    );
+
+  const before = await resumeAt(new Date("2026-08-29T15:59:59.999Z"));
+  assert.equal(before.status, "available");
+  if (before.status !== "available") {
+    assert.fail("daily set must be available in this fixture");
+  }
+  assert.equal(before.attempt.status, "started");
+
+  const expired = await resumeAt(new Date("2026-08-29T16:00:00.000Z"));
+  if (expired.status !== "available") {
+    assert.fail("daily set must be available in this fixture");
+  }
+  assert.equal(expired.attempt.id, start.attempt.id);
+  assert.equal(expired.attempt.status, "abandoned");
+  const abandoned = await harness.database.client<
+    { abandoned_at: Date | string }[]
+  >`
+    SELECT abandoned_at FROM attempts WHERE id = ${start.attempt.id}
+  `;
+  assert.equal(
+    new Date(abandoned[0]!.abandoned_at).toISOString(),
+    "2026-08-29T16:00:00.000Z",
+  );
 });
 
 test("database constraints and immutability triggers reject invalid writes", async () => {
   harness.setNow(PRIMARY_DAY_NOON);
   const token = await bootstrapUser("dev-it-db-probes");
   const start = await startQuiz(token);
-  await submitSuccessfulAnswer(
-    token,
+  await seedHistoricalAnswer(
     start.attempt.id,
-    "db-probe-answer-1",
     start.questions[0]!,
     correctSelections[0],
   );
@@ -1531,20 +1561,7 @@ test("database constraints and immutability triggers reject invalid writes", asy
       `;
   }, /published daily sets must have exactly five items/);
 
-  for (let index = 1; index < start.questions.length; index += 1) {
-    await submitSuccessfulAnswer(
-      token,
-      start.attempt.id,
-      `db-probe-answer-${index + 1}`,
-      start.questions[index]!,
-      correctSelections[index]!,
-    );
-  }
-  const completed = await completeQuiz(
-    token,
-    start.attempt.id,
-    "db-probe-complete-1",
-  );
+  const completed = await completeQuiz(token, start, "db-probe-complete-1");
   assert.equal(completed.statusCode, 200, completed.body);
 
   await expectDatabaseFailure(async (transaction) => {
@@ -1671,28 +1688,11 @@ test("voided daily sets suppress every progress state and preserve historical ro
   const fiveAnswerStart = await startQuiz(fiveAnswerToken);
   const completedStart = await startQuiz(completedToken);
 
-  for (let index = 0; index < 4; index += 1) {
-    await submitSuccessfulAnswer(
-      partialToken,
-      partialStart.attempt.id,
-      `void-partial-answer-${index + 1}`,
-      partialStart.questions[index]!,
-      correctSelections[index]!,
-    );
-  }
-  await answerAllQuestions(
-    fiveAnswerToken,
-    fiveAnswerStart,
-    "void-five-answers",
-  );
-  await answerAllQuestions(
-    completedToken,
-    completedStart,
-    "void-completed-answer",
-  );
+  await seedHistoricalAnswers(partialStart, 4);
+  await seedHistoricalAnswers(fiveAnswerStart);
   const preVoidCompletion = await completeQuiz(
     completedToken,
-    completedStart.attempt.id,
+    completedStart,
     "void-completed-old-key",
   );
   assert.equal(preVoidCompletion.statusCode, 200, preVoidCompletion.body);
@@ -1741,7 +1741,7 @@ test("voided daily sets suppress every progress state and preserve historical ro
     SELECT response_body::text AS response_body
     FROM idempotency_records
     WHERE user_id = ${getTokenUserId(completedToken)}
-      AND operation = ${`complete:${completedStart.attempt.id}`}
+      AND operation = ${`batch-complete:${completedStart.attempt.id}`}
       AND status = 'completed'
   `;
   assert.equal(oldCompletionRecord.length, 1);
@@ -1787,6 +1787,7 @@ test("voided daily sets suppress every progress state and preserve historical ro
       "status",
       "voidedAt",
     ]);
+    assert.equal("completedResult" in body, false);
     assert.doesNotMatch(
       JSON.stringify(body),
       /attempt|answer|question|review|score/i,
@@ -1802,31 +1803,14 @@ test("voided daily sets suppress every progress state and preserve historical ro
   `;
   assert.equal(untouchedAttempts[0]?.count, 0);
 
-  const replayedAnswer = await submitAnswer(
-    partialToken,
-    partialStart.attempt.id,
-    "void-partial-answer-1",
-    answerPayload(partialStart.questions[0]!, correctSelections[0]),
-  );
-  expectApiError(replayedAnswer, 409, "DAILY_SET_VOIDED");
-  assert.equal(replayedAnswer.body.includes("정답 기준 오류"), false);
-  const newAnswer = await submitAnswer(
-    partialToken,
-    partialStart.attempt.id,
-    "void-partial-answer-new",
-    answerPayload(partialStart.questions[4]!, correctSelections[4]),
-  );
-  expectApiError(newAnswer, 409, "DAILY_SET_VOIDED");
-  assert.equal(newAnswer.body.includes("정답 기준 오류"), false);
-
-  for (const [token, attemptId, key] of [
-    [zeroToken, zeroStart.attempt.id, "void-zero-complete"],
-    [partialToken, partialStart.attempt.id, "void-partial-complete"],
-    [fiveAnswerToken, fiveAnswerStart.attempt.id, "void-five-answers-complete"],
-    [completedToken, completedStart.attempt.id, "void-completed-old-key"],
-    [completedToken, completedStart.attempt.id, "void-completed-new-key"],
+  for (const [token, start, key] of [
+    [zeroToken, zeroStart, "void-zero-complete"],
+    [partialToken, partialStart, "void-partial-complete"],
+    [fiveAnswerToken, fiveAnswerStart, "void-five-answers-complete"],
+    [completedToken, completedStart, "void-completed-old-key"],
+    [completedToken, completedStart, "void-completed-new-key"],
   ] as const) {
-    const response = await completeQuiz(token, attemptId, key);
+    const response = await completeQuiz(token, start, key);
     assert.equal(response.statusCode, 200, response.body);
     const body = response.json();
     const projection = CompleteAttemptResponseSchema.parse(body);
@@ -1844,6 +1828,26 @@ test("voided daily sets suppress every progress state and preserve historical ro
     assert.equal(response.body.includes("daily-integration-operator"), false);
     assert.equal(response.body.includes("정답 기준 오류"), false);
   }
+  const changedVoidReplay = await completeQuiz(
+    completedToken,
+    completedStart,
+    "void-completed-old-key",
+    batch(completedStart, [1, 2, 1, 1, 3]),
+  );
+  assert.equal(changedVoidReplay.statusCode, 200, changedVoidReplay.body);
+  assert.equal(
+    CompleteAttemptResponseSchema.parse(changedVoidReplay.json()).status,
+    "voided",
+  );
+  expectApiError(
+    await completeQuiz(
+      untouchedToken,
+      completedStart,
+      "void-completed-old-key",
+    ),
+    403,
+    "FORBIDDEN",
+  );
 
   const historicalAfter = await harness.database.client<
     {
@@ -1877,7 +1881,7 @@ test("voided daily sets suppress every progress state and preserve historical ro
     SELECT response_body::text AS response_body
     FROM idempotency_records
     WHERE user_id = ${getTokenUserId(completedToken)}
-      AND operation = ${`complete:${completedStart.attempt.id}`}
+      AND operation = ${`batch-complete:${completedStart.attempt.id}`}
       AND status = 'completed'
     ORDER BY id
   `;

@@ -67,8 +67,8 @@ jobs:
         run: pnpm typecheck
       - name: Dependency audit
         run: pnpm audit --audit-level high
-      - name: PostgreSQL integration tests
-        run: pnpm test:integration
+      - name: API integration and backup health tests
+        run: pnpm test
       - name: Production build
         run: pnpm build
       - name: Netlify function packaging

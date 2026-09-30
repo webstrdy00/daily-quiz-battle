@@ -452,7 +452,10 @@ export async function runOperations(
         lockKey: 2,
         intervalMilliseconds:
           config.operationsCleanupIntervalHours * MILLISECONDS_PER_HOUR,
-        run: (taskDatabase) => runCleanup(taskDatabase, new Date()),
+        run: (taskDatabase) =>
+          runCleanup(taskDatabase, new Date(), {
+            operationalRetentionEnabled: config.operationalRetentionEnabled,
+          }),
       },
     ];
 

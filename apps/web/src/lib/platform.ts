@@ -5,6 +5,7 @@ import {
   User,
 } from "@apps-in-toss/web-framework";
 import type { ReportReason } from "@daily-quiz-battle/contracts";
+import { createChallengeLinkTarget } from "./challenge-link";
 
 const isDevelopment =
   import.meta.env.DEV || import.meta.env.VITE_APP_ENV === "development";
@@ -188,9 +189,14 @@ export async function shareChallenge(
   token: string,
 ): Promise<ChallengeShareOutcome> {
   try {
-    const link = await Share.createLink({
-      path: `intoss://daily-quiz-battle-anlee/challenge/${token}`,
-    });
+    const target = createChallengeLinkTarget(
+      token,
+      import.meta.env.VITE_PRIVATE_TEST_DEPLOYMENT_ID,
+    );
+    const link =
+      target.mode === "private-test"
+        ? target.path
+        : await Share.createLink({ path: target.path });
     await Share.sendMessage({
       message: `오늘의 상식대결에 도전해 보세요!\n${link}`,
     });

@@ -3,6 +3,38 @@ import type { AppConfig } from "../config.js";
 import { AppError } from "../shared/errors.js";
 
 const ADMIN_ACCESS_TOKEN_TTL_SECONDS = 15 * 60;
+export const ADMIN_ACCESS_TOKEN_SCOPES = [
+  "content:write",
+  "content:void",
+  "reports:read",
+  "reports:triage",
+] as const;
+const CONTROL_CHARACTER_PATTERN = /\p{Cc}/u;
+
+export function isValidAdminSubject(subject: unknown): subject is string {
+  return (
+    typeof subject === "string" &&
+    subject === subject.trim() &&
+    subject.length > 0 &&
+    Array.from(subject).length <= 100 &&
+    !CONTROL_CHARACTER_PATTERN.test(subject)
+  );
+}
+
+export function isValidAdminScopes(scopes: unknown): scopes is string[] {
+  if (!Array.isArray(scopes) || scopes.length === 0) {
+    return false;
+  }
+  for (const scope of scopes) {
+    if (
+      typeof scope !== "string" ||
+      !ADMIN_ACCESS_TOKEN_SCOPES.some((allowed) => allowed === scope)
+    ) {
+      return false;
+    }
+  }
+  return new Set(scopes).size === scopes.length;
+}
 
 export interface AdminAccessTokenPrincipal {
   actorSubject: string;
@@ -21,6 +53,12 @@ export function createAdminAccessTokenService(
 
   return {
     async issue(principal) {
+      if (
+        !isValidAdminSubject(principal.actorSubject) ||
+        !isValidAdminScopes(principal.scopes)
+      ) {
+        throw new Error("Admin access token principal is invalid");
+      }
       const issuedAt = Math.floor(Date.now() / 1000);
 
       return new SignJWT({ scope: principal.scopes })
@@ -43,8 +81,7 @@ export function createAdminAccessTokenService(
         const now = Math.floor(Date.now() / 1000);
 
         if (
-          typeof payload.sub !== "string" ||
-          payload.sub.length === 0 ||
+          !isValidAdminSubject(payload.sub) ||
           typeof payload.iat !== "number" ||
           !Number.isInteger(payload.iat) ||
           typeof payload.exp !== "number" ||
@@ -52,11 +89,7 @@ export function createAdminAccessTokenService(
           payload.iat > now ||
           payload.exp <= payload.iat ||
           payload.exp - payload.iat > ADMIN_ACCESS_TOKEN_TTL_SECONDS ||
-          !Array.isArray(payload.scope) ||
-          !payload.scope.every(
-            (scope): scope is string =>
-              typeof scope === "string" && scope.length > 0,
-          )
+          !isValidAdminScopes(payload.scope)
         ) {
           throw new Error("Admin access token payload is invalid");
         }

@@ -1,6 +1,6 @@
 import {
+  CompleteAttemptRequestSchema,
   IdempotencyKeySchema,
-  SubmitAnswerRequestSchema,
   UuidSchema,
 } from "@daily-quiz-battle/contracts";
 import type { FastifyInstance, FastifyRequest } from "fastify";
@@ -10,7 +10,7 @@ import type { AccessTokenService } from "../auth/token.js";
 import type { Database } from "../db/client.js";
 import { AppError, parseRequest } from "../shared/errors.js";
 import { principalKey, rateLimited } from "../shared/rate-limit.js";
-import { completeAttempt, startDailyQuiz, submitAnswer } from "./service.js";
+import { completeAttempt, startDailyQuiz } from "./service.js";
 
 const AttemptParamsSchema = z.object({ attemptId: UuidSchema });
 
@@ -64,7 +64,7 @@ export function registerDailyRoutes(
   });
 
   app.post(
-    "/v1/attempts/:attemptId/answers",
+    "/v1/attempts/:attemptId/complete",
     rateLimited(rateLimitEnabled, 30, "1 minute", principalKey),
     async (request) => {
       const principal = await authenticateRequest(
@@ -74,37 +74,18 @@ export function registerDailyRoutes(
       );
       requireFeatureEnabled(dailyContinuationEnabled);
       const params = parseRequest(AttemptParamsSchema, request.params);
-      const body = parseRequest(SubmitAnswerRequestSchema, request.body);
+      const body = parseRequest(CompleteAttemptRequestSchema, request.body);
       const idempotencyKey = getIdempotencyKey(request);
 
-      return submitAnswer(
+      return completeAttempt(
         database,
         principal.userId,
         params.attemptId,
         idempotencyKey,
         body,
         clock(),
+        notificationDeliveryEnabled,
       );
     },
   );
-
-  app.post("/v1/attempts/:attemptId/complete", async (request) => {
-    const principal = await authenticateRequest(
-      request,
-      database,
-      tokenService,
-    );
-    requireFeatureEnabled(dailyContinuationEnabled);
-    const params = parseRequest(AttemptParamsSchema, request.params);
-    const idempotencyKey = getIdempotencyKey(request);
-
-    return completeAttempt(
-      database,
-      principal.userId,
-      params.attemptId,
-      idempotencyKey,
-      clock(),
-      notificationDeliveryEnabled,
-    );
-  });
 }
