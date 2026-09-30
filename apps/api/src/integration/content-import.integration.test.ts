@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 import {
   importLaunchContent,
@@ -10,29 +9,44 @@ import { createIntegrationHarness } from "./test-harness.js";
 
 test("launch import validates, rolls back, remains draft, and rejects changed reruns", async (context) => {
   const harness = await createIntegrationHarness();
-  const { database } = harness;
-  const inventory = JSON.parse(
-    await readFile(
-      new URL(
-        "../../../../docs/development/launch-content-cms-drafts.json",
-        import.meta.url,
-      ),
-      "utf8",
-    ),
-  ) as {
-    drafts: { localId: string; request: AdminCreateQuestionRevisionRequest }[];
-  };
-  const actor = "integration-launch-import";
-  const counts = async () => {
-    const rows = await database.client`
+  try {
+    const { database } = harness;
+    // Synthetic test-only content; never sourced from the launch inventory.
+    const inventory = {
+      drafts: Array.from({ length: 165 }, (_, index) => {
+        const suffix = String(index + 1).padStart(3, "0");
+        const request: AdminCreateQuestionRevisionRequest = {
+          category: "integration-test-only",
+          difficulty: "easy",
+          prompt: `Synthetic test-only import prompt ${suffix}`,
+          choices: [
+            `Test-only choice A ${suffix}`,
+            `Test-only choice B ${suffix}`,
+            `Test-only choice C ${suffix}`,
+            `Test-only choice D ${suffix}`,
+          ],
+          correctIndex: 0,
+          explanation: `Synthetic test-only explanation ${suffix}`,
+          sourceUrl: `https://example.invalid/test-only/content-import/${suffix}`,
+          sourceCheckedAt: "2026-08-28T00:00:00.000Z",
+          reviewerId: "integration-test-only",
+          timeSensitive: false,
+          validUntil: null,
+          nextReviewAt: null,
+        };
+        return { localId: `TEST-${suffix}`, request };
+      }),
+    };
+    const actor = "integration-launch-import";
+    const counts = async () => {
+      const rows = await database.client`
       SELECT (SELECT count(*)::int FROM questions) AS questions,
         (SELECT count(*)::int FROM question_revisions) AS revisions,
         (SELECT count(*)::int FROM admin_audit_logs) AS audits,
         (SELECT count(*)::int FROM daily_sets) AS daily_sets
     `;
-    return { ...rows[0] };
-  };
-  try {
+      return { ...rows[0] };
+    };
     const baseline = await counts();
     await context.test(
       "invalid middle request and duplicate IDs cause zero writes",
