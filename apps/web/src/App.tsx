@@ -752,6 +752,7 @@ function App() {
     "home" | "result"
   >("home");
   const accountDeleted = useRef(false);
+  const deletingAccount = useRef(false);
   const [sessionEnded, setSessionEnded] = useState(false);
   const initialChallengeToken = useRef(challengeToken);
   const initializationGeneration = useRef(0);
@@ -788,11 +789,16 @@ function App() {
 
   const discardDraft = useCallback(() => {
     const current = draftRef.current;
+    const generation = initializationGeneration.current;
     draftRef.current = null;
     setDraft(null);
     if (current !== null) {
       void clearDraft(current).catch((error: unknown) => {
-        setStorageError(toDisplayError(error).message);
+        if (
+          !accountDeleted.current &&
+          generation === initializationGeneration.current
+        )
+          setStorageError(toDisplayError(error).message);
       });
     }
   }, []);
@@ -898,6 +904,8 @@ function App() {
     const handleStorage = (event: StorageEvent) => {
       const current = draftRef.current;
       if (
+        deletingAccount.current ||
+        accountDeleted.current ||
         current === null ||
         (event.key !== null && event.key !== draftKey(current))
       )
@@ -1859,19 +1867,26 @@ function App() {
   }, []);
 
   const loadResultNotificationPreference = useCallback(async () => {
+    const generation = initializationGeneration.current;
+    const isCurrent = () =>
+      !accountDeleted.current &&
+      !deletingAccount.current &&
+      generation === initializationGeneration.current;
     setNotificationBusy(true);
     setNotificationError(null);
 
     try {
       const preference = await getResultNotificationPreference();
+      if (!isCurrent()) return;
       setNotificationEnabled(preference.enabled);
       setNotificationDeliveryAvailable(preference.deliveryAvailable);
     } catch (error) {
+      if (!isCurrent()) return;
       setNotificationEnabled(null);
       setNotificationDeliveryAvailable(false);
       setNotificationError(toDisplayError(error));
     } finally {
-      setNotificationBusy(false);
+      if (isCurrent()) setNotificationBusy(false);
     }
   }, []);
 
@@ -1881,26 +1896,33 @@ function App() {
     }
 
     let active = true;
+    const generation = initializationGeneration.current;
+    const isCurrent = () =>
+      active &&
+      !accountDeleted.current &&
+      !deletingAccount.current &&
+      generation === initializationGeneration.current;
     const timer = window.setTimeout(() => {
+      if (!isCurrent()) return;
       setNotificationBusy(true);
       setNotificationError(null);
 
       void getResultNotificationPreference()
         .then((preference) => {
-          if (active) {
+          if (isCurrent()) {
             setNotificationEnabled(preference.enabled);
             setNotificationDeliveryAvailable(preference.deliveryAvailable);
           }
         })
         .catch((error: unknown) => {
-          if (active) {
+          if (isCurrent()) {
             setNotificationEnabled(null);
             setNotificationDeliveryAvailable(false);
             setNotificationError(toDisplayError(error));
           }
         })
         .finally(() => {
-          if (active) {
+          if (isCurrent()) {
             setNotificationBusy(false);
           }
         });
@@ -1924,6 +1946,11 @@ function App() {
       return;
     }
 
+    const generation = initializationGeneration.current;
+    const isCurrent = () =>
+      !accountDeleted.current &&
+      !deletingAccount.current &&
+      generation === initializationGeneration.current;
     setNotificationBusy(true);
     setNotificationError(null);
 
@@ -1936,11 +1963,13 @@ function App() {
         const agreement = await requestResultNotificationAgreement(
           controller.signal,
         );
+        if (!isCurrent()) return;
         enabled = agreement === "agreed";
         agreementDenied = agreement === "denied";
       }
 
       const preference = await updateResultNotificationPreference(enabled);
+      if (!isCurrent()) return;
       if (preference.enabled !== enabled) {
         throw new Error("서버가 결과 알림 설정 변경을 확인하지 못했습니다.");
       }
@@ -1953,13 +1982,16 @@ function App() {
         });
       }
     } catch (error) {
+      if (!isCurrent()) return;
       setNotificationDeliveryAvailable(false);
       if (!(error instanceof DOMException && error.name === "AbortError")) {
         setNotificationError(toDisplayError(error));
       }
     } finally {
-      notificationAgreementAbort.current = null;
-      setNotificationBusy(false);
+      if (isCurrent()) {
+        notificationAgreementAbort.current = null;
+        setNotificationBusy(false);
+      }
     }
   }, [
     busy,
@@ -1969,22 +2001,33 @@ function App() {
   ]);
 
   const handleDeleteAccount = useCallback(async () => {
-    if (busy || notificationBusy || reportPending) {
+    if (
+      busy ||
+      notificationBusy ||
+      reportPending ||
+      deletingAccount.current ||
+      accountDeleted.current
+    ) {
       return;
     }
+    const preservedDraft = draftRef.current;
+    deletingAccount.current = true;
     setBusy(true);
     setActionError(null);
     invalidateChallengeRefresh();
     initializationAbort.current?.abort();
+    initializationAbort.current = null;
+    notificationAgreementAbort.current?.abort();
+    notificationAgreementAbort.current = null;
     initializationGeneration.current += 1;
-    draftRef.current = null;
-    setDraft(null);
 
     try {
       await deleteAccount({ confirmation: "DELETE" });
 
       accountDeleted.current = true;
       setSessionEnded(true);
+      draftRef.current = null;
+      setDraft(null);
       capturedInitialChallengeToken = null;
       setDaily(null);
       setResult(null);
@@ -2012,7 +2055,9 @@ function App() {
     } catch (error) {
       if (
         error instanceof ApiClientError &&
-        error.code === "ACCOUNT_DELETION_OUTCOME_UNKNOWN"
+        (error.code === "ACCOUNT_DELETION_OUTCOME_UNKNOWN" ||
+          error.code === "ACCOUNT_DELETION_IDENTITY_CHANGED" ||
+          error.code === "ACCOUNT_DELETED_LOCAL_CLEANUP_FAILED")
       ) {
         accountDeleted.current = true;
         setSessionEnded(true);
@@ -2020,9 +2065,24 @@ function App() {
         setResult(null);
         setFatalError(toDisplayError(error));
         setScreen("error");
+      } else if (preservedDraft !== null) {
+        try {
+          // Another tab may have saved or frozen while DELETE was rejected.
+          // Restore that durable snapshot without creating a new attempt/key.
+          const restored = readDraft(preservedDraft);
+          draftRef.current = restored;
+          setDraft(restored);
+          if (restored === null)
+            setStorageError(
+              "기기의 답안 상태가 변경됐어요. 서버에서 최신 상태를 다시 확인해 주세요.",
+            );
+        } catch (storageFailure) {
+          setStorageError(toDisplayError(storageFailure).message);
+        }
       }
       setActionError(toDisplayError(error));
     } finally {
+      deletingAccount.current = false;
       setBusy(false);
     }
   }, [busy, invalidateChallengeRefresh, notificationBusy, reportPending]);

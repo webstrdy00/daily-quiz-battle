@@ -214,7 +214,7 @@ export async function browserFixture(
     });
   }
 
-  const source = await appBundle();
+  const source = `${await appBundle()}\n//# sourceURL=quiz-browser-fixture-${instance + 1}.mjs`;
   // Bundle act together with App to guarantee one React instance. Each import
   // gets fresh API/session/draft module state without writing a generated file.
   app = (await import(

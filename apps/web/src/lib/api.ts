@@ -476,6 +476,15 @@ export async function deleteAccount(
   }
   assertActiveSession();
 
+  const deletingUserId = authenticatedUserId;
+  if (deletingUserId === null) {
+    throw new ApiClientError({
+      code: "UNAUTHORIZED",
+      message: "삭제할 계정의 인증 정보를 확인하지 못했어요.",
+      status: 401,
+    });
+  }
+  const previousCapabilities = challengeCapabilities;
   sessionState = "deleting";
   sessionEpoch += 1;
   invalidateCapabilities();
@@ -483,17 +492,16 @@ export async function deleteAccount(
   bootstrapPromise = null;
   abortInFlightRequests();
 
-  try {
-    if (authenticatedUserId !== null) {
-      await clearUserDrafts(authenticatedUserId);
+  const assertDeletionCurrent = () => {
+    if (sessionState !== "deleting" || sessionEpoch !== deletionEpoch) {
+      throw new ApiClientError({
+        code: "SESSION_INVALIDATED",
+        message: "계정 상태가 변경되어 요청을 중단했습니다.",
+      });
     }
-  } catch (error) {
-    sessionState = "active";
-    throw error;
-  }
-
-  try {
-    const response = await fetchJson(
+  };
+  const sendDeletion = () =>
+    fetchJson(
       "/v1/me",
       DeleteAccountResponseSchema,
       {
@@ -503,24 +511,72 @@ export async function deleteAccount(
       },
       { epoch: deletionEpoch, allowDeleting: true },
     );
-    if (sessionState !== "deleting" || sessionEpoch !== deletionEpoch) {
-      throw new ApiClientError({
-        code: "SESSION_INVALIDATED",
-        message: "계정 상태가 변경되어 요청을 중단했습니다.",
-      });
+  let deletionRejected = false;
+
+  try {
+    let response: DeleteAccountResponse;
+    try {
+      response = await sendDeletion();
+    } catch (error) {
+      if (!(error instanceof ApiClientError) || error.status !== 401)
+        throw error;
+
+      // Only an explicit rejection permits one refresh. Never bootstrap after
+      // an ambiguous DELETE, and never adopt or delete a replacement identity.
+      deletionRejected = true;
+      const anonymousKey = await getAnonymousKey();
+      assertDeletionCurrent();
+      const refreshed = await fetchJson(
+        "/v1/auth/bootstrap",
+        BootstrapResponseSchema,
+        {
+          method: "POST",
+          body: JSON.stringify({ anonymousKey }),
+        },
+        { epoch: deletionEpoch, allowDeleting: true },
+      );
+      assertDeletionCurrent();
+      if (refreshed.user.id !== deletingUserId) {
+        sessionState = "deletion-uncertain";
+        accessToken = null;
+        throw new ApiClientError({
+          code: "ACCOUNT_DELETION_IDENTITY_CHANGED",
+          message:
+            "기존 계정의 인증 정보를 확인하지 못했어요. 다른 계정은 삭제하지 않았고 기기의 답안은 유지했어요. 계정 상태 확인을 위해 고객지원에 문의해 주세요.",
+        });
+      }
+      accessToken = refreshed.accessToken;
+      deletionRejected = false;
+      response = await sendDeletion();
     }
+    assertDeletionCurrent();
     sessionState = "deleted";
     accessToken = null;
     setAnalyticsPublishingEnabled(false);
+    await clearUserDrafts(deletingUserId, true);
     return response;
   } catch (error) {
+    if (sessionState === "deleted") {
+      throw new ApiClientError({
+        code: "ACCOUNT_DELETED_LOCAL_CLEANUP_FAILED",
+        message:
+          "서버의 계정 삭제는 완료됐지만 기기의 임시 답안을 모두 지우지 못했어요. 브라우저 저장 공간을 허용하고 고객지원에 문의해 주세요. 삭제된 계정으로는 계속할 수 없어요.",
+      });
+    }
+    if (
+      error instanceof ApiClientError &&
+      error.code === "ACCOUNT_DELETION_IDENTITY_CHANGED"
+    )
+      throw error;
     const knownRejection =
       error instanceof ApiClientError &&
       error.status !== undefined &&
-      (error.status < 200 || error.status >= 300);
+      error.status >= 400 &&
+      error.status < 500;
 
-    if (knownRejection) {
+    if (deletionRejected || knownRejection) {
       sessionState = "active";
+      setChallengeCapabilities(previousCapabilities);
       throw error;
     }
 
@@ -530,7 +586,7 @@ export async function deleteAccount(
     throw new ApiClientError({
       code: "ACCOUNT_DELETION_OUTCOME_UNKNOWN",
       message:
-        "계정 삭제 결과를 확인하지 못했어요. 새 사용자가 생성되지 않도록 앱을 완전히 종료한 뒤 다시 시작해 주세요.",
+        "계정 삭제 결과를 확인하지 못했어요. 기기의 답안은 유지했지만 중복 처리와 새 계정 생성을 막기 위해 이용을 중단했어요. 다시 시작하거나 삭제를 반복하지 말고 고객지원에 문의해 주세요.",
       retryable: false,
       requestId: error instanceof ApiClientError ? error.requestId : undefined,
     });

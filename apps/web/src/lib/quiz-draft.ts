@@ -29,6 +29,7 @@ function withDraftLock<T>(userId: string, operation: () => T): Promise<T> {
 }
 function assertNotRemoved(draft: QuizDraft): void {
   if (
+    localStorage.getItem(`${removedPrefix}${draft.userId}/deleted`) !== null ||
     localStorage.getItem(
       `${removedPrefix}${draft.userId}/${draft.quizDate}`,
     ) !== null ||
@@ -185,10 +186,20 @@ export function clearDraft(
     }
   });
 }
-export function clearUserDrafts(userId: string): Promise<void> {
+export function clearUserDrafts(
+  userId: string,
+  accountDeleted = false,
+): Promise<void> {
   return withDraftLock(userId, () => {
     try {
-      localStorage.setItem(`${removedPrefix}${userId}`, crypto.randomUUID());
+      if (accountDeleted) {
+        const deletedKey = `${removedPrefix}${userId}/deleted`;
+        localStorage.setItem(deletedKey, "1");
+        if (localStorage.getItem(deletedKey) !== "1") throw new Error();
+      }
+      const generation = crypto.randomUUID();
+      localStorage.setItem(`${removedPrefix}${userId}`, generation);
+      if (getDraftGeneration(userId) !== generation) throw new Error();
       const prefix = `${draftPrefix}${userId}/`;
       const keys = Array.from({ length: localStorage.length }, (_, index) =>
         localStorage.key(index),
@@ -197,6 +208,7 @@ export function clearUserDrafts(userId: string): Promise<void> {
         if (key?.startsWith(prefix)) {
           localStorage.setItem(`${removedPrefix}${key}`, "1");
           localStorage.removeItem(key);
+          if (localStorage.getItem(key) !== null) throw new Error();
         }
     } catch {
       throw storageError();
