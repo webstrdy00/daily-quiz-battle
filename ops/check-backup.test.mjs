@@ -10,6 +10,7 @@ import {
 } from "./check-backup.mjs";
 
 const NOW = Date.parse("2026-09-13T12:00:00.000Z");
+const WEBHOOK = "https://discord.com/api/webhooks/123456789/test-only-token";
 const receipt = (ageMs = 0, success = true) =>
   JSON.stringify({
     success,
@@ -162,10 +163,11 @@ test("missing, unreadable and malformed statuses are sanitized without network",
   });
 });
 
-test("HTTPS configuration rejects credentials, fragments and non-HTTPS endpoints", () => {
+test("Discord webhook configuration rejects foreign hosts and unexpected URL components", () => {
+  assert.equal(parseWebhookUrl(`\uFEFF${WEBHOOK}\n`), `${WEBHOOK}?wait=true`);
   assert.equal(
-    parseWebhookUrl("\uFEFFhttps://receiver.example/hook?token=private\n"),
-    "https://receiver.example/hook?token=private",
+    parseWebhookUrl(WEBHOOK.replace("/api/", "/api/v10/")),
+    `${WEBHOOK.replace("/api/", "/api/v10/")}?wait=true`,
   );
   for (const url of [
     "",
@@ -175,6 +177,13 @@ test("HTTPS configuration rejects credentials, fragments and non-HTTPS endpoints
     "https://receiver.example/#private",
     "https://recei\nver.example",
     "file:///private",
+    WEBHOOK.replace("discord.com", "discord.com.evil.example"),
+    WEBHOOK.replace("discord.com", "discord.com:8443"),
+    WEBHOOK.replace("/webhooks/", "/channels/"),
+    WEBHOOK.replace("123456789", "not-an-id"),
+    WEBHOOK.replace("test-only-token", ""),
+    `${WEBHOOK}?thread_id=123`,
+    `${WEBHOOK}#private`,
   ]) {
     assert.throws(() => parseWebhookUrl(url));
   }
@@ -187,20 +196,18 @@ test("explicit configured incident sends only allowlisted summary with timeout a
     { ...options, webhookUrlFile: "private-url-path" },
     dependencies(receipt(), {
       read: async (path) =>
-        path === options.statusFile
-          ? receipt(0, false)
-          : "https://receiver.example/private-token",
+        path === options.statusFile ? receipt(0, false) : WEBHOOK,
       fetch: async (url, init) => {
         calls++;
-        assert.equal(url, "https://receiver.example/private-token");
+        assert.equal(url, `${WEBHOOK}?wait=true`);
         assert.equal(init.method, "POST");
         assert.equal(init.redirect, "error");
         assert.equal(init.headers["Content-Type"], "application/json");
         assert.ok(init.signal instanceof AbortSignal);
         assert.equal(init.signal.aborted, false);
         assert.deepEqual(JSON.parse(init.body), {
-          event: "backup_unhealthy",
-          status: "failed",
+          content: "[Daily Quiz Battle] 백업 상태 경고: failed",
+          allowed_mentions: { parse: [] },
         });
         return {
           ok: true,
@@ -238,9 +245,7 @@ test("HTTP failure, network failure, timeout and rejected redirects do not claim
       { ...options, webhookUrlFile: "url" },
       dependencies("", {
         read: async (path) =>
-          path === options.statusFile
-            ? receipt(27 * 3_600_000)
-            : "https://receiver.example/hook",
+          path === options.statusFile ? receipt(27 * 3_600_000) : WEBHOOK,
         fetch: send,
       }),
     );
@@ -258,9 +263,7 @@ test("healthy backups do not send incidents, but invalid requested configuration
       configured,
       dependencies("", {
         read: async (path) =>
-          path === options.statusFile
-            ? receipt()
-            : "https://receiver.example/hook",
+          path === options.statusFile ? receipt() : WEBHOOK,
       }),
     ),
     { exitCode: 0, summary: { status: "healthy", alert: "not_needed" } },

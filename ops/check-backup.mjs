@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 // node ops/check-backup.mjs --status-file PATH [--max-age-hours 26] [--webhook-url-file PATH]
+// The optional URL file contains a Discord webhook; never log its contents.
 // Only unhealthy checks send alerts. No URL file means no network and no delivery claim.
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
@@ -99,13 +100,17 @@ export function parseWebhookUrl(text) {
   const url = new URL(value);
   if (
     url.protocol !== "https:" ||
-    !url.hostname ||
+    url.hostname !== "discord.com" ||
+    url.port ||
     url.username ||
     url.password ||
-    url.hash
+    url.hash ||
+    url.search ||
+    !/^\/api(?:\/v\d+)?\/webhooks\/\d+\/[A-Za-z0-9._-]+$/.test(url.pathname)
   ) {
     throw new Error("Invalid webhook configuration.");
   }
+  url.searchParams.set("wait", "true");
   return url.href;
 }
 
@@ -143,7 +148,10 @@ export async function checkBackup(
         const response = await send(url, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ event: "backup_unhealthy", status }),
+          body: JSON.stringify({
+            content: `[Daily Quiz Battle] 백업 상태 경고: ${status}`,
+            allowed_mentions: { parse: [] },
+          }),
           redirect: "error",
           signal: AbortSignal.timeout(WEBHOOK_TIMEOUT_MS),
         });
