@@ -73,8 +73,8 @@ importers:
         specifier: 0.45.2
         version: 0.45.2(@opentelemetry/api@1.9.1)(postgres@3.4.9)
       fastify:
-        specifier: 5.12.1
-        version: 5.12.1
+        specifier: 5.12.5
+        version: 5.12.5
       ioredis:
         specifier: 5.8.2
         version: 5.8.2
@@ -1395,8 +1395,8 @@ packages:
   fastify-plugin@6.0.0:
     resolution: {integrity: sha512-fZOty7z3O7vOliF6d8bHE3wiEh1KcNnKEQensSgTk9C1DvN6nRLS++XVd86v33Hw/8u9Un8A1zDrQ8ujcQDHEg==}
 
-  fastify@5.12.1:
-    resolution: {integrity: sha512-FWi+tQvwxR/PeRX7Z2mhfEF5ozJ3jn9asiiclzKXNSzJRHAYcU924aIOKAdHFJ+YIKieh3cqr1IwCOvTr41B3Q==}
+  fastify@5.12.5:
+    resolution: {integrity: sha512-OB2k1dlxs5/NAABqeKV2FUHkSD2BbENsCak8yULVcymn3fHIPDVa9TI3SDnJSWYSllZmSYuZXy2gTnsT+Sut1A==}
 
   fastq@1.20.2:
     resolution: {integrity: sha512-UpGiiODyCGprM8EPP6JodP6jC9Rws6TCuiDOD+nn0CJhR8guI3g/ozo4ugL0vJ+Yz1UtJuuRPqvQuybVOF1VQA==}
@@ -3058,7 +3058,7 @@ snapshots:
 
   fastify-plugin@6.0.0: {}
 
-  fastify@5.12.1:
+  fastify@5.12.5:
     dependencies:
       '@fastify/ajv-compiler': 4.0.6
       '@fastify/error': 4.2.0

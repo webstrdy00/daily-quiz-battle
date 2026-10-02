@@ -27,7 +27,7 @@
     "@fastify/rate-limit": "10.3.0",
     "@prometheus-io/client": "0.16.1",
     "drizzle-orm": "0.45.2",
-    "fastify": "5.12.1",
+    "fastify": "5.12.5",
     "ioredis": "5.8.2",
     "jose": "6.2.10",
     "postgres": "3.4.9",
