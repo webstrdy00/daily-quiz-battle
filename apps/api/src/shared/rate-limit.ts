@@ -10,6 +10,8 @@ import { AppError } from "./errors.js";
 
 const RATE_LIMIT_NAMESPACE = "daily-quiz-battle:rate-limit:";
 const IP_BUCKET_HASH_DOMAIN = "daily-quiz-battle:rate-limit:ip:v1\0";
+const ACCOUNT_DELETION_HASH_DOMAIN =
+  "daily-quiz-battle:rate-limit:account-delete:v1\0";
 
 export interface RegisterRateLimitOptions {
   redisUrl?: string;
@@ -22,6 +24,15 @@ function preAuthIpBucket(request: FastifyRequest): string {
     .update(request.ip, "utf8")
     .digest("hex");
   return `ip-sha256:${digest}`;
+}
+
+// Only pass an identity returned by authenticateRequest, never decoded claims.
+export function accountDeletionKey(userId: string): string {
+  const digest = createHash("sha256")
+    .update(ACCOUNT_DELETION_HASH_DOMAIN, "utf8")
+    .update(userId, "utf8")
+    .digest("hex");
+  return `account-delete-sha256:${digest}`;
 }
 
 /**
