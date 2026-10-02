@@ -54,6 +54,12 @@ import {
   mutateDraft,
   type QuizDraft,
 } from "./lib/quiz-draft";
+import {
+  isChallengeContextCurrent,
+  isDraftForQuizDate,
+  runChallengeRequest,
+  type ChallengeContext,
+} from "./lib/challenge-context";
 
 type Screen =
   | "loading"
@@ -712,6 +718,7 @@ function App() {
   const [challengeToken, setChallengeToken] = useState<string | null>(
     takeInitialChallengeToken,
   );
+  const activeChallengeToken = useRef(challengeToken);
   const [challengeLanding, setChallengeLanding] =
     useState<ActiveChallengeLanding | null>(null);
   const [challengeResult, setChallengeResult] =
@@ -749,6 +756,8 @@ function App() {
   const initialChallengeToken = useRef(challengeToken);
   const initializationGeneration = useRef(0);
   const initializationAbort = useRef<AbortController | null>(null);
+  const challengeRefreshGeneration = useRef(0);
+  const challengeRefreshAbort = useRef<AbortController | null>(null);
   const pendingChallengeCreateKey = useRef<string | null>(null);
   const pendingClaimKey = useRef<string | null>(null);
   const notificationAgreementAbort = useRef<AbortController | null>(null);
@@ -757,6 +766,25 @@ function App() {
   const completionAnalyticsBlocked = useRef(false);
   const mainHeading = useRef<HTMLHeadingElement>(null);
   const lastFocusedHeading = useRef<string | null>(null);
+
+  const readChallengeContext = useCallback(
+    (requestGeneration = 0): ChallengeContext => ({
+      generation: initializationGeneration.current,
+      requestGeneration,
+      userId: getAuthenticatedUserId(),
+      token: activeChallengeToken.current,
+      quizDate: activeQuizDate.current,
+      accountDeleted: accountDeleted.current,
+    }),
+    [],
+  );
+
+  const invalidateChallengeRefresh = useCallback(() => {
+    challengeRefreshGeneration.current += 1;
+    challengeRefreshAbort.current?.abort();
+    challengeRefreshAbort.current = null;
+    setRefreshingChallenge(false);
+  }, []);
 
   const discardDraft = useCallback(() => {
     const current = draftRef.current;
@@ -769,14 +797,24 @@ function App() {
     }
   }, []);
 
-  const discardDateDrafts = useCallback((quizDate: string) => {
-    const userId = getAuthenticatedUserId();
-    if (userId !== null) {
-      void clearQuizDateDrafts(userId, quizDate).catch((error: unknown) => {
-        setStorageError(toDisplayError(error).message);
-      });
-    }
-  }, []);
+  const discardDateDrafts = useCallback(
+    (quizDate: string) => {
+      const context = readChallengeContext();
+      if (isDraftForQuizDate(draftRef.current, context.userId, quizDate)) {
+        draftRef.current = null;
+        setDraft(null);
+      }
+      if (context.userId !== null) {
+        void clearQuizDateDrafts(context.userId, quizDate).catch(
+          (error: unknown) => {
+            if (isChallengeContextCurrent(context, readChallengeContext()))
+              setStorageError(toDisplayError(error).message);
+          },
+        );
+      }
+    },
+    [readChallengeContext],
+  );
 
   const hydrateDraft = useCallback(async (loaded: AvailableDaily) => {
     const userId = getAuthenticatedUserId();
@@ -872,6 +910,7 @@ function App() {
         draftRef.current = null;
         setDraft(null);
         initializationGeneration.current += 1;
+        invalidateChallengeRefresh();
         setFatalError({
           title: "기기의 답안 상태가 변경됐어요",
           message: "서버에서 최신 상태를 다시 확인해 주세요.",
@@ -900,20 +939,21 @@ function App() {
     };
     window.addEventListener("storage", handleStorage);
     return () => window.removeEventListener("storage", handleStorage);
-  }, []);
+  }, [invalidateChallengeRefresh]);
 
   const showVoidedResult = useCallback(
     (quizDate?: string) => {
       const date = quizDate ?? activeQuizDate.current;
-      if (date !== null) discardDateDrafts(date);
-      discardDraft();
+      invalidateChallengeRefresh();
       initializationAbort.current?.abort();
       initializationAbort.current = null;
       initializationGeneration.current += 1;
       completionAnalyticsBlocked.current = true;
       setDaily(null);
       setResult(null);
+      activeChallengeToken.current = null;
       setChallengeToken(null);
+      if (date !== null) discardDateDrafts(date);
       setChallengeLanding(null);
       setChallengeResult(null);
       setChallengeRole(null);
@@ -921,14 +961,13 @@ function App() {
       setFatalError(null);
       setActionError(null);
       setReportPending(false);
-      setRefreshingChallenge(false);
       setPollingPaused(true);
       pendingChallengeCreateKey.current = null;
       pendingClaimKey.current = null;
       setBusy(false);
       setScreen("voided");
     },
-    [discardDateDrafts, discardDraft],
+    [discardDateDrafts, invalidateChallengeRefresh],
   );
 
   const showChallengeResult = useCallback(
@@ -939,7 +978,6 @@ function App() {
           return;
         case "completed":
           discardDateDrafts(loadedResult.quizDate);
-          discardDraft();
           setChallengeResult(loadedResult);
           setChallengeRole(loadedResult.viewerRole);
           if (
@@ -970,14 +1008,16 @@ function App() {
           assertNever(loadedResult);
       }
     },
-    [discardDateDrafts, discardDraft, showVoidedResult],
+    [discardDateDrafts, showVoidedResult],
   );
 
   const initializeDaily = useCallback(async () => {
+    invalidateChallengeRefresh();
     initializationAbort.current?.abort();
     const controller = new AbortController();
     initializationAbort.current = controller;
     const generation = ++initializationGeneration.current;
+    activeQuizDate.current = null;
     draftRef.current = null;
     setDraft(null);
     const isCurrent = () =>
@@ -1043,14 +1083,16 @@ function App() {
         setBusy(false);
       }
     }
-  }, [hydrateDraft, showVoidedResult]);
+  }, [hydrateDraft, invalidateChallengeRefresh, showVoidedResult]);
 
   const initializeChallenge = useCallback(
     async (token: string) => {
+      invalidateChallengeRefresh();
       initializationAbort.current?.abort();
       const controller = new AbortController();
       initializationAbort.current = controller;
       const generation = ++initializationGeneration.current;
+      activeQuizDate.current = null;
       draftRef.current = null;
       setDraft(null);
       const isCurrent = () =>
@@ -1142,7 +1184,6 @@ function App() {
             activeQuizDate.current !== null
           ) {
             discardDateDrafts(activeQuizDate.current);
-            discardDraft();
           }
           setChallengeIssue(issue);
           setScreen("challenge-issue");
@@ -1159,8 +1200,8 @@ function App() {
     },
     [
       discardDateDrafts,
-      discardDraft,
       hydrateDraft,
+      invalidateChallengeRefresh,
       showChallengeResult,
       showVoidedResult,
     ],
@@ -1180,6 +1221,9 @@ function App() {
       initializationAbort.current?.abort();
       initializationAbort.current = null;
       initializationGeneration.current += 1;
+      challengeRefreshAbort.current?.abort();
+      challengeRefreshAbort.current = null;
+      challengeRefreshGeneration.current += 1;
     };
   }, [initializeChallenge, initializeDaily]);
 
@@ -1437,7 +1481,6 @@ function App() {
           activeQuizDate.current !== null
         ) {
           discardDateDrafts(activeQuizDate.current);
-          discardDraft();
         }
         void logAnalyticsEvent("claim_conflict", {
           reason: error instanceof ApiClientError ? error.code : "unknown",
@@ -1453,7 +1496,6 @@ function App() {
   }, [
     challengeToken,
     discardDateDrafts,
-    discardDraft,
     hydrateDraft,
     showChallengeResult,
     showVoidedResult,
@@ -1472,6 +1514,10 @@ function App() {
       return;
     }
 
+    let context = readChallengeContext();
+    const isCurrent = () =>
+      isChallengeContextCurrent(context, readChallengeContext());
+    if (context.accountDeleted || context.token !== challengeToken) return;
     const returnScreen = screen;
     setBusy(true);
     setActionError(null);
@@ -1490,19 +1536,21 @@ function App() {
           { attemptId: daily.attempt.id },
           pendingChallengeCreateKey.current,
         );
-        if (completionAnalyticsBlocked.current) {
+        if (!isCurrent() || completionAnalyticsBlocked.current) {
           return;
         }
         pendingChallengeCreateKey.current = null;
         token = created.challenge.token;
+        activeChallengeToken.current = token;
         setChallengeToken(token);
+        context = readChallengeContext();
         setChallengeRole("creator");
         setChallengeResult(null);
         loggedChallengeCompletion.current = false;
       }
 
       const outcome = await shareChallenge(token);
-      if (completionAnalyticsBlocked.current) {
+      if (!isCurrent() || completionAnalyticsBlocked.current) {
         return;
       }
       if (outcome === "cancelled") {
@@ -1517,6 +1565,7 @@ function App() {
         setScreen("challenge-waiting");
       }
     } catch (error) {
+      if (!isCurrent()) return;
       if (isDailySetVoidedError(error)) {
         showVoidedResult();
         return;
@@ -1524,35 +1573,64 @@ function App() {
       setActionError(toDisplayError(error));
       setScreen(returnScreen);
     } finally {
-      setBusy(false);
+      if (isCurrent()) setBusy(false);
     }
-  }, [challengeToken, daily, result, screen, showVoidedResult]);
+  }, [
+    challengeToken,
+    daily,
+    readChallengeContext,
+    result,
+    screen,
+    showVoidedResult,
+  ]);
 
   const refreshChallengeResult = useCallback(async () => {
-    if (challengeToken === null) {
+    if (
+      challengeToken === null ||
+      activeChallengeToken.current !== challengeToken ||
+      accountDeleted.current
+    ) {
       return;
     }
 
+    challengeRefreshAbort.current?.abort();
+    const controller = new AbortController();
+    challengeRefreshAbort.current = controller;
+    const context = readChallengeContext(++challengeRefreshGeneration.current);
     setRefreshingChallenge(true);
     setActionError(null);
-    try {
-      showChallengeResult(await getChallengeResult(challengeToken));
-    } catch (error) {
-      if (isDailySetVoidedError(error)) {
-        showVoidedResult();
-        return;
-      }
-      const issue = challengeIssueFromError(error);
-      if (issue !== null) {
-        setChallengeIssue(issue);
-        setScreen("challenge-issue");
-      } else {
-        setActionError(toDisplayError(error));
-      }
-    } finally {
-      setRefreshingChallenge(false);
-    }
-  }, [challengeToken, showChallengeResult, showVoidedResult]);
+    await runChallengeRequest({
+      request: () => getChallengeResult(challengeToken, controller.signal),
+      isCurrent: () =>
+        isChallengeContextCurrent(
+          context,
+          readChallengeContext(challengeRefreshGeneration.current),
+        ),
+      onResult: showChallengeResult,
+      onError: (error) => {
+        if (isDailySetVoidedError(error)) {
+          showVoidedResult(context.quizDate ?? undefined);
+          return;
+        }
+        const issue = challengeIssueFromError(error);
+        if (issue !== null) {
+          setChallengeIssue(issue);
+          setScreen("challenge-issue");
+        } else {
+          setActionError(toDisplayError(error));
+        }
+      },
+      onFinally: () => {
+        challengeRefreshAbort.current = null;
+        setRefreshingChallenge(false);
+      },
+    });
+  }, [
+    challengeToken,
+    readChallengeContext,
+    showChallengeResult,
+    showVoidedResult,
+  ]);
 
   useEffect(() => {
     if (screen !== "challenge-waiting" || challengeToken === null) {
@@ -1561,10 +1639,15 @@ function App() {
 
     const delays = [2_000, 4_000, 8_000, 15_000, 30_000];
     let active = true;
+    const pollingContext = readChallengeContext();
     let timer: number | null = null;
     let requestController: AbortController | null = null;
     let delayIndex = 0;
 
+    const isActive = () =>
+      active &&
+      activeChallengeToken.current === challengeToken &&
+      isChallengeContextCurrent(pollingContext, readChallengeContext());
     const clearTimer = () => {
       if (timer !== null) {
         window.clearTimeout(timer);
@@ -1572,7 +1655,7 @@ function App() {
       }
     };
     const schedule = () => {
-      if (!active || document.hidden) {
+      if (!isActive() || document.hidden) {
         return;
       }
       const delay = delays[Math.min(delayIndex, delays.length - 1)];
@@ -1581,18 +1664,31 @@ function App() {
     };
     const poll = async () => {
       clearTimer();
-      if (!active || document.hidden) {
+      if (!isActive() || document.hidden) {
+        return;
+      }
+      if (challengeRefreshAbort.current !== null) {
+        schedule();
         return;
       }
       requestController?.abort();
       const controller = new AbortController();
       requestController = controller;
+      const context = readChallengeContext(challengeRefreshGeneration.current);
+      const isCurrent = () =>
+        isActive() &&
+        requestController === controller &&
+        isChallengeContextCurrent(
+          context,
+          readChallengeContext(challengeRefreshGeneration.current),
+        );
       try {
         const loadedResult = await getChallengeResult(
           challengeToken,
           controller.signal,
         );
-        if (!active) {
+        if (!isCurrent()) {
+          if (active && requestController === controller) schedule();
           return;
         }
         setActionError(null);
@@ -1610,15 +1706,18 @@ function App() {
             assertNever(loadedResult);
         }
       } catch (error) {
+        if (!isCurrent()) {
+          if (active && requestController === controller) schedule();
+          return;
+        }
         if (
-          !active ||
           document.hidden ||
           (error instanceof ApiClientError && error.code === "REQUEST_ABORTED")
         ) {
           return;
         }
         if (isDailySetVoidedError(error)) {
-          showVoidedResult();
+          showVoidedResult(context.quizDate ?? undefined);
           return;
         }
         const issue = challengeIssueFromError(error);
@@ -1636,6 +1735,7 @@ function App() {
       }
     };
     const handleVisibilityChange = () => {
+      if (!isActive()) return;
       clearTimer();
       if (document.hidden) {
         requestController?.abort();
@@ -1660,7 +1760,13 @@ function App() {
       requestController = null;
       document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
-  }, [challengeToken, screen, showChallengeResult, showVoidedResult]);
+  }, [
+    challengeToken,
+    readChallengeContext,
+    screen,
+    showChallengeResult,
+    showVoidedResult,
+  ]);
 
   useEffect(() => {
     if (screen !== "result") {
@@ -1677,14 +1783,19 @@ function App() {
 
       const controller = new AbortController();
       requestController = controller;
+      const context = readChallengeContext();
+      const isCurrent = () =>
+        active &&
+        requestController === controller &&
+        isChallengeContextCurrent(context, readChallengeContext());
       try {
         const loadedDaily = await startDailyQuiz(controller.signal);
-        if (!active) {
+        if (!isCurrent()) {
           return;
         }
         switch (loadedDaily.status) {
           case "voided":
-            showVoidedResult();
+            showVoidedResult(loadedDaily.quizDate);
             break;
           case "available":
             break;
@@ -1692,11 +1803,11 @@ function App() {
             assertNever(loadedDaily);
         }
       } catch (error) {
-        if (!active) {
+        if (!isCurrent()) {
           return;
         }
         if (isDailySetVoidedError(error)) {
-          showVoidedResult();
+          showVoidedResult(context.quizDate ?? undefined);
         }
       } finally {
         if (requestController === controller) {
@@ -1726,9 +1837,10 @@ function App() {
       document.removeEventListener("visibilitychange", handleVisibilityChange);
       window.removeEventListener("focus", handleFocus);
     };
-  }, [screen, showVoidedResult]);
+  }, [readChallengeContext, screen, showVoidedResult]);
 
   const handleGoToDaily = useCallback(() => {
+    activeChallengeToken.current = null;
     setChallengeToken(null);
     setChallengeLanding(null);
     setChallengeResult(null);
@@ -1862,6 +1974,7 @@ function App() {
     }
     setBusy(true);
     setActionError(null);
+    invalidateChallengeRefresh();
     initializationAbort.current?.abort();
     initializationGeneration.current += 1;
     draftRef.current = null;
@@ -1875,6 +1988,7 @@ function App() {
       capturedInitialChallengeToken = null;
       setDaily(null);
       setResult(null);
+      activeChallengeToken.current = null;
       setChallengeToken(null);
       setChallengeLanding(null);
       setChallengeResult(null);
@@ -1911,7 +2025,7 @@ function App() {
     } finally {
       setBusy(false);
     }
-  }, [busy, notificationBusy, reportPending]);
+  }, [busy, invalidateChallengeRefresh, notificationBusy, reportPending]);
 
   if (screen === "loading") {
     if (challengeToken === null) {
