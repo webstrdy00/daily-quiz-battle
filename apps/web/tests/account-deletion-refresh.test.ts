@@ -39,28 +39,49 @@ for (const scenario of [
   "rateLimited",
   "differentUser",
   "refreshFailure",
+  "refreshRejected",
 ] as const) {
   test(
     `deletion refresh is bounded and identity safe: ${scenario}`,
     { timeout: 20000 },
     async (t) => {
       let bootstraps = 0;
+      let refreshes = 0;
       const deletionTokens: string[] = [];
       const browser = await browserFixture(t, {
         fetch({ url, init }) {
           if (url.pathname === "/v1/auth/bootstrap") {
             bootstraps++;
-            assert.ok(bootstraps <= 2, "at most one authentication refresh");
-            if (scenario === "refreshFailure" && bootstraps === 2)
-              return failure(503);
+            assert.equal(bootstraps, 1, "deletion must never bootstrap");
             return jsonResponse({
-              accessToken: bootstraps === 1 ? "expired" : "fresh",
+              accessToken: "expired",
+              expiresInSeconds: 1800,
+              user: { id: userId, nickname: "검증자" },
+            });
+          }
+          if (url.pathname === "/v1/auth/refresh") {
+            const body = JSON.parse(String(init.body));
+            refreshes++;
+            assert.equal(refreshes, 1);
+            assert.deepEqual(Object.keys(body as object).sort(), [
+              "anonymousKey",
+              "expectedUserId",
+            ]);
+            assert.equal(
+              (body as { expectedUserId: string }).expectedUserId,
+              userId,
+            );
+            assert.equal(
+              typeof (body as { anonymousKey: string }).anonymousKey,
+              "string",
+            );
+            if (scenario === "refreshFailure") return failure(503);
+            if (scenario === "refreshRejected") return failure(401);
+            return jsonResponse({
+              accessToken: "fresh",
               expiresInSeconds: 1800,
               user: {
-                id:
-                  scenario === "differentUser" && bootstraps === 2
-                    ? otherUserId
-                    : userId,
+                id: scenario === "differentUser" ? otherUserId : userId,
                 nickname: "검증자",
               },
             });
@@ -135,7 +156,7 @@ for (const scenario of [
                 return error.code === "ACCOUNT_DELETION_IDENTITY_CHANGED";
               return (
                 error.status ===
-                (scenario === "repeated401"
+                (scenario === "repeated401" || scenario === "refreshRejected"
                   ? 401
                   : scenario === "rateLimited"
                     ? 429
@@ -167,10 +188,13 @@ for (const scenario of [
           }
         }
       });
-      assert.equal(bootstraps, 2);
+      assert.equal(bootstraps, 1);
+      assert.equal(refreshes, 1);
       assert.deepEqual(
         deletionTokens,
-        scenario === "differentUser" || scenario === "refreshFailure"
+        scenario === "differentUser" ||
+          scenario === "refreshFailure" ||
+          scenario === "refreshRejected"
           ? ["Bearer expired"]
           : ["Bearer expired", "Bearer fresh"],
       );

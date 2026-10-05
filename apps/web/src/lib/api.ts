@@ -12,6 +12,7 @@ import {
   DeleteAccountRequestSchema,
   DeleteAccountResponseSchema,
   OperationalCapabilitiesResponseSchema,
+  RefreshSessionRequestSchema,
   ResultNotificationPreferenceResponseSchema,
   UpdateResultNotificationPreferenceRequestSchema,
   type ApiError,
@@ -521,17 +522,22 @@ export async function deleteAccount(
       if (!(error instanceof ApiClientError) || error.status !== 401)
         throw error;
 
-      // Only an explicit rejection permits one refresh. Never bootstrap after
-      // an ambiguous DELETE, and never adopt or delete a replacement identity.
+      // Only an explicit rejection permits one non-creating refresh.
+      // Never bootstrap or adopt a replacement identity during deletion.
       deletionRejected = true;
       const anonymousKey = await getAnonymousKey();
       assertDeletionCurrent();
       const refreshed = await fetchJson(
-        "/v1/auth/bootstrap",
+        "/v1/auth/refresh",
         BootstrapResponseSchema,
         {
           method: "POST",
-          body: JSON.stringify({ anonymousKey }),
+          body: JSON.stringify(
+            RefreshSessionRequestSchema.parse({
+              anonymousKey,
+              expectedUserId: deletingUserId,
+            }),
+          ),
         },
         { epoch: deletionEpoch, allowDeleting: true },
       );

@@ -13,6 +13,7 @@ import {
   type DailyStartResponse,
 } from "@daily-quiz-battle/contracts";
 import { decodeJwt } from "jose";
+import { fingerprintAnonymousKey } from "../shared/hash.js";
 import {
   createIntegrationHarness,
   PRIMARY_DAY_NOON,
@@ -36,11 +37,13 @@ type AvailableDailyStart = Extract<DailyStartResponse, { status: "available" }>;
 interface UserLifecycleRow {
   anon_key_fingerprint: string;
   identity_status: "active" | "deleted" | "blocked";
+  identity_verified_at: Date | string | null;
   deleted_at: Date | string | null;
   nickname: string;
   token_version: number;
   streak_days: number;
   last_daily_date: string | null;
+  updated_at: Date | string;
 }
 
 interface ChallengeDeletionRow {
@@ -123,6 +126,24 @@ async function rebootstrapUser(anonymousKey: string): Promise<TestUser> {
   assert.equal(response.statusCode, 200, response.body);
   const token = BootstrapResponseSchema.parse(response.json()).accessToken;
   return { anonymousKey, token, userId: getTokenUserId(token) };
+}
+
+async function requestRefresh(user: TestUser): Promise<JsonResponse> {
+  return harness.app.inject({
+    method: "POST",
+    url: "/v1/auth/refresh",
+    payload: {
+      anonymousKey: user.anonymousKey,
+      expectedUserId: user.userId,
+    },
+  });
+}
+
+async function countUsers(): Promise<number> {
+  const rows = await harness.database.client<{ count: number }[]>`
+    SELECT count(*)::int AS count FROM users
+  `;
+  return rows[0]!.count;
 }
 
 async function setNickname(userId: string, nickname: string): Promise<void> {
@@ -339,6 +360,7 @@ async function holdChallengeLock(challengeId: string): Promise<LockBarrier> {
 async function waitForBlockedUserLocks(
   minimum: number,
   timeoutMs = 2_000,
+  lockMode: "UPDATE" | "SHARE" = "UPDATE",
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -349,7 +371,7 @@ async function waitForBlockedUserLocks(
         AND pid <> pg_backend_pid()
         AND wait_event_type = 'Lock'
         AND query ILIKE '%FROM users%'
-        AND query ILIKE '%FOR UPDATE%'
+        AND query ILIKE ${`%FOR ${lockMode}%`}
     `;
     if ((rows[0]?.count ?? 0) >= minimum) {
       return;
@@ -368,7 +390,7 @@ async function waitForBlockedChallengeLocks(timeoutMs = 2_000): Promise<void> {
       WHERE datname = current_database()
         AND pid <> pg_backend_pid()
         AND wait_event_type = 'Lock'
-        AND query ILIKE '%UPDATE challenges%'
+        AND query ILIKE '%challenges%'
     `;
     if ((rows[0]?.count ?? 0) >= 1) {
       return;
@@ -406,11 +428,13 @@ async function getUserLifecycle(userId: string): Promise<UserLifecycleRow> {
     SELECT
       anon_key_fingerprint,
       identity_status::text AS identity_status,
+      identity_verified_at,
       deleted_at,
       nickname,
       token_version::int AS token_version,
       streak_days::int AS streak_days,
-      last_daily_date::text AS last_daily_date
+      last_daily_date::text AS last_daily_date,
+      updated_at
     FROM users
     WHERE id = ${userId}
   `;
@@ -464,6 +488,205 @@ async function assertOldTokenRejected(token: string): Promise<void> {
   });
   expectApiError(response, 401, "UNAUTHORIZED");
 }
+
+test("refresh keeps the verified identity and issues its current token version without mutations", async () => {
+  harness.setNow(PRIMARY_DAY_NOON);
+  const user = await bootstrapUser("refresh-active");
+  // A stored verified key need not pass the current mock verifier's dev- prefix rule.
+  user.anonymousKey = "previously-verified-account-refresh-identity";
+  await harness.database.client`
+    UPDATE users
+    SET anon_key_fingerprint = ${fingerprintAnonymousKey(user.anonymousKey, harness.config.anonymousKeyPepper)}
+    WHERE id = ${user.userId}
+  `;
+  const before = await getUserLifecycle(user.userId);
+  assert.ok(before.identity_verified_at);
+  const totalUsers = await countUsers();
+
+  const response = await requestRefresh(user);
+  assert.equal(response.statusCode, 200, response.body);
+  const refreshed = BootstrapResponseSchema.parse(response.json());
+  assert.deepEqual(refreshed.user, {
+    id: user.userId,
+    nickname: before.nickname,
+  });
+  assert.equal(
+    refreshed.expiresInSeconds,
+    harness.config.accessTokenTtlSeconds,
+  );
+  assert.equal(getTokenUserId(refreshed.accessToken), user.userId);
+  assert.equal(
+    decodeJwt(refreshed.accessToken).tokenVersion,
+    before.token_version,
+  );
+  assert.equal(await countUsers(), totalUsers);
+  assert.deepEqual(await getUserLifecycle(user.userId), before);
+  await startQuiz(refreshed.accessToken);
+
+  await harness.database.client`
+    UPDATE users
+    SET token_version = token_version + 1
+    WHERE id = ${user.userId}
+  `;
+  const afterIncrement = await getUserLifecycle(user.userId);
+  assert.equal(afterIncrement.token_version, before.token_version + 1);
+  await assertOldTokenRejected(user.token);
+  await assertOldTokenRejected(refreshed.accessToken);
+
+  const renewedResponse = await requestRefresh(user);
+  assert.equal(renewedResponse.statusCode, 200, renewedResponse.body);
+  const renewed = BootstrapResponseSchema.parse(renewedResponse.json());
+  assert.deepEqual(renewed.user, refreshed.user);
+  assert.equal(getTokenUserId(renewed.accessToken), user.userId);
+  assert.equal(
+    decodeJwt(renewed.accessToken).tokenVersion,
+    afterIncrement.token_version,
+  );
+  assert.equal(await countUsers(), totalUsers);
+  assert.deepEqual(await getUserLifecycle(user.userId), afterIncrement);
+  await startQuiz(renewed.accessToken);
+});
+
+test("refresh rejects mismatched or missing identities and malformed bodies without creating users", async () => {
+  const user = await bootstrapUser("refresh-mismatch");
+  const other = await bootstrapUser("refresh-mismatch-other");
+  const before = await getUserLifecycle(user.userId);
+  const otherBefore = await getUserLifecycle(other.userId);
+  const totalUsers = await countUsers();
+  for (const payload of [
+    { anonymousKey: user.anonymousKey, expectedUserId: other.userId },
+    { anonymousKey: other.anonymousKey, expectedUserId: user.userId },
+    {
+      anonymousKey: "dev-account-deletion-it-refresh-unknown",
+      expectedUserId: user.userId,
+    },
+    {
+      anonymousKey: user.anonymousKey,
+      expectedUserId: "00000000-0000-4000-8000-000000000000",
+    },
+  ]) {
+    const response = await harness.app.inject({
+      method: "POST",
+      url: "/v1/auth/refresh",
+      payload,
+    });
+    expectApiError(response, 401, "UNAUTHORIZED");
+    assert.equal(await countUsers(), totalUsers);
+  }
+  for (const payload of [
+    { expectedUserId: user.userId },
+    { anonymousKey: user.anonymousKey },
+    { anonymousKey: user.anonymousKey, expectedUserId: "not-a-uuid" },
+    {
+      anonymousKey: user.anonymousKey,
+      expectedUserId: user.userId,
+      extra: true,
+    },
+  ]) {
+    const response = await harness.app.inject({
+      method: "POST",
+      url: "/v1/auth/refresh",
+      payload,
+    });
+    expectApiError(response, 400, "INVALID_REQUEST");
+    assert.equal(await countUsers(), totalUsers);
+  }
+  assert.deepEqual(await getUserLifecycle(user.userId), before);
+  assert.deepEqual(await getUserLifecycle(other.userId), otherBefore);
+});
+
+test("refresh cannot recreate a deleted identity or switch to a replacement account", async () => {
+  harness.setNow(PRIMARY_DAY_NOON);
+  const user = await bootstrapUser("refresh-deleted");
+  const before = await getUserLifecycle(user.userId);
+  const deletion = await deleteUser(user);
+  assert.equal(deletion.statusCode, 200, deletion.body);
+  DeleteAccountResponseSchema.parse(deletion.json());
+  const tombstone = await getUserLifecycle(user.userId);
+  assert.equal(tombstone.identity_status, "deleted");
+  assert.notEqual(tombstone.anon_key_fingerprint, before.anon_key_fingerprint);
+  const totalUsers = await countUsers();
+
+  expectApiError(await requestRefresh(user), 401, "UNAUTHORIZED");
+  assert.equal(await countUsers(), totalUsers);
+  assert.deepEqual(await getUserLifecycle(user.userId), tombstone);
+
+  const replacement = await rebootstrapUser(user.anonymousKey);
+  assert.notEqual(replacement.userId, user.userId);
+  assert.equal(await countUsers(), totalUsers + 1);
+  const replacementBefore = await getUserLifecycle(replacement.userId);
+  expectApiError(await requestRefresh(user), 401, "UNAUTHORIZED");
+  assert.equal(await countUsers(), totalUsers + 1);
+  assert.deepEqual(await getUserLifecycle(user.userId), tombstone);
+  assert.deepEqual(
+    await getUserLifecycle(replacement.userId),
+    replacementBefore,
+  );
+});
+
+test("refresh rejects a blocked identity without altering it", async () => {
+  const user = await bootstrapUser("refresh-blocked");
+  await harness.database.client`
+    UPDATE users
+    SET identity_status = 'blocked'
+    WHERE id = ${user.userId}
+  `;
+  const before = await getUserLifecycle(user.userId);
+  const totalUsers = await countUsers();
+
+  expectApiError(await requestRefresh(user), 401, "UNAUTHORIZED");
+  assert.equal(await countUsers(), totalUsers);
+  assert.deepEqual(await getUserLifecycle(user.userId), before);
+});
+
+test(
+  "refresh waits for a deletion-held user lock and rejects the committed tombstone",
+  { timeout: 8_000 },
+  async () => {
+    harness.setNow(PRIMARY_DAY_NOON);
+    const user = await bootstrapUser("refresh-deletion-lock");
+    const attempt = await finishQuiz(user, "refresh-deletion-lock", 2);
+    await createChallenge(
+      user,
+      attempt.attempt.id,
+      "refresh-deletion-lock-challenge",
+    );
+    const challenges = await harness.database.client<{ id: string }[]>`
+      SELECT id
+      FROM challenges
+      WHERE creator_user_id = ${user.userId}
+        AND creator_attempt_id = ${attempt.attempt.id}
+    `;
+    assert.equal(challenges.length, 1);
+    const totalUsers = await countUsers();
+    const barrier = await holdChallengeLock(challenges[0]!.id);
+    const deletionPromise = deleteUser(user);
+    try {
+      await waitForBlockedChallengeLocks();
+      const refreshPromise = requestRefresh(user);
+      try {
+        await waitForBlockedUserLocks(1, 2_000, "SHARE");
+      } finally {
+        barrier.release();
+      }
+      const [, deletionResponse, refreshResponse] = await withTimeout(
+        Promise.all([barrier.completion, deletionPromise, refreshPromise]),
+        "refresh and deletion",
+      );
+      assert.equal(deletionResponse.statusCode, 200, deletionResponse.body);
+      DeleteAccountResponseSchema.parse(deletionResponse.json());
+      expectApiError(refreshResponse, 401, "UNAUTHORIZED");
+      const tombstone = await getUserLifecycle(user.userId);
+      assert.equal(tombstone.identity_status, "deleted");
+      assert.equal(await countUsers(), totalUsers);
+      expectApiError(await requestRefresh(user), 401, "UNAUTHORIZED");
+      assert.deepEqual(await getUserLifecycle(user.userId), tombstone);
+    } finally {
+      barrier.release();
+      await withTimeout(barrier.completion, "refresh deletion lock release");
+    }
+  },
+);
 
 test("account deletion requires the exact confirmation", async () => {
   harness.setNow(PRIMARY_DAY_NOON);

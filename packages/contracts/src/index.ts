@@ -46,6 +46,10 @@ export const BootstrapResponseSchema = z.object({
   }),
 });
 
+export const RefreshSessionRequestSchema = BootstrapRequestSchema.extend({
+  expectedUserId: UuidSchema,
+}).strict();
+
 export const OperationalCapabilitiesResponseSchema = z
   .object({
     analyticsPublishEnabled: z.boolean(),
