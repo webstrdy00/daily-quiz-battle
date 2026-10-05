@@ -20,10 +20,12 @@ import {
 } from "node:crypto";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { pathToFileURL } from "node:url";
 
 const HEADER = Buffer.from("DQB-AES256GCM-v1\n");
 const LIMIT = 256 * 1024 * 1024;
+const COMMAND_TIMEOUT_MS = 180_000;
 const CONTAINER = "daily-quiz-battle-postgres";
 const USER = "daily_quiz";
 let interrupted = false;
@@ -108,7 +110,15 @@ export function parseSource(text) {
 }
 
 // Never relay docker/PostgreSQL stderr: it can contain credentials, SQL or private data.
-function docker(args, { input, env = {}, allowInterrupted = false } = {}) {
+function docker(
+  args,
+  {
+    input,
+    env = {},
+    allowInterrupted = false,
+    timeoutMs = COMMAND_TIMEOUT_MS,
+  } = {},
+) {
   if (interrupted && !allowInterrupted)
     return Promise.reject(new Error("Interrupted."));
   return new Promise((accept, reject) => {
@@ -119,28 +129,80 @@ function docker(args, { input, env = {}, allowInterrupted = false } = {}) {
     });
     const chunks = [];
     let size = 0;
-    let failed = false;
-    child.on("error", () => {
-      failed = true;
-    });
-    child.stdin.on("error", () => {
-      failed = true;
-    });
+    let settled = false;
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) reject(error);
+      else accept(Buffer.concat(chunks));
+    };
+    const fail = (message) => {
+      if (settled) return;
+      finish(new Error(message));
+      child.kill("SIGKILL");
+    };
+    const timer = setTimeout(
+      () => fail("Docker/PostgreSQL command timed out."),
+      Math.min(timeoutMs, COMMAND_TIMEOUT_MS),
+    );
+    child.on("error", () => fail("Docker/PostgreSQL command failed."));
+    child.stdin.on("error", () => fail("Docker/PostgreSQL command failed."));
     child.stderr.on("data", () => {});
     child.stdout.on("data", (chunk) => {
+      if (settled) return;
       size += chunk.length;
       if (size > LIMIT) {
-        failed = true;
-        child.kill();
+        fail("Docker/PostgreSQL command failed.");
       } else chunks.push(chunk);
     });
     child.on("close", (code) => {
-      if (failed || code !== 0)
-        reject(new Error("Docker/PostgreSQL command failed."));
-      else accept(Buffer.concat(chunks));
+      finish(
+        code !== 0 ? new Error("Docker/PostgreSQL command failed.") : null,
+      );
     });
     child.stdin.end(input);
   });
+}
+
+export async function ensureDockerReady({
+  run = docker,
+  wait = delay,
+  platform = process.platform,
+  now = () => performance.now(),
+} = {}) {
+  // Include the initial probe and Desktop startup in the same readiness budget.
+  const deadline = now() + 180_000;
+  const probe = async () => {
+    const remaining = deadline - now();
+    if (remaining <= 0) return false;
+    try {
+      await run(["info"], { timeoutMs: Math.min(10_000, remaining) });
+      return now() <= deadline;
+    } catch {
+      return false;
+    }
+  };
+  if (await probe()) return;
+  if (interrupted) throw new Error("Interrupted.");
+  if (platform !== "win32") throw new Error("Docker is not ready.");
+  const remaining = deadline - now();
+  if (remaining > 0) {
+    try {
+      await run(["desktop", "start", "--detach"], {
+        timeoutMs: Math.min(30_000, remaining),
+      });
+    } catch {
+      throw new Error("Docker Desktop could not be started.");
+    }
+  }
+  while (now() < deadline) {
+    if (interrupted) throw new Error("Interrupted.");
+    if (await probe()) return;
+    const remaining = deadline - now();
+    if (remaining > 0) await wait(Math.min(5_000, remaining));
+  }
+  throw new Error("Docker readiness timed out.");
 }
 
 async function backup(options, key) {
@@ -150,6 +212,7 @@ async function backup(options, key) {
   if (ca.includes(",") || /[\r\n]/.test(ca))
     throw new Error("Invalid CA path.");
   await readFile(ca);
+  await ensureDockerReady();
   const plain = await docker(
     [
       "run",
