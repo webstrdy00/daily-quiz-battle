@@ -24,7 +24,7 @@
     "db:seed": "pnpm --filter @daily-quiz-battle/api db:seed"
   },
   "devDependencies": {
-    "esbuild": "^0.28.2",
+    "esbuild": "^0.25.12",
     "jsdom": "^30.1.1",
     "prettier": "3.9.6"
   }
