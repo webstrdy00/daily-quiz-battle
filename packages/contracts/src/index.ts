@@ -416,6 +416,7 @@ export const AdminAuditActionSchema = z.enum([
   "question_revision.status.update",
   "daily_set.create",
   "daily_set.publish",
+  "daily_set.correct",
   "daily_set.void",
   "report.status.update",
 ]);
@@ -439,6 +440,10 @@ export const AdminAuditMetadataSchema = z.object({
   category: CategorySchema.optional(),
   difficulty: DifficultySchema.optional(),
   reason: z.string().min(1).max(500).optional(),
+  oldVersion: z.number().int().positive().optional(),
+  newVersion: z.number().int().positive().optional(),
+  oldItems: z.array(AdminDailySetDraftItemSchema).length(5).optional(),
+  newItems: z.array(AdminDailySetDraftItemSchema).length(5).optional(),
   fromStatus: z.enum(REPORT_STATUS_VALUES).optional(),
   toStatus: z.enum(REPORT_STATUS_VALUES).optional(),
 });

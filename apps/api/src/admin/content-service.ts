@@ -914,13 +914,14 @@ export async function publishDailySet(
     }
     if (
       difficultyCounts.easy !== 2 ||
-      difficultyCounts.medium !== 2 ||
-      difficultyCounts.hard !== 1
+      difficultyCounts.hard > 1 ||
+      difficultyCounts.medium !== 3 - difficultyCounts.hard
     ) {
       throw new AppError({
         statusCode: 422,
         code: "DAILY_SET_DIFFICULTY_DISTRIBUTION_INVALID",
-        message: "난이도 구성은 쉬움 2개, 보통 2개, 어려움 1개여야 합니다.",
+        message:
+          "난이도 구성은 쉬움 2개, 어려움 최대 1개이며 나머지는 보통이어야 합니다.",
       });
     }
     if ([...categoryCounts.values()].some((count) => count > 2)) {

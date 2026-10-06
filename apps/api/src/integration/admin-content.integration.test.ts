@@ -194,6 +194,29 @@ async function publishDailySet(token: string, dailySetId: string) {
   });
 }
 
+test("daily publication accepts two easy and three medium questions", async () => {
+  harness.setNow(DEFAULT_CLOCK);
+  const token = await issueAdminToken("admin-no-hard-writer");
+  const revisions = await Promise.all(
+    (["easy", "easy", "medium", "medium", "medium"] as const).map(
+      (difficulty, index) =>
+        publishRevision(
+          token,
+          `no-hard-${index}`,
+          difficulty,
+          `no-hard-category-${index}`,
+        ),
+    ),
+  );
+  const draft = await createDailySet(token, "2037-12-01", revisions);
+  const response = await publishDailySet(token, draft.dailySetId);
+  assert.equal(response.statusCode, 200, response.body);
+  assert.equal(
+    AdminPublishDailySetResponseSchema.parse(response.json()).status,
+    "published",
+  );
+});
+
 test("admin content routes enforce the admin-token and scope boundary", async () => {
   harness.setNow("2034-01-01T00:00:00.000Z");
   const payload = questionPayload("auth-boundary", "easy", "auth-boundary");
@@ -1115,7 +1138,9 @@ test("daily-set void requires its dedicated scope and is immutable, replayable, 
   ]);
   const publishedDraft = await createDailySet(
     writerToken,
-    "2041-03-10",
+    // This fixture inserts completed play below. Use a historical quiz date:
+    // the DB correctly rejects assigning attempts to real future dates.
+    "2020-03-10",
     revisions,
   );
   const publishedResponse = await publishDailySet(
@@ -1334,7 +1359,7 @@ test("daily-set void requires its dedicated scope and is immutable, replayable, 
 
   const listedResponse = await harness.app.inject({
     method: "GET",
-    url: `${ADMIN_CONTENT_URL}/daily-sets?from=2041-03-10&to=2041-03-10&status=published`,
+    url: `${ADMIN_CONTENT_URL}/daily-sets?from=2020-03-10&to=2020-03-10&status=published`,
     headers: authorizationHeaders(writerToken),
   });
   assert.equal(listedResponse.statusCode, 200, listedResponse.body);

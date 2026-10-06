@@ -228,6 +228,7 @@ test("isolated database setup is migrated, seeded, and ready", async () => {
       ["0015_operation_task_runs.sql", 1],
       ["0016_question_report_triage.sql", 1],
       ["0017_fix_report_triage_trigger.sql", 1],
+      ["0018_future_daily_set_correction.sql", 1],
     ],
   );
 
