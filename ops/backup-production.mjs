@@ -227,6 +227,7 @@ async function backup(options, key) {
       "pg_dump",
       `--dbname=${source.dbname}`,
       "--schema=public",
+      "--schema=content_correction_private",
       "--format=custom",
       "--no-owner",
       "--no-acl",
@@ -260,7 +261,7 @@ async function backup(options, key) {
       sha256: createHash("sha256").update(encrypted).digest("hex"),
       bytes: encrypted.length,
       scope: {
-        schemas: ["public"],
+        schemas: ["public", "content_correction_private"],
         includes: ["schema", "data"],
         excludes: ["auth", "storage", "roles", "ownership", "grants"],
       },
@@ -341,6 +342,15 @@ async function restore(options, key) {
     const migrationCount = JSON.parse(
       (await sql("SELECT count(*) FROM public.app_migrations;")).toString(),
     );
+    const privateSchemaRestored = JSON.parse(
+      (
+        await sql(
+          "SELECT to_json(CASE WHEN EXISTS (SELECT 1 FROM public.app_migrations WHERE filename = '0018_future_daily_set_correction.sql') THEN to_regclass('content_correction_private.authorizations') IS NOT NULL AND to_regprocedure('content_correction_private.assert_future_unplayed(uuid)') IS NOT NULL AND to_regprocedure('content_correction_private.authorized_items(uuid,integer,uuid,jsonb,boolean)') IS NOT NULL ELSE true END);",
+        )
+      ).toString(),
+    );
+    if (!privateSchemaRestored)
+      throw new Error("Restored correction schema is incomplete.");
     const tables = JSON.parse(
       (
         await sql(
@@ -359,6 +369,7 @@ async function restore(options, key) {
     return {
       localRestore: true,
       migrationCount,
+      privateSchemaRestored,
       tables,
       rowCounts,
       temporaryDatabaseRemoved: true,

@@ -26,5 +26,14 @@ GRANT CONNECT ON DATABASE postgres TO daily_quiz_backup;
 GRANT USAGE ON SCHEMA public TO daily_quiz_backup;
 GRANT SELECT ON ALL TABLES IN SCHEMA public TO daily_quiz_backup;
 GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO daily_quiz_backup;
+DO $$
+BEGIN
+  IF to_regnamespace('content_correction_private') IS NOT NULL THEN
+    GRANT USAGE ON SCHEMA content_correction_private TO daily_quiz_backup;
+    GRANT SELECT ON ALL TABLES IN SCHEMA content_correction_private TO daily_quiz_backup;
+  END IF;
+END;
+$$;
 
 COMMIT;
+-- Application schema + data backup; excludes Supabase auth/storage, roles and grants.
